@@ -1,61 +1,186 @@
+.hidden {
+    display: none;
+}
+
 #wallpaper {
-    background-color: #1a1f2e;
-    width: 1920;
-    height: 1080;
+    background: linear-gradient(160deg, #0f172aff, #312e81ff, #1e1b4bff);
+    width: 100%;
+    height: 100%;
     left: 0;
     top: 0;
     border-radius: 0;
 }
 
-#taskbar {
-    background-color: rgba(18, 18, 22, 0.92);
+#wallpaper_glow {
+    background: radial-gradient(circle at 70% 20%, #6366f155, transparent);
+    width: 60%;
+    height: 50%;
+    right: 5%;
+    top: 8%;
+    border-radius: 0;
+}
+
+#wallpaper_glow2 {
+    background: radial-gradient(circle at 25% 75%, #a855f733, transparent);
+    width: 50%;
+    height: 40%;
+    left: 5%;
+    bottom: 15%;
+    border-radius: 0;
+}
+
+#widget_grid {
+    display: grid;
+    grid-template-areas:
+        "cpu mem net"
+        "disk disk temp";
+    grid-template-columns: minmax(72px, 1fr) minmax(72px, 1fr) minmax(72px, 1fr);
+    grid-template-rows: minmax(68px, 1fr) minmax(68px, 1fr);
+    grid-auto-rows: 60;
+    place-items: center;
+    place-content: center;
+    gap: 12;
+    width: 380;
+    height: 176;
+    left: 36;
+    top: 72;
+    padding: 10;
+    box-sizing: border-box;
+    background-color: #0f172a66;
+    border-radius: 16;
     border-width: 1;
     border-color: #ffffff18;
-    width: 1920;
-    height: 44;
+}
+
+.widget {
+    background: linear-gradient(145deg, #1e293bff, #0f172aff);
+    color: #e2e8f0ff;
+    border-radius: 12;
+    border-width: 1;
+    border-color: #ffffff14;
+    text-align: center;
+    font-size: 13;
+    font-weight: bold;
+    box-sizing: border-box;
+    padding: 8;
+}
+
+.widget.accent {
+    background: linear-gradient(135deg, #6366f1ff, #8b5cf6ff);
+    color: #ffffffff;
+}
+
+#widget_cpu  { grid-area: cpu; }
+#widget_mem  { grid-area: mem; }
+#widget_net  { grid-area: net; }
+#widget_disk { grid-area: disk; }
+#widget_temp { grid-area: temp; }
+
+#icon_tray {
+    display: grid;
+    grid-auto-flow: column dense;
+    grid-template-rows: 28 28 28;
+    grid-template-columns: 28 28;
+    place-content: center;
+    gap: 5;
+    width: 74;
+    height: 104;
+    right: 36;
+    top: 248;
+    padding: 6;
+    box-sizing: border-box;
+    background-color: #0f172a88;
+    border-radius: 14;
+    border-width: 1;
+    border-color: #ffffff18;
+}
+
+.tray_icon {
+    background: linear-gradient(145deg, #334155ff, #1e293bff);
+    color: #e2e8f0ff;
+    border-radius: 8;
+    text-align: center;
+    font-size: 10;
+    font-weight: bold;
+    box-sizing: border-box;
+    padding: 6;
+}
+
+#tray_wide {
+    grid-row: span 2;
+}
+
+#taskbar {
+    background-color: #0f172ae6;
+    border-width: 1;
+    border-color: #ffffff14;
+    width: 100%;
+    height: 48;
     left: 0;
-    top: 1036;
+    bottom: 0;
     border-radius: 0;
-    box-shadow: 0 -4 16 rgba(0, 0, 0, 0.35);
+    box-shadow: 0 -6 24 rgba(0, 0, 0, 0.4);
+}
+
+#taskbar_inner {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12;
+    width: 100%;
+    height: 48;
+    left: 0;
+    top: 0;
+    padding: 7;
+    box-sizing: border-box;
 }
 
 .taskbar_btn {
-    background-color: #007affff;
+    background: linear-gradient(135deg, #6366f1ff, #8b5cf6ff);
     color: #ffffffff;
-    width: 72;
-    height: 32;
-    border-radius: 8;
-    left: 12;
-    top: 6;
+    width: 76;
+    height: 34;
+    border-radius: 10;
     text-align: center;
     font-weight: bold;
     font-size: 14;
     cursor: pointer;
+    transition-duration: 0.12s;
+    box-sizing: border-box;
+    flex: 0 0 76;
 }
 
 .taskbar_btn:hover {
-    background-color: #3395ffff;
+    background: linear-gradient(135deg, #818cf8ff, #a78bfaff);
+    transform: translateY(-2px);
 }
 
 .taskbar_btn:active {
-    background-color: #0062ccff;
+    background: linear-gradient(135deg, #4f46e5ff, #7c3aedff);
+    transform: translateY(0px);
 }
 
-#task_spacer {
-    background-color: transparent;
-    width: 1600;
-    height: 44;
-    left: 96;
-    top: 0;
+.taskbar_btn:focus {
+    border-width: 2;
+    border-color: #c7d2fe80;
 }
 
 .taskbar_label {
-    color: #ddddddff;
+    color: #c7d2feff;
     background-color: transparent;
-    width: 200;
-    height: 44;
-    left: 1708;
-    top: 12;
+    width: 120;
+    height: 34;
     text-align: right;
     font-size: 14;
+    flex: 0 0 120;
+}
+
+#taskbar_status {
+    color: #64748bff;
+    background-color: transparent;
+    height: 34;
+    font-size: 12;
+    flex: 1 1 auto;
+    align-self: center;
 }
