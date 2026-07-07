@@ -1,0 +1,149 @@
+<div id="main_win" class="window focused">
+  <div id="title_bar">
+    <div id="title_drag" class="title_drag" draggable="1"></div>
+    <div id="btn_close" class="btn_os"></div>
+    <div id="btn_min" class="btn_os"></div>
+    <div id="btn_max" class="btn_os"></div>
+    <p id="title_text">System Preferences</p>
+  </div>
+  <div id="sidebar">
+    <div id="sidebar_avatar"></div>
+    <p id="sidebar_username">Vespera User</p>
+    <p id="sidebar_role">Administrator</p>
+    <div id="nav_1" class="nav_item active">General</div>
+    <div id="nav_2" class="nav_item">Appearance</div>
+    <div id="nav_3" class="nav_item">Network</div>
+    <div id="nav_4" class="nav_item">Security</div>
+    <div id="tag_cloud">
+      <div class="tag">CSS</div>
+      <div class="tag">Flex</div>
+      <div class="tag wide">Shrink</div>
+      <div class="tag">Grid</div>
+      <div class="tag">Flow</div>
+      <div class="tag wide">Clip</div>
+    </div>
+    <div id="shrink_row">
+      <div class="shrink_item">A</div>
+      <div class="shrink_item">BB</div>
+      <div class="shrink_item">CCC</div>
+      <div class="shrink_item">DD</div>
+    </div>
+    <div id="dense_demo">
+      <div id="dense_wide" class="dense_cell">Wide</div>
+      <div class="dense_cell">1</div>
+      <div class="dense_cell">2</div>
+      <div class="dense_cell">3</div>
+      <div class="dense_cell">4</div>
+    </div>
+    <div id="col_dense_demo">
+      <div id="col_dense_tall" class="col_dense_cell">T</div>
+      <div id="col_dense_b" class="col_dense_cell">B</div>
+      <div class="col_dense_cell">1</div>
+      <div class="col_dense_cell">2</div>
+      <div class="col_dense_cell">3</div>
+    </div>
+  </div>
+  <div id="content">
+    <p id="section_title">General</p>
+    <p id="desc" aria-live="polite">focus-within, scroll-snap, aria-expanded.</p>
+    <div id="sep1"></div>
+    <div id="toolbar">
+      <div id="tool_save" class="tool_btn active" role="button" aria-label="Save settings">Save</div>
+      <div id="tool_reset" class="tool_btn" role="button">Reset</div>
+      <div id="tool_export" class="tool_btn" role="button">Export</div>
+    </div>
+    <div id="apply_btn" aria-label="Apply all pending settings">Apply Changes</div>
+    <div id="chip_row">
+      <div class="chip accent" aria-hidden="true">CSS</div>
+      <div class="chip" aria-hidden="true">Flex</div>
+      <div class="chip">Grid</div>
+      <div class="chip">HSL</div>
+      <div class="chip">Wrap</div>
+      <div class="chip">Self</div>
+      <div id="chip_wide" class="chip">Axis</div>
+      <div class="chip">GLSL</div>
+      <div class="chip">Focus</div>
+    </div>
+    <p id="toggle_row_label">Dark Mode</p>
+    <div id="toggle_knob_track" class="toggle">
+      <div id="toggle_knob" class="toggle_knob"></div>
+    </div>
+    <div id="checkbox_notify" class="checkbox"></div>
+    <p id="chk_label">Enable Notifications</p>
+    <p id="theme_label">Theme</p>
+    <div id="theme_combo">
+      <div id="theme_select_box" role="combobox" aria-label="Theme" aria-expanded="false">Indigo  v</div>
+      <div id="select_panel" class="card hidden">
+        <div id="opt_blue" class="select_option">Indigo</div>
+        <div id="opt_graphite" class="select_option">Graphite</div>
+        <div id="opt_green" class="select_option">Emerald</div>
+      </div>
+    </div>
+    <p id="slider_label">Brightness: 70%</p>
+    <div id="slider_track">
+      <div id="slider_fill"></div>
+      <div id="slider_thumb" draggable="2"></div>
+    </div>
+    <div id="hscroll_panel">
+      <div id="hscroll_inner">
+        <div id="hs_pin" class="hscroll_chip">Pin</div>
+        <div id="hs_1" class="hscroll_chip">Alpha</div>
+        <div id="hs_2" class="hscroll_chip">Beta</div>
+        <div id="hs_3" class="hscroll_chip">Gamma</div>
+        <div id="hs_4" class="hscroll_chip">Delta</div>
+        <div id="hs_5" class="hscroll_chip">Epsilon</div>
+        <div id="hs_6" class="hscroll_chip">Zeta</div>
+      </div>
+    </div>
+    <p id="progress_label">Syncing...</p>
+    <div id="progress_track">
+      <div id="progress_fill"></div>
+    </div>
+    <div id="activity_panel">
+      <div id="activity_header" class="activity_sticky">Recent Activity</div>
+      <div id="act_1" class="activity_line">Sync complete - 2 min ago</div>
+      <div id="act_2" class="activity_line">Theme applied - Indigo</div>
+      <div id="act_3" class="activity_line">Network profile updated</div>
+      <div id="act_4" class="activity_line">Backup finished - 128 files</div>
+      <div id="act_5" class="activity_line">Driver update available</div>
+      <div id="act_6" class="activity_line">VPN connected - qberry</div>
+      <div id="activity_footer" class="activity_sticky_bottom">End of feed</div>
+    </div>
+    <div id="badge_active" class="badge">Active</div>
+    <div id="badge_update" class="badge">Update</div>
+    <div id="badge_err"    class="badge">Error</div>
+    <div id="sep2"></div>
+    <p id="status_text" aria-live="assertive">v3.8.0 - Vespera GUI Engine</p>
+  </div>
+</div>
+<div id="toast" class="window card">
+  <div id="toast_bar">
+    <div id="toast_drag" draggable="1"></div>
+    <div id="toast_icon"></div>
+    <p id="toast_title">Update Available</p>
+    <p id="toast_msg">Version 2.3 is ready to install.</p>
+    <div id="toast_close">x</div>
+  </div>
+</div>
+<div id="info_win" class="window card">
+  <div id="info_drag" draggable="1"></div>
+  <div id="info_close">x</div>
+  <div id="info_icon"></div>
+  <p id="info_title">Vespera GUI Engine</p>
+  <p id="info_msg">OpenGL window manager with CSS styling, gradients, and smooth transitions.</p>
+</div>
+<div id="dock" class="window">
+  <div id="dock_icon_info" class="dock_icon">i</div>
+  <div id="dock_icon_theme" class="dock_icon">T</div>
+  <div id="dock_icon_notify" class="dock_icon">N</div>
+  <div id="dock_icon_toast" class="dock_icon">X</div>
+</div>
+<div id="modal_overlay" class="overlay hidden">
+  <div id="modal_dialog" class="window">
+    <div id="modal_icon"></div>
+    <p id="modal_title">Apply Changes?</p>
+    <p id="modal_msg">Your preferences will be updated immediately.</p>
+    <div id="modal_cancel" role="button" aria-label="Cancel dialog">Cancel</div>
+    <div id="modal_confirm" role="button" aria-label="Confirm and apply">Apply</div>
+  </div>
+</div>

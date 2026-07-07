@@ -1,6 +1,8 @@
-**🚀 Vespera / Lu Desktop**
+**🚀 Luna Desktop**
 
 A **pure Rust** Wayland compositor + custom `libwayland-client` implementation + OpenGL desktop shell (`lu-shell` / `opengl_gui.c`). Run GTK4 apps while replacing Xorg or Weston!
+
+- [GitHub Sponsors](https://github.com/sponsors/yui0)
 
 ---
 
@@ -8,10 +10,10 @@ A **pure Rust** Wayland compositor + custom `libwayland-client` implementation +
 
 | Name              | Actual Binary       | Role |
 |-------------------|---------------------|------|
-| **Lu Desktop**    | Full session        | The complete desktop environment users see after kernel boot |
+| **Luna Desktop**  | Full session        | The complete desktop environment users see after kernel boot |
 | **lu-compositor** | `vespera-server`    | DRM/KMS Wayland compositor (Xorg/Weston replacement) |
 | **lu-shell**      | `opengl_gui`        | Wallpaper, taskbar & shell UI (luUI engine) |
-| **luUI**          | `opengl_gui.c` HTML/CSS engine | UI toolkit for shell & settings apps |
+| **Luna UI**       | `opengl_gui.c` HTML/CSS engine | UI toolkit for shell & settings apps |
 | **wayland-client-rs** | `libwayland_client.so` | Pure Rust client lib that GTK apps connect to |
 
 **Internal codename:** Vespera
