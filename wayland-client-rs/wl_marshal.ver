@@ -1,0 +1,4 @@
+{
+  global: wl_proxy_marshal_flags;
+  local: *;
+};

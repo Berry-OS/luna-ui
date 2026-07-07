@@ -1,0 +1,105 @@
+#!/bin/bash
+# Copyright © 2026 Yuichiro Nakada / Project Lu (Vespera)
+#
+# Lu Desktop session launcher.
+# Starts the compositor (vespera-server), desktop shell (lu-shell), and optional apps.
+#
+# Usage:
+#   ./lu-session                          # DRI compositor + lu-shell
+#   BACKEND=software ./lu-session         # software compositor (dev / VM)
+#   LU_APPS="hello-gtk" ./lu-session      # launch GTK apps after shell
+#   INSTALL_PREFIX=/usr/local make install && lu-session
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROFILE="${PROFILE:-release}"
+PREFIX="${INSTALL_PREFIX:-$SCRIPT_DIR}"
+TARGET="$SCRIPT_DIR/target/$PROFILE"
+BIN="${LU_BIN:-$PREFIX/bin}"
+LIB="${LU_LIB:-$PREFIX/lib/lu}"
+BACKEND="${BACKEND:-dri}"
+SOCKET="${LU_SOCKET:-wayland-0}"
+SIZE="${LU_SIZE:-}"
+PORT="${LU_WEBGL_PORT:-}"
+
+# Dev mode: use local build artifacts when not installed.
+if [ ! -x "$BIN/lu-compositor" ] && [ -x "$TARGET/vespera-server" ]; then
+    BIN="$TARGET"
+    LIB="$TARGET"
+fi
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+export LU_DESKTOP_LAYOUT="${LU_DESKTOP_LAYOUT:-$SCRIPT_DIR/desktop/shell/layout.html}"
+export LU_DESKTOP_CSS="${LU_DESKTOP_CSS:-$SCRIPT_DIR/desktop/shell/style.css}"
+
+COMPOSITOR_PID=""
+SHELL_PID=""
+APP_PIDS=()
+
+cleanup() {
+    for pid in "${APP_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    [ -n "$SHELL_PID" ] && kill "$SHELL_PID" 2>/dev/null || true
+    [ -n "$COMPOSITOR_PID" ] && kill "$COMPOSITOR_PID" 2>/dev/null || true
+    rm -f "$XDG_RUNTIME_DIR/$SOCKET"
+}
+trap cleanup EXIT INT TERM
+
+if [ ! -x "$BIN/lu-compositor" ] && [ ! -x "$BIN/vespera-server" ]; then
+    echo "→ Lu compositor not found; building from source..."
+    make -C "$SCRIPT_DIR" build-desktop PROFILE="$PROFILE"
+    BIN="$TARGET"
+    LIB="$TARGET"
+fi
+
+COMPOSITOR="$BIN/lu-compositor"
+[ -x "$COMPOSITOR" ] || COMPOSITOR="$BIN/vespera-server"
+
+SHELL_BIN="$BIN/lu-shell"
+[ -x "$SHELL_BIN" ] || SHELL_BIN="$SCRIPT_DIR/opengl_gui"
+
+ln -sf libwayland_client.so "$TARGET/libwayland-client.so.0" 2>/dev/null || true
+ln -sf libwayland_client.so "$TARGET/libwayland-client.so" 2>/dev/null || true
+
+COMPOSITOR_ARGS=(--socket "$SOCKET" --backend "$BACKEND")
+if [ -n "$SIZE" ]; then
+    COMPOSITOR_ARGS+=(--size "$SIZE")
+fi
+if [ "$BACKEND" = "webgl" ]; then
+  COMPOSITOR_ARGS+=(--port "${PORT:-8081}")
+fi
+
+echo "→ Starting Lu compositor (backend=$BACKEND, socket=$SOCKET)"
+"$COMPOSITOR" "${COMPOSITOR_ARGS[@]}" &
+COMPOSITOR_PID=$!
+sleep 0.6
+
+export WAYLAND_DISPLAY="$SOCKET"
+export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_PRELOAD="$LIB/libwayland-client.so.0"
+
+echo "→ Starting Lu shell"
+"$SHELL_BIN" --desktop &
+SHELL_PID=$!
+sleep 0.3
+
+if [ -n "${LU_APPS:-}" ]; then
+    for app in $LU_APPS; do
+        echo "→ Launching app: $app"
+        $app &
+        APP_PIDS+=($!)
+    done
+fi
+
+if [ "$BACKEND" = "webgl" ]; then
+    echo ""
+    echo "  WebGL view → http://localhost:${PORT:-8081}/"
+    echo ""
+fi
+
+wait "$SHELL_PID"

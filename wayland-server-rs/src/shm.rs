@@ -1,0 +1,152 @@
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Vespera
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+
+use libc::{c_void, mmap, munmap, MAP_FAILED, MAP_SHARED, PROT_READ};
+use std::os::unix::io::RawFd;
+use std::rc::Rc;
+
+pub const FORMAT_ARGB8888: u32 = 0;
+pub const FORMAT_XRGB8888: u32 = 1;
+
+// DMA_BUF_IOCTL_SYNC: required before/after CPU reads of dmabuf (not SHM).
+#[repr(C)]
+struct DmaBufSync {
+    flags: u64,
+}
+const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+const DMA_BUF_SYNC_START: u64 = 0 << 2;
+const DMA_BUF_SYNC_END: u64 = 1 << 2;
+// _IOW('b', 0, struct dma_buf_sync) = (WRITE<<30)|('b'<<8)|nr|(size<<16)
+const DMA_BUF_IOCTL_SYNC: u64 =
+    (1 << 30) | (0x62u64 << 8) | 0 | ((std::mem::size_of::<DmaBufSync>() as u64) << 16);
+
+pub struct ShmPool {
+    ptr: *mut c_void,
+    size: usize,
+    fd: RawFd,
+    /// dmabuf pools need DMA_BUF_IOCTL_SYNC around CPU access
+    is_dmabuf: bool,
+}
+
+impl ShmPool {
+    pub fn map(fd: RawFd, size: usize) -> Option<Rc<ShmPool>> {
+        Self::map_inner(fd, size, false)
+    }
+
+    pub fn map_dmabuf(fd: RawFd, size: usize) -> Option<Rc<ShmPool>> {
+        Self::map_inner(fd, size, true)
+    }
+
+    fn map_inner(fd: RawFd, size: usize, is_dmabuf: bool) -> Option<Rc<ShmPool>> {
+        if size == 0 {
+            return None;
+        }
+        let ptr = unsafe { mmap(std::ptr::null_mut(), size, PROT_READ, MAP_SHARED, fd, 0) };
+        if ptr == MAP_FAILED {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        Some(Rc::new(ShmPool {
+            ptr,
+            size,
+            fd,
+            is_dmabuf,
+        }))
+    }
+
+    /// Notify dmabuf CPU read boundaries; no-op for SHM.
+    fn dma_sync(&self, start: bool) {
+        if !self.is_dmabuf {
+            return;
+        }
+        let phase = if start {
+            DMA_BUF_SYNC_START
+        } else {
+            DMA_BUF_SYNC_END
+        };
+        let mut arg = DmaBufSync {
+            flags: DMA_BUF_SYNC_READ | phase,
+        };
+        // Retry on EINTR/EAGAIN per dma-buf convention.
+        loop {
+            let r = unsafe { libc::ioctl(self.fd, DMA_BUF_IOCTL_SYNC as _, &mut arg) };
+            if r == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if e != libc::EINTR && e != libc::EAGAIN {
+                break;
+            }
+        }
+    }
+
+    pub fn begin_cpu_read(&self) {
+        self.dma_sync(true);
+    }
+    pub fn end_cpu_read(&self) {
+        self.dma_sync(false);
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        if offset.checked_add(len)? > self.size {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts((self.ptr as *const u8).add(offset), len) })
+    }
+}
+
+impl Drop for ShmPool {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.ptr, self.size);
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ShmBuffer {
+    pub pool: Rc<ShmPool>,
+    pub offset: usize,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+    pub format: u32,
+}
+
+impl ShmBuffer {
+    /// Begin CPU read (dmabuf issues SYNC_START). Pair with end_cpu_read().
+    pub fn begin_cpu_read(&self) {
+        self.pool.begin_cpu_read();
+    }
+
+    pub fn end_cpu_read(&self) {
+        self.pool.end_cpu_read();
+    }
+
+    #[inline]
+    pub fn pixel(&self, x: i32, y: i32) -> Option<u32> {
+        if x < 0 || y < 0 || x >= self.width || y >= self.height {
+            return None;
+        }
+        let off = self.offset + (y as usize) * (self.stride as usize) + (x as usize) * 4;
+        let px = self.pool.slice(off, 4)?;
+        let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+        match self.format {
+            // wl_shm stores BGRA little-endian as 0xAARRGGBB
+            FORMAT_ARGB8888 => Some(v),
+            FORMAT_XRGB8888 => Some(v | 0xff00_0000),
+            _ => Some(v | 0xff00_0000),
+        }
+    }
+}

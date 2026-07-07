@@ -1,0 +1,3 @@
+[workspace]
+members = ["wayland-client-rs", "wayland-server-rs", "hello-gtk"]
+resolver = "2"

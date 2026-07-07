@@ -1,0 +1,14 @@
+[package]
+name = "wayland-client-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wayland_client"
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+libc = "0.2"

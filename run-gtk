@@ -1,0 +1,70 @@
+#!/bin/bash
+# Copyright © 2026 Yuichiro Nakada / Project Vespera
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Vespera WebGL launcher
+#
+# Usage:
+#   ./run-gtk                      # run hello-gtk
+#   ./run-gtk gtk4-demo            # app on PATH
+#   ./run-gtk /usr/bin/gnome-text-editor
+#   PORT=9090 ./run-gtk <app>      # change port
+#   PROFILE=release ./run-gtk      # use release build
+#
+# Open http://localhost:8081/ in a browser to view the app.
+
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROFILE="${PROFILE:-debug}"
+TARGET="$SCRIPT_DIR/target/$PROFILE"
+PORT="${PORT:-8081}"
+SIZE="${SIZE:-1920x1080}"
+SOCKET="${SOCKET:-wayland-webgl-$$}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+
+if [ ! -f "$TARGET/vespera-server" ] || [ "${1}" = "--build" ]; then
+    echo "→ Building (feature=webgl)..."
+    [ "${1}" = "--build" ] && shift
+    cd "$SCRIPT_DIR"
+    if [ "$PROFILE" = "release" ]; then
+        cargo build --features webgl --release
+    else
+        cargo build --features webgl
+    fi
+fi
+
+ln -sf libwayland_client.so "$TARGET/libwayland-client.so.0" 2>/dev/null || true
+ln -sf libwayland_client.so "$TARGET/libwayland-client.so"   2>/dev/null || true
+
+echo "→ Starting WebGL compositor (socket=$SOCKET, port=$PORT)"
+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+    "$TARGET/vespera-server" --socket "$SOCKET" --backend webgl --port "$PORT" --size "$SIZE" &
+COMPOSITOR_PID=$!
+
+cleanup() {
+    kill "$COMPOSITOR_PID" 2>/dev/null || true
+    rm -f "$XDG_RUNTIME_DIR/$SOCKET"
+}
+trap cleanup EXIT INT TERM
+
+sleep 0.4
+
+echo ""
+echo "  Open in browser → http://localhost:$PORT/"
+echo ""
+
+if [ $# -eq 0 ]; then
+    APP="$TARGET/hello-gtk"
+else
+    APP="$*"
+fi
+
+echo "→ Launching app: $APP"
+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+WAYLAND_DISPLAY="$SOCKET" \
+LD_LIBRARY_PATH="$TARGET${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+LD_PRELOAD="$TARGET/libwayland-client.so.0" \
+    $APP

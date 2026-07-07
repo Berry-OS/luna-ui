@@ -1,0 +1,24 @@
+[package]
+name = "wayland-server-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust Wayland compositor (no libwayland). Accepts GTK clients and renders via DRI/WebGL."
+
+[lib]
+name = "wayland_server"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "vespera-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+libc = "0.2"
+tungstenite = { version = "0.24", optional = true }
+
+[features]
+default = []
+# Enable DRM/KMS (DRI) backend. Requires Linux + GPU.
+dri = []
+# WebSocket + WebGL browser display backend (native Linux)
+webgl = ["dep:tungstenite"]

@@ -1,0 +1,61 @@
+#wallpaper {
+    background-color: #1a1f2e;
+    width: 1920;
+    height: 1080;
+    left: 0;
+    top: 0;
+    border-radius: 0;
+}
+
+#taskbar {
+    background-color: rgba(18, 18, 22, 0.92);
+    border-width: 1;
+    border-color: #ffffff18;
+    width: 1920;
+    height: 44;
+    left: 0;
+    top: 1036;
+    border-radius: 0;
+    box-shadow: 0 -4 16 rgba(0, 0, 0, 0.35);
+}
+
+.taskbar_btn {
+    background-color: #007affff;
+    color: #ffffffff;
+    width: 72;
+    height: 32;
+    border-radius: 8;
+    left: 12;
+    top: 6;
+    text-align: center;
+    font-weight: bold;
+    font-size: 14;
+    cursor: pointer;
+}
+
+.taskbar_btn:hover {
+    background-color: #3395ffff;
+}
+
+.taskbar_btn:active {
+    background-color: #0062ccff;
+}
+
+#task_spacer {
+    background-color: transparent;
+    width: 1600;
+    height: 44;
+    left: 96;
+    top: 0;
+}
+
+.taskbar_label {
+    color: #ddddddff;
+    background-color: transparent;
+    width: 200;
+    height: 44;
+    left: 1708;
+    top: 12;
+    text-align: right;
+    font-size: 14;
+}

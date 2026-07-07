@@ -1,0 +1,25 @@
+[Unit]
+Description=Lu Desktop Session
+Documentation=file:///usr/share/doc/lu-desktop/README.md
+After=systemd-user-sessions.service plymouth-quit.service
+Conflicts=getty@tty1.service
+ConditionPathExists=/usr/bin/lu-session
+
+[Service]
+Type=simple
+User=root
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=BACKEND=dri
+ExecStart=/usr/bin/lu-session
+Restart=on-failure
+RestartSec=2
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
