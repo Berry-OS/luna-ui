@@ -241,6 +241,7 @@ typedef struct Element {
     int pos_overridden_x, pos_overridden_y;
     int position_fixed;
     int position_sticky;
+    int position_mode; /* 0 unset 1 static 2 relative 3 absolute */
     float sticky_top;
     int sticky_use_top;
     int sticky_use_bottom;
@@ -414,6 +415,7 @@ typedef struct {
     int pct_bottom; float raw_bottom;
     int pct_right;  float raw_right;
     int has_position; int position_fixed; int position_sticky;
+    int position_mode; /* 0 unset 1 static 2 relative 3 absolute */
 
     int has_opacity; float opacity;
     int has_cursor;  int cursor_pointer; int cursor_type;
@@ -521,8 +523,11 @@ float  window_width = 1024.0f, window_height = 768.0f;
 GLFWwindow* g_window = NULL;
 static int g_desktop_mode = 0;
 static int g_fullscreen   = 0;
-static const char* g_layout_path = "layout.html";
-static const char* g_css_path    = "style.css";
+static const char* g_layout_path = "ui/demo_layout.html";
+static const char* g_css_path    = "ui/demo_style.css";
+static char g_html_base_dir[512] = "ui";
+static char g_doc_title[128] = "Vespera GUI Engine";
+static int  g_css_from_document = 0;
 int   drag_target_idx = -1;
 float drag_offset_x   = 0, drag_offset_y = 0;
 static int    g_scroll_drag_idx = -1;
@@ -1536,6 +1541,18 @@ int selector_matches(CSSRule* r, Element* e) {
 // CSS declaration parsing
 // ============================================================
 
+#define POS_UNSET     0
+#define POS_STATIC    1
+#define POS_RELATIVE  2
+#define POS_ABSOLUTE  3
+
+static int offsets_should_apply(const Element* e) {
+    if (e->position_fixed || e->position_sticky) return 1;
+    if (e->position_mode == POS_STATIC) return 0;
+    if (e->position_mode == POS_RELATIVE || e->position_mode == POS_ABSOLUTE) return 1;
+    return 1;
+}
+
 void parse_declarations(char* declarations, CSSRule* rule) {
     char* prop = declarations;
     while (prop && *prop) {
@@ -1593,6 +1610,9 @@ void parse_declarations(char* declarations, CSSRule* rule) {
                 rule->has_position = 1;
                 rule->position_fixed = (strcmp(val, "fixed") == 0);
                 rule->position_sticky = (strcmp(val, "sticky") == 0);
+                if (strcmp(val, "absolute") == 0) rule->position_mode = POS_ABSOLUTE;
+                else if (strcmp(val, "relative") == 0) rule->position_mode = POS_RELATIVE;
+                else if (strcmp(val, "static") == 0) rule->position_mode = POS_STATIC;
             }
             else if (strcmp(key, "opacity") == 0)          { rule->has_opacity = 1; rule->opacity = parse_float_val(val); }
             else if (strcmp(key, "cursor") == 0)           { rule->has_cursor = 1; rule->cursor_type = parse_cursor_type(val); rule->cursor_pointer = (rule->cursor_type == 1); }
@@ -1957,6 +1977,12 @@ void parse_css(const char* css_text) {
 
         char* brace_close = strchr(brace_open + 1, '}');
         if (!brace_close) break;
+
+        if (selector_line[0] == '@') {
+            rule_start = brace_close + 1;
+            continue;
+        }
+
         *brace_close = '\0';
 
         char declarations[1024] = {0};
@@ -2073,6 +2099,7 @@ void update_element_style(Element* e) {
     e->has_scrollbar_width = 0;
     e->has_scrollbar_color = 0;
     e->position_sticky = 0;
+    e->position_mode = POS_UNSET;
     e->sticky_top = 0.0f;
     e->sticky_use_top = 0;
     e->sticky_use_bottom = 0;
@@ -2167,27 +2194,28 @@ void update_element_style(Element* e) {
             e->margin_bottom = r->margin_bottom;
             e->margin_left = r->margin_left;
         }
-        if (r->has_left && !e->pos_overridden_x) {
+        if (r->has_position) {
+            e->position_fixed = r->position_fixed;
+            e->position_sticky = r->position_sticky;
+            if (r->position_mode != POS_UNSET) e->position_mode = r->position_mode;
+        }
+        if (r->has_left && !e->pos_overridden_x && offsets_should_apply(e)) {
             e->pct_left = r->pct_left; if (r->pct_left) e->raw_left = r->raw_left; else e->rel_x = r->left;
             e->has_right = 0; e->css_positioned |= 1;
         }
-        if (r->has_top  && !e->pos_overridden_y) {
+        if (r->has_top && !e->pos_overridden_y && offsets_should_apply(e)) {
             e->pct_top = r->pct_top; if (r->pct_top) e->raw_top = r->raw_top; else e->rel_y = r->top;
             e->has_bottom = 0; e->css_positioned |= 2;
         }
-        if (r->has_bottom && !e->pos_overridden_y) {
+        if (r->has_bottom && !e->pos_overridden_y && offsets_should_apply(e)) {
             e->has_bottom = 1; e->pct_bottom = r->pct_bottom;
             if (r->pct_bottom) e->raw_bottom = r->raw_bottom; else e->bottom_val = r->bottom;
             e->css_positioned |= 2;
         }
-        if (r->has_right && !e->pos_overridden_x) {
+        if (r->has_right && !e->pos_overridden_x && offsets_should_apply(e)) {
             e->has_right = 1; e->pct_right = r->pct_right;
             if (r->pct_right) e->raw_right = r->raw_right; else e->right_val = r->right;
             e->css_positioned |= 1;
-        }
-        if (r->has_position) {
-            e->position_fixed = r->position_fixed;
-            e->position_sticky = r->position_sticky;
         }
         if (r->has_top && e->position_sticky && !e->sticky_use_bottom) {
             e->sticky_use_top = 1;
@@ -2344,6 +2372,74 @@ void update_element_style(Element* e) {
 // HTML parsing
 // ============================================================
 
+static void set_html_base_dir(const char* layout_path) {
+    if (!layout_path || !layout_path[0]) {
+        snprintf(g_html_base_dir, sizeof(g_html_base_dir), "ui");
+        return;
+    }
+    strncpy(g_html_base_dir, layout_path, sizeof(g_html_base_dir) - 1);
+    g_html_base_dir[sizeof(g_html_base_dir) - 1] = '\0';
+    char* slash = strrchr(g_html_base_dir, '/');
+    if (slash) *slash = '\0';
+    else g_html_base_dir[0] = '\0';
+}
+
+static void resolve_resource_path(const char* href, char* out, size_t outsz) {
+    if (!href || !href[0]) { out[0] = '\0'; return; }
+    if (href[0] == '/' || strchr(href, ':')) {
+        snprintf(out, outsz, "%s", href);
+        return;
+    }
+    if (g_html_base_dir[0])
+        snprintf(out, outsz, "%s/%s", g_html_base_dir, href);
+    else
+        snprintf(out, outsz, "%s", href);
+}
+
+static int tag_attr_equals(const char* tag_buf, const char* key, const char* val) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "%s=\"", key);
+    char* a = strstr(tag_buf, pattern);
+    if (!a) return 0;
+    char got[64] = {0};
+    sscanf(a + (int)strlen(pattern), "%63[^\"]", got);
+    return strcasecmp(got, val) == 0;
+}
+
+static int tag_is_stylesheet_link(const char* tag_buf) {
+    if (!tag_attr_equals(tag_buf, "rel", "stylesheet")) {
+        char* rel = strstr(tag_buf, "rel=\"");
+        if (!rel) return 0;
+        char rval[32] = {0};
+        sscanf(rel + 5, "%31[^\"]", rval);
+        return strcasestr(rval, "stylesheet") != NULL;
+    }
+    return 1;
+}
+
+static void load_stylesheet_href(const char* href) {
+    if (!href || !href[0]) return;
+    char path[512];
+    resolve_resource_path(href, path, sizeof(path));
+    char* css = read_file(path);
+    if (css) {
+        parse_css(css);
+        free(css);
+        g_css_from_document = 1;
+    }
+}
+
+static void ingest_inline_style(const char* css, int len) {
+    if (!css || len <= 0) return;
+    char* buf = (char*)malloc((size_t)len + 1);
+    if (!buf) return;
+    memcpy(buf, css, (size_t)len);
+    buf[len] = '\0';
+    parse_css(buf);
+    free(buf);
+    g_css_from_document = 1;
+}
+
 static int is_void_element(const char* t) {
     static const char* v[] = {
         "area","base","br","col","embed","hr","img","input",
@@ -2356,6 +2452,12 @@ static int is_void_element(const char* t) {
 static int is_ignored_element(const char* t) {
     static const char* ig[] = {"html","head","body","style","script","title",NULL};
     for (int i = 0; ig[i]; i++) if (strcasecmp(t, ig[i]) == 0) return 1;
+    return 0;
+}
+
+static int is_semantic_shell_element(const char* t) {
+    static const char* sh[] = {"html","head","body","meta","link","title",NULL};
+    for (int i = 0; sh[i]; i++) if (strcasecmp(t, sh[i]) == 0) return 1;
     return 0;
 }
 
@@ -2409,12 +2511,56 @@ void parse_html(const char* html) {
         int tl = (int)strlen(type);
         while (tl > 0 && (type[tl-1] == '/' || isspace((unsigned char)type[tl-1]))) type[--tl] = '\0';
 
-        // Skip style/script content
-        if (strcasecmp(type, "style") == 0 || strcasecmp(type, "script") == 0) {
+        if (strcasecmp(type, "link") == 0) {
+            if (tag_is_stylesheet_link(tag_buf)) {
+                char href[256] = {0};
+                char* attr_href = strstr(tag_buf, "href=\"");
+                if (attr_href) sscanf(attr_href + 6, "%255[^\"]", href);
+                load_stylesheet_href(href);
+            }
+            p = tag_end + 1;
+            continue;
+        }
+
+        if (strcasecmp(type, "meta") == 0) {
+            p = tag_end + 1;
+            continue;
+        }
+
+        if (strcasecmp(type, "title") == 0) {
+            const char* text_start = tag_end + 1;
+            const char* close_title = strcasestr(text_start, "</title>");
+            if (close_title && close_title > text_start) {
+                int tlen = (int)(close_title - text_start);
+                if (tlen > (int)sizeof(g_doc_title) - 1) tlen = (int)sizeof(g_doc_title) - 1;
+                strncpy(g_doc_title, text_start, (size_t)tlen);
+                g_doc_title[tlen] = '\0';
+                trim_whitespace(g_doc_title);
+            }
+            p = close_title ? strchr(close_title, '>') + 1 : tag_end + 1;
+            continue;
+        }
+
+        // Skip style/script content (style ingests CSS; script is ignored)
+        if (strcasecmp(type, "style") == 0) {
+            const char* css_start = tag_end + 1;
+            const char* close_pos = strcasestr(css_start, "</style>");
+            if (close_pos && close_pos > css_start)
+                ingest_inline_style(css_start, (int)(close_pos - css_start));
+            const char* gt2 = close_pos ? strchr(close_pos, '>') : NULL;
+            p = gt2 ? gt2 + 1 : tag_end + 1;
+            continue;
+        }
+        if (strcasecmp(type, "script") == 0) {
             char close_tag[40]; snprintf(close_tag, sizeof(close_tag), "</%s", type);
             const char* close_pos = strcasestr(tag_end + 1, close_tag);
             const char* gt2 = close_pos ? strchr(close_pos, '>') : NULL;
             p = gt2 ? gt2 + 1 : tag_end + 1;
+            continue;
+        }
+
+        if (is_semantic_shell_element(type)) {
+            p = tag_end + 1;
             continue;
         }
 
@@ -4650,6 +4796,7 @@ static int element_is_focusable(int idx) {
     if (e->tabindex >= 0) return 1;
     if (e->role[0] && strcmp(e->role, "button") == 0) return 1;
     if (e->role[0] && strcmp(e->role, "combobox") == 0) return 1;
+    if (strcasecmp(e->type, "button") == 0) return 1;
     return e->on_click || e->cursor_pointer;
 }
 
@@ -4907,9 +5054,10 @@ int main(int argc, char** argv) {
         glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
     }
 
-    const char* title = g_desktop_mode ? "Lu Shell" : "Vespera GUI Engine";
+    const char* win_title = g_desktop_mode ? "Lu Shell" :
+        (g_doc_title[0] ? g_doc_title : "Vespera GUI Engine");
     GLFWmonitor* monitor = g_fullscreen ? glfwGetPrimaryMonitor() : NULL;
-    GLFWwindow* window = glfwCreateWindow((int)window_width, (int)window_height, title, monitor, NULL);
+    GLFWwindow* window = glfwCreateWindow((int)window_width, (int)window_height, win_title, monitor, NULL);
     g_window = window;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -4938,14 +5086,24 @@ int main(int argc, char** argv) {
     init_rect_geometry();
     init_font();
 
-    // Load CSS then HTML (file or built-in demo)
-    char* css_str = read_file(g_css_path);
-    if (css_str) { parse_css(css_str); free(css_str); }
-    else if (!g_desktop_mode) { parse_css(default_css); }
+    g_css_from_document = 0;
 
+    // Load HTML document (parses <link>/<style> in <head>), then fallback CSS
+    set_html_base_dir(g_layout_path);
     char* html_str = read_file(g_layout_path);
-    if (html_str) { parse_html(html_str); free(html_str); }
-    else if (!g_desktop_mode) { parse_html(default_html); }
+    if (html_str) {
+        parse_html(html_str);
+        free(html_str);
+    } else if (!g_desktop_mode) {
+        set_html_base_dir("ui");
+        parse_html(default_html);
+    }
+
+    if (!g_css_from_document) {
+        char* css_str = read_file(g_css_path);
+        if (css_str) { parse_css(css_str); free(css_str); }
+        else if (!g_desktop_mode) { parse_css(default_css); }
+    }
 
     g_clock_idx = get_element_by_id("clock");
     update_clock(glfwGetTime() + 1.0);
