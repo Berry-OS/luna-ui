@@ -22,6 +22,9 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
+#define CSS_PARSER_IMPLEMENTATION
+#include "cssparser.h"
+
 typedef void (*PFNGLCREATEVERTEXARRAYSPROC)(GLsizei n, GLuint* arrays);
 typedef void (*PFNGLDELETEVERTEXARRAYSPROC)(GLsizei n, const GLuint* arrays);
 typedef void (*PFNGLGENBUFFERSPROC)(GLsizei n, GLuint* buffers);
@@ -351,6 +354,7 @@ typedef struct Element {
     char grid_area_name[32];
     int has_grid_area;
     int grid_child;
+    int flow_child;
 
     int overflow_x, overflow_y;
     float scroll_top, scroll_left;
@@ -508,13 +512,13 @@ typedef struct {
     int has_transform_ty; float transform_ty;
     int has_transition; float transition_duration;
     int has_pointer_events; int pointer_events_none;
-} CSSRule;
+} StyleRule;
 
 #define MAX_ELEMENTS 500
 #define MAX_RULES    600
 
 Element  elements[MAX_ELEMENTS]; int elem_count = 0;
-CSSRule  css_rules[MAX_RULES];   int rule_count = 0;
+StyleRule  css_rules[MAX_RULES];   int rule_count = 0;
 
 static int render_order[MAX_ELEMENTS];
 
@@ -780,7 +784,7 @@ static void parse_length(const char* val, float* out_num, int* out_pct) {
 
 // Parse box-shadow: dx dy blur color
 // Uses strtof so trailing color string (including rgba with spaces) is handled.
-static void parse_box_shadow(const char* val, CSSRule* rule) {
+static void parse_box_shadow(const char* val, StyleRule* rule) {
     const char* p = val;
     char* endp;
     float dx   = strtof(p, &endp); p = endp; while (isspace((unsigned char)*p)) p++;
@@ -796,7 +800,7 @@ static void parse_box_shadow(const char* val, CSSRule* rule) {
 }
 
 // Parse border shorthand: "1px solid #color" or "none" or "0"
-static void parse_border_shorthand(const char* val, CSSRule* rule) {
+static void parse_border_shorthand(const char* val, StyleRule* rule) {
     rule->has_border = 1;
     if (strcmp(val, "none") == 0 || strcmp(val, "0") == 0) {
         rule->border_width = 0; rule->bd_a = 0; return;
@@ -821,7 +825,7 @@ static void parse_border_shorthand(const char* val, CSSRule* rule) {
 }
 
 // Copy gradient stops into rule/element
-static void apply_gradient_rule(CSSRule* rule, int type, float angle,
+static void apply_gradient_rule(StyleRule* rule, int type, float angle,
                                 float rcx, float rcy, float rr) {
     rule->has_gradient = 1;
     rule->grad_type = type;
@@ -839,7 +843,7 @@ static void apply_gradient_rule(CSSRule* rule, int type, float angle,
 }
 
 // Parse comma-separated color stops after gradient header
-static int parse_gradient_stops(const char** p_in, CSSRule* rule) {
+static int parse_gradient_stops(const char** p_in, StyleRule* rule) {
     const char* p = *p_in;
     int count = 0;
     while (*p && *p != ')' && count < MAX_GRAD_STOPS) {
@@ -905,7 +909,7 @@ static int parse_gradient_stops(const char** p_in, CSSRule* rule) {
 }
 
 // Parse linear-gradient(angle, stop1, stop2, ...)
-static void parse_linear_gradient(const char* val, CSSRule* rule) {
+static void parse_linear_gradient(const char* val, StyleRule* rule) {
     const char* p = strchr(val, '(');
     if (!p) return;
     p++;
@@ -938,7 +942,7 @@ static void parse_linear_gradient(const char* val, CSSRule* rule) {
 }
 
 // Parse radial-gradient(shape at cx cy, stops...)
-static void parse_radial_gradient(const char* val, CSSRule* rule) {
+static void parse_radial_gradient(const char* val, StyleRule* rule) {
     const char* p = strchr(val, '(');
     if (!p) return;
     p++;
@@ -982,7 +986,7 @@ static void parse_radial_gradient(const char* val, CSSRule* rule) {
 }
 
 // Parse background shorthand: color or gradient(...)
-static void parse_background_shorthand(const char* val, CSSRule* rule) {
+static void parse_background_shorthand(const char* val, StyleRule* rule) {
     char buf[512];
     strncpy(buf, val, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
@@ -1001,7 +1005,30 @@ static void parse_background_shorthand(const char* val, CSSRule* rule) {
     }
 }
 
-static void parse_margin_shorthand(const char* val, CSSRule* rule) {
+static void parse_padding_shorthand(const char* val, StyleRule* rule) {
+    float vals[4] = {0, 0, 0, 0};
+    char buf[128];
+    strncpy(buf, val, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    int count = 0;
+    char* tok = strtok(buf, " \t");
+    while (tok && count < 4) {
+        vals[count++] = parse_float_val(tok);
+        tok = strtok(NULL, " \t");
+    }
+    rule->has_padding = 1;
+    if (count == 1) {
+        rule->padding = vals[0];
+    } else if (count == 2) {
+        rule->padding = vals[0];
+    } else if (count == 3) {
+        rule->padding = vals[0];
+    } else if (count >= 4) {
+        rule->padding = vals[0];
+    }
+}
+
+static void parse_margin_shorthand(const char* val, StyleRule* rule) {
     float vals[4] = {0, 0, 0, 0};
     char buf[128];
     strncpy(buf, val, sizeof(buf) - 1);
@@ -1030,7 +1057,7 @@ static void parse_margin_shorthand(const char* val, CSSRule* rule) {
     }
 }
 
-static void parse_scroll_margin_shorthand(const char* val, CSSRule* rule) {
+static void parse_scroll_margin_shorthand(const char* val, StyleRule* rule) {
     float vals[4] = {0, 0, 0, 0};
     char buf[128];
     strncpy(buf, val, sizeof(buf) - 1);
@@ -1060,7 +1087,7 @@ static void parse_scroll_margin_shorthand(const char* val, CSSRule* rule) {
     }
 }
 
-static void parse_scroll_padding_shorthand(const char* val, CSSRule* rule) {
+static void parse_scroll_padding_shorthand(const char* val, StyleRule* rule) {
     float vals[4] = {0, 0, 0, 0};
     char buf[128];
     strncpy(buf, val, sizeof(buf) - 1);
@@ -1091,7 +1118,7 @@ static void parse_scroll_padding_shorthand(const char* val, CSSRule* rule) {
 }
 
 // Parse transform: scale(), translateX(), translateY() (may be combined)
-static void parse_transform(const char* val, CSSRule* rule) {
+static void parse_transform(const char* val, StyleRule* rule) {
     const char* p = val;
     while (p && *p) {
         while (isspace((unsigned char)*p)) p++;
@@ -1174,7 +1201,7 @@ static float parse_scrollbar_width(const char* val) {
     return parse_float_val(val);
 }
 
-static void parse_scrollbar_color(const char* val, CSSRule* rule) {
+static void parse_scrollbar_color(const char* val, StyleRule* rule) {
     char buf[128];
     strncpy(buf, val, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
@@ -1264,7 +1291,7 @@ static void parse_single_grid_track(const char* val, float* size, int* type, flo
     parse_one_grid_track(tok, size, type, min_px);
 }
 
-static void parse_grid_template_areas(const char* val, CSSRule* rule) {
+static void parse_grid_template_areas(const char* val, StyleRule* rule) {
     memset(rule->grid_area_cell, 0, sizeof(rule->grid_area_cell));
     rule->grid_area_rows = 0;
     rule->grid_area_cols = 0;
@@ -1496,7 +1523,7 @@ void parse_simple_selector(const char* sel_in, SimpleSelector* out) {
     }
 }
 
-void parse_selector(const char* sel_in, CSSRule* rule) {
+void parse_selector(const char* sel_in, StyleRule* rule) {
     char sel[128]; strncpy(sel, sel_in, sizeof(sel) - 1); sel[sizeof(sel)-1] = 0;
     rule->ancestor_count = 0;
 
@@ -1523,7 +1550,7 @@ int simple_selector_matches(SimpleSelector* s, Element* e) {
     return 1;
 }
 
-int selector_matches(CSSRule* r, Element* e) {
+int selector_matches(StyleRule* r, Element* e) {
     if (!simple_selector_matches(&r->target, e)) return 0;
     int search_from = e->parent_idx;
     for (int a = 0; a < r->ancestor_count; a++) {
@@ -1553,7 +1580,19 @@ static int offsets_should_apply(const Element* e) {
     return 1;
 }
 
-void parse_declarations(char* declarations, CSSRule* rule) {
+/* Forward declaration — defined below */
+void parse_declarations(char* declarations, StyleRule* rule);
+
+/* Apply one pre-tokenised CSS key/value to a StyleRule.
+   Wraps parse_declarations so all property logic stays in one place. */
+static void apply_one_declaration(const char* key, const char* val, StyleRule* rule) {
+    /* buf = "key: val;" — parse_declarations handles the rest */
+    char buf[CSS_MAX_VALUE + CSS_MAX_STR + 4];
+    snprintf(buf, sizeof(buf), "%s: %s;", key, val);
+    parse_declarations(buf, rule);
+}
+
+void parse_declarations(char* declarations, StyleRule* rule) {
     char* prop = declarations;
     while (prop && *prop) {
         char* semi  = strchr(prop, ';');
@@ -1596,7 +1635,7 @@ void parse_declarations(char* declarations, CSSRule* rule) {
             else if (strcmp(key, "border") == 0)           { parse_border_shorthand(val, rule); }
             else if (strcmp(key, "width") == 0)            { rule->has_width = 1; parse_length(val, &rule->width, &rule->pct_w); if (rule->pct_w) rule->raw_w = rule->width; }
             else if (strcmp(key, "height") == 0)           { rule->has_height = 1; parse_length(val, &rule->height, &rule->pct_h); if (rule->pct_h) rule->raw_h = rule->height; }
-            else if (strcmp(key, "padding") == 0)          { rule->has_padding = 1; rule->padding = parse_float_val(val); }
+            else if (strcmp(key, "padding") == 0)          { parse_padding_shorthand(val, rule); }
             else if (strcmp(key, "margin") == 0)           { parse_margin_shorthand(val, rule); }
             else if (strcmp(key, "margin-top") == 0)       { rule->has_margin = 1; rule->margin_top = parse_float_val(val); }
             else if (strcmp(key, "margin-right") == 0)     { rule->has_margin = 1; rule->margin_right = parse_float_val(val); }
@@ -1954,85 +1993,127 @@ void parse_declarations(char* declarations, CSSRule* rule) {
 }
 
 int cmp_rules_by_specificity(const void* a, const void* b) {
-    return ((const CSSRule*)a)->specificity - ((const CSSRule*)b)->specificity;
+    return ((const StyleRule*)a)->specificity - ((const StyleRule*)b)->specificity;
+}
+
+/* ── Build a StyleRule from one parsed CSSRule ──────────────────────── */
+
+/* Convert cssparser.h CSSSelector into our SimpleSelector + pseudo flags. */
+static void convert_selector(const CSSSelector *cs, SimpleSelector *ss,
+                              int *is_hover, int *is_active, int *is_focus,
+                              int *is_focus_visible, int *is_focus_within) {
+    memset(ss, 0, sizeof(*ss));
+    for (int pi = 0; pi < cs->compounds[cs->compound_count > 0 ? cs->compound_count - 1 : 0].part_count; pi++) {
+        const CSSSelectorPart *p = &cs->compounds[cs->compound_count > 0 ? cs->compound_count - 1 : 0].parts[pi];
+        switch (p->type) {
+        case CSS_SEL_TYPE:
+            strncpy(ss->sel_type, p->name, sizeof(ss->sel_type) - 1);
+            break;
+        case CSS_SEL_ID:
+            /* strip leading '#' if present */
+            strncpy(ss->sel_id, p->name[0] == '#' ? p->name + 1 : p->name, sizeof(ss->sel_id) - 1);
+            break;
+        case CSS_SEL_CLASS:
+            if (ss->sel_class_count < MAX_SEL_CLASSES)
+                strncpy(ss->sel_classes[ss->sel_class_count++], p->name, sizeof(ss->sel_classes[0]) - 1);
+            break;
+        case CSS_SEL_PSEUDO_CLASS:
+            if      (strcmp(p->name, "hover")        == 0) *is_hover = 1;
+            else if (strcmp(p->name, "active")       == 0) *is_active = 1;
+            else if (strcmp(p->name, "focus-visible") == 0) *is_focus_visible = 1;
+            else if (strcmp(p->name, "focus-within") == 0) *is_focus_within = 1;
+            else if (strcmp(p->name, "focus")        == 0) *is_focus = 1;
+            break;
+        default: break;
+        }
+    }
+}
+
+/* Compute specificity for our internal format (100·id + 10·cls + 1·type). */
+static int simple_selector_spec(const SimpleSelector *ss) {
+    return (ss->sel_id[0] ? 100 : 0)
+         + ss->sel_class_count * 10
+         + (ss->sel_type[0] ? 1 : 0);
+}
+
+/* Ingest one cssparser.h CSSRule into the global css_rules[] array.
+   For each selector in the rule a separate StyleRule entry is created. */
+static void ingest_parsed_rule(const CSSRule *pr) {
+    /* Build declaration-derived template once */
+    StyleRule tmpl; memset(&tmpl, 0, sizeof(tmpl));
+    for (int di = 0; di < pr->decl_count; di++)
+        apply_one_declaration(pr->decls[di].property, pr->decls[di].value, &tmpl);
+
+    for (int si = 0; si < pr->selector_count && rule_count < MAX_RULES; si++) {
+        const CSSSelector *cs = &pr->selectors[si];
+        if (cs->compound_count == 0) continue;
+
+        StyleRule rule = tmpl;
+        int is_hover = 0, is_active = 0, is_focus = 0, is_fvis = 0, is_fwithin = 0;
+
+        /* Target = last compound */
+        convert_selector(cs, &rule.target,
+                         &is_hover, &is_active, &is_focus, &is_fvis, &is_fwithin);
+
+        /* Ancestor compounds (earlier) */
+        rule.ancestor_count = 0;
+        for (int ci = 0; ci < cs->compound_count - 1 && rule.ancestor_count < MAX_SEL_ANCESTORS; ci++) {
+            SimpleSelector *anc = &rule.ancestors[rule.ancestor_count++];
+            memset(anc, 0, sizeof(*anc));
+            const CSSCompound *cmp = &cs->compounds[ci];
+            for (int pi = 0; pi < cmp->part_count; pi++) {
+                const CSSSelectorPart *p = &cmp->parts[pi];
+                if      (p->type == CSS_SEL_TYPE)  strncpy(anc->sel_type, p->name, sizeof(anc->sel_type)-1);
+                else if (p->type == CSS_SEL_ID)    strncpy(anc->sel_id,   p->name, sizeof(anc->sel_id)-1);
+                else if (p->type == CSS_SEL_CLASS && anc->sel_class_count < MAX_SEL_CLASSES)
+                    strncpy(anc->sel_classes[anc->sel_class_count++], p->name, sizeof(anc->sel_classes[0])-1);
+            }
+        }
+
+        rule.is_hover        = is_hover;
+        rule.is_active       = is_active;
+        rule.is_focus        = is_focus && !is_fvis;
+        rule.is_focus_visible = is_fvis;
+        rule.is_focus_within  = is_fwithin;
+
+        /* Specificity: use cssparser.h value scaled to our units */
+        int spec = simple_selector_spec(&rule.target);
+        for (int a = 0; a < rule.ancestor_count; a++)
+            spec += simple_selector_spec(&rule.ancestors[a]);
+        if (is_hover)   spec += 1000;
+        if (is_active)  spec += 2000;
+        if (is_fvis)    spec += 1600;
+        if (is_fwithin) spec += 1550;
+        if (is_focus && !is_fvis) spec += 1500;
+        rule.specificity = spec;
+
+        /* Store selector string for debugging */
+        snprintf(rule.selector, sizeof(rule.selector) - 1,
+                 "[sel%d]", si);
+
+        css_rules[rule_count++] = rule;
+    }
 }
 
 void parse_css(const char* css_text) {
-    char* copy = strdup(css_text);
-    // Strip /* ... */ comments
-    char* c;
-    while ((c = strstr(copy, "/*")) != NULL) {
-        char* end = strstr(c, "*/");
-        if (end) memset(c, ' ', end - c + 2); else break;
+    rule_count = 0;
+    CSSStyleSheet *sheet = css_parse(css_text, 0);
+    if (!sheet) return;
+
+    /* Normal rules */
+    for (int i = 0; i < sheet->rule_count && rule_count < MAX_RULES; i++)
+        ingest_parsed_rule(&sheet->rules[i]);
+
+    /* @media / @supports nested rules */
+    for (int i = 0; i < sheet->at_rule_count; i++) {
+        const CSSAtRule *at = &sheet->at_rules[i];
+        if (at->type != CSS_AT_MEDIA && at->type != CSS_AT_SUPPORTS) continue;
+        for (int j = 0; j < at->nested_rule_count && rule_count < MAX_RULES; j++)
+            ingest_parsed_rule(&at->nested_rules[j]);
     }
 
-    char* rule_start = copy;
-    while (rule_start && *rule_start && rule_count < MAX_RULES) {
-        char* brace_open = strchr(rule_start, '{');
-        if (!brace_open) break;
-        *brace_open = '\0';
-
-        char selector_line[256] = {0};
-        strncpy(selector_line, rule_start, 255); trim_whitespace(selector_line);
-
-        char* brace_close = strchr(brace_open + 1, '}');
-        if (!brace_close) break;
-
-        if (selector_line[0] == '@') {
-            rule_start = brace_close + 1;
-            continue;
-        }
-
-        *brace_close = '\0';
-
-        char declarations[1024] = {0};
-        strncpy(declarations, brace_open + 1, 1023); trim_whitespace(declarations);
-
-        CSSRule template_rule; memset(&template_rule, 0, sizeof(CSSRule));
-        parse_declarations(declarations, &template_rule);
-
-        char sel_copy[256]; strncpy(sel_copy, selector_line, 255); sel_copy[255] = 0;
-        char* sel_tok = strtok(sel_copy, ",");
-        while (sel_tok && rule_count < MAX_RULES) {
-            char one[128] = {0}; strncpy(one, sel_tok, 127); trim_whitespace(one);
-
-            CSSRule rule = template_rule;
-            char* pseudo_fwithin = strstr(one, ":focus-within");
-            char* pseudo_fvis   = strstr(one, ":focus-visible");
-            char* pseudo_hover  = strstr(one, ":hover");
-            char* pseudo_active = strstr(one, ":active");
-            char* pseudo_focus  = strstr(one, ":focus");
-            if (pseudo_fwithin) { rule.is_focus_within = 1; *pseudo_fwithin = '\0'; }
-            if (pseudo_fvis)   { rule.is_focus_visible = 1; *pseudo_fvis = '\0'; }
-            if (pseudo_hover)  { rule.is_hover = 1; *pseudo_hover = '\0'; }
-            if (pseudo_active) { rule.is_active = 1; *pseudo_active = '\0'; }
-            if (!pseudo_fvis && pseudo_focus) { rule.is_focus = 1; *pseudo_focus = '\0'; }
-            trim_whitespace(one);
-
-            strncpy(rule.selector, one, 127);
-            parse_selector(one, &rule);
-
-            int spec = (rule.target.sel_id[0] ? 100 : 0)
-                     + rule.target.sel_class_count * 10
-                     + (rule.target.sel_type[0] ? 1 : 0);
-            for (int a = 0; a < rule.ancestor_count; a++)
-                spec += (rule.ancestors[a].sel_id[0] ? 100 : 0)
-                      + rule.ancestors[a].sel_class_count * 10
-                      + (rule.ancestors[a].sel_type[0] ? 1 : 0);
-            rule.specificity = spec;
-            if (rule.is_hover)  rule.specificity += 1000;
-            if (rule.is_active) rule.specificity += 2000;
-            if (rule.is_focus_visible) rule.specificity += 1600;
-            if (rule.is_focus_within) rule.specificity += 1550;
-            if (rule.is_focus)  rule.specificity += 1500;
-
-            css_rules[rule_count++] = rule;
-            sel_tok = strtok(NULL, ",");
-        }
-        rule_start = brace_close + 1;
-    }
-    free(copy);
-    qsort(css_rules, rule_count, sizeof(CSSRule), cmp_rules_by_specificity);
+    css_free(sheet);
+    qsort(css_rules, rule_count, sizeof(StyleRule), cmp_rules_by_specificity);
 }
 
 // ============================================================
@@ -2137,7 +2218,7 @@ void update_element_style(Element* e) {
     e->pct_bottom = 0; e->pct_right = 0;
 
     for (int i = 0; i < rule_count; i++) {
-        CSSRule* r = &css_rules[i];
+        StyleRule* r = &css_rules[i];
         if (!selector_matches(r, e)) continue;
         if (r->is_hover  && !e->is_hovered) continue;
         if (r->is_active && !e->is_active)  continue;
@@ -2670,6 +2751,78 @@ void parse_html(const char* html) {
 // Layout & Animation
 // ============================================================
 
+FontAtlas* get_atlas(int size, int bold, int* out_is_fake_bold);
+float measure_text_width(FontAtlas* atlas, const char* text);
+
+static float flow_content_height(Element* e) {
+    float lh = (float)e->font_size;
+    if (lh < 10.0f) lh = 12.0f;
+    lh *= 1.5f;
+    return lh + e->padding * 2.0f;
+}
+
+static float flex_content_width(Element* ch) {
+    if (ch->has_css_width && !ch->pct_w) return ch->css_width;
+    if (ch->text[0] && font_loaded) {
+        FontAtlas* atlas = get_atlas(ch->font_size, ch->font_bold, NULL);
+        return measure_text_width(atlas, ch->text) + ch->padding * 2.0f + 4.0f;
+    }
+    if (ch->w > 0.0f && ch->w < 200.0f) return ch->w;
+    return 40.0f;
+}
+
+static int is_out_of_flow(int idx) {
+    Element* e = &elements[idx];
+    if (e->position_fixed || e->flex_child || e->grid_child) return 1;
+    if (e->position_mode == POS_ABSOLUTE) return 1;
+    if (e->position_sticky) return 0;
+    if (e->position_mode == POS_RELATIVE) return 0;
+    if (e->css_positioned & 3) return 1;
+    return 0;
+}
+
+static void layout_block_container(int container_idx) {
+    Element* cont = &elements[container_idx];
+    if (cont->display_mode == DISPLAY_FLEX || cont->display_mode == DISPLAY_GRID) return;
+    if (cont->display_mode == DISPLAY_NONE) return;
+
+    float pad = cont->padding;
+    float inner_w = cont->w - pad * 2.0f;
+    if (inner_w < 0.0f) inner_w = 0.0f;
+    float y = pad;
+
+    for (int c = 0; c < elem_count; c++) {
+        if (elements[c].parent_idx != container_idx) continue;
+        if (!is_visible(c) || elements[c].position_fixed) continue;
+        if (is_out_of_flow(c)) continue;
+
+        Element* ch = &elements[c];
+        ch->flow_child = 1;
+
+        if (ch->pct_w) {
+            ch->w = inner_w * ch->raw_w;
+        } else if (!ch->has_css_width) {
+            ch->w = inner_w;
+        }
+
+        if (!ch->has_css_height && !ch->pct_h) {
+            ch->h = flow_content_height(ch);
+            if (ch->h < 14.0f) ch->h = 14.0f;
+        }
+
+        ch->rel_x = pad + ch->margin_left;
+        ch->rel_y = y + ch->margin_top;
+        y += ch->margin_top + ch->h + ch->margin_bottom;
+    }
+}
+
+static void layout_block_containers(void) {
+    for (int i = 0; i < elem_count; i++) {
+        if (!is_visible(i)) continue;
+        layout_block_container(i);
+    }
+}
+
 void update_layout() {
     for (int i = 0; i < elem_count; i++) {
         Element* e = &elements[i];
@@ -2764,7 +2917,12 @@ static void place_flex_cross(Element* ch, Element* cont, int row_mode,
 static float flex_main_size(Element* ch, int row_mode) {
     if (ch->has_flex_basis && !ch->flex_basis_auto)
         return ch->flex_basis;
-    return row_mode ? ch->w : ch->h;
+    if (row_mode) {
+        if (ch->has_css_width && !ch->pct_w) return ch->css_width;
+        return flex_content_width(ch);
+    }
+    if (ch->has_css_height && !ch->pct_h) return ch->css_height;
+    return flow_content_height(ch);
 }
 
 static float flex_min_main(Element* ch, int row_mode) {
@@ -2974,6 +3132,13 @@ static void layout_flex_container(int container_idx) {
         }
         cross_cursor += lines[i].cross_sz;
         if (i < num_lines - 1) cross_cursor += cross_gap;
+    }
+
+    if (cont->flex_wrap == FLEX_WRAP_WRAP && row_mode && !cont->has_css_height && !cont->pct_h) {
+        float needed_h = cross_cursor + pad;
+        if (cont->has_min_height && needed_h < cont->css_min_height)
+            needed_h = cont->css_min_height;
+        if (needed_h > cont->h) cont->h = needed_h;
     }
 }
 
@@ -3291,6 +3456,7 @@ static void layout_flex_containers(void) {
     for (int i = 0; i < elem_count; i++) {
         elements[i].flex_child = 0;
         elements[i].grid_child = 0;
+        elements[i].flow_child = 0;
     }
     for (int i = 0; i < elem_count; i++) {
         if (elements[i].display_mode == DISPLAY_FLEX && is_visible(i))
@@ -3298,11 +3464,12 @@ static void layout_flex_containers(void) {
         else if (elements[i].display_mode == DISPLAY_GRID && is_visible(i))
             layout_grid_container(i);
     }
+    layout_block_containers();
     for (int i = 0; i < elem_count; i++) {
         Element* e = &elements[i];
         int par = e->parent_idx;
         if (par == -1 || e->position_fixed) continue;
-        if (!e->flex_child && !e->grid_child) continue;
+        if (!e->flex_child && !e->grid_child && !e->flow_child) continue;
         e->x = elements[par].x + e->rel_x + e->margin_left;
         e->y = elements[par].y + e->rel_y + e->margin_top;
     }
