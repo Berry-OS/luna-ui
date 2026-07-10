@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Vespera GUI Engine v3.10</title>
+  <title>Vespera GUI Engine v3.12</title>
   <link rel="stylesheet" type="text/css" href="demo_style.css">
 </head>
 <body>
@@ -19,8 +19,8 @@
     <div id="sidebar_avatar"></div>
     <p id="sidebar_username">Vespera User</p>
     <p id="sidebar_role">Administrator</p>
-    <div id="nav_1" class="nav_item active">General</div>
-    <div id="nav_2" class="nav_item">Appearance</div>
+    <div id="nav_1" class="nav_item active">General<div id="nav_dot_1" class="nav_dot"></div></div>
+    <div id="nav_2" class="nav_item">Appearance<div id="nav_dot_2" class="nav_dot"></div></div>
     <div id="nav_3" class="nav_item">Network</div>
     <div id="nav_4" class="nav_item">Security</div>
     <div id="tag_cloud">
@@ -51,10 +51,26 @@
       <div class="col_dense_cell">2</div>
       <div class="col_dense_cell">3</div>
     </div>
+    <div id="stat_cpu" class="stat_card">
+      <p class="stat_label">CPU</p>
+      <p class="stat_val">42%</p>
+      <div class="stat_bar_bg"><div id="cpu_bar_fill" class="stat_bar_fill"></div></div>
+    </div>
+    <div id="stat_mem" class="stat_card">
+      <p class="stat_label">MEM</p>
+      <p class="stat_val">2.4G</p>
+      <div class="stat_bar_bg"><div id="mem_bar_fill" class="stat_bar_fill"></div></div>
+    </div>
+    <div id="stat_net" class="stat_card">
+      <p class="stat_label">NET</p>
+      <p class="stat_val">72K</p>
+      <div class="stat_bar_bg"><div id="net_bar_fill" class="stat_bar_fill"></div></div>
+    </div>
+    <p id="sidebar_version">v3.12.0 — Vespera</p>
   </div>
   <div id="content">
     <p id="section_title">General</p>
-    <p id="desc" aria-live="polite">position, px units, browser-matched CSS.</p>
+    <p id="desc" aria-live="polite">Position, px units, browser-matched CSS.</p>
     <div id="sep1"></div>
     <div id="toolbar">
       <div id="tool_save" class="tool_btn active" role="button" aria-label="Save settings">Save</div>
@@ -81,7 +97,7 @@
     <p id="chk_label">Enable Notifications</p>
     <p id="theme_label">Theme</p>
     <div id="theme_combo">
-      <div id="theme_select_box" role="combobox" aria-label="Theme" aria-expanded="false">Indigo  v</div>
+      <div id="theme_select_box" role="combobox" aria-label="Theme" aria-expanded="false">Indigo  ▾</div>
       <div id="select_panel" class="card hidden">
         <div id="opt_blue" class="select_option">Indigo</div>
         <div id="opt_graphite" class="select_option">Graphite</div>
@@ -108,21 +124,36 @@
     <div id="progress_track">
       <div id="progress_fill"></div>
     </div>
+    <!-- activity_panel uses normal document flow for scrollable items -->
     <div id="activity_panel">
       <div id="activity_header" class="activity_sticky">Recent Activity</div>
-      <div id="act_1" class="activity_line">Sync complete - 2 min ago</div>
-      <div id="act_2" class="activity_line">Theme applied - Indigo</div>
+      <div id="act_1" class="activity_line">Sync complete — 2 min ago</div>
+      <div id="act_2" class="activity_line">Theme applied — Indigo</div>
       <div id="act_3" class="activity_line">Network profile updated</div>
-      <div id="act_4" class="activity_line">Backup finished - 128 files</div>
+      <div id="act_4" class="activity_line">Backup finished — 128 files</div>
       <div id="act_5" class="activity_line">Driver update available</div>
-      <div id="act_6" class="activity_line">VPN connected - qberry</div>
+      <div id="act_6" class="activity_line">VPN connected — qberry</div>
       <div id="activity_footer" class="activity_sticky_bottom">End of feed</div>
     </div>
     <div id="badge_active" class="badge">Active</div>
     <div id="badge_update" class="badge">Update</div>
     <div id="badge_err"    class="badge">Error</div>
     <div id="sep2"></div>
-    <p id="status_text" aria-live="assertive">v3.10.0 - Vespera GUI Engine</p>
+    <div id="metrics_row">
+      <div id="mp_online" class="metric_pill">
+        <p id="mp_val_online" class="mp_val">Online</p>
+        <p id="mp_lbl_online" class="mp_label">STATUS</p>
+      </div>
+      <div id="mp_peers" class="metric_pill">
+        <p id="mp_val_peers" class="mp_val">7</p>
+        <p id="mp_lbl_peers" class="mp_label">PEERS</p>
+      </div>
+      <div id="mp_latency" class="metric_pill">
+        <p id="mp_val_lat" class="mp_val">12ms</p>
+        <p id="mp_lbl_lat" class="mp_label">PING</p>
+      </div>
+    </div>
+    <p id="status_text" aria-live="assertive">v3.12.0 — Vespera GUI Engine</p>
   </div>
 </div>
 <div id="toast" class="window card">
@@ -131,22 +162,137 @@
     <div id="toast_icon"></div>
     <p id="toast_title">Update Available</p>
     <p id="toast_msg">Version 2.3 is ready to install.</p>
-    <div id="toast_close">x</div>
+    <div id="toast_close"></div>
   </div>
 </div>
 <div id="info_win" class="window card">
   <div id="info_drag" draggable="1"></div>
-  <div id="info_close">x</div>
+  <div id="info_close"></div>
   <div id="info_icon"></div>
   <p id="info_title">Vespera GUI Engine</p>
   <p id="info_msg">OpenGL window manager with CSS styling, gradients, and smooth transitions.</p>
 </div>
 <div id="dock" class="window">
-  <div id="dock_icon_info" class="dock_icon">i</div>
-  <div id="dock_icon_theme" class="dock_icon">T</div>
-  <div id="dock_icon_notify" class="dock_icon">N</div>
-  <div id="dock_icon_toast" class="dock_icon">X</div>
+  <div id="dock_icon_info" class="dock_icon">i<p class="dock_label">Info</p></div>
+  <div id="dock_icon_theme" class="dock_icon">T<p class="dock_label">Theme</p></div>
+  <div id="dock_icon_notify" class="dock_icon">N<p class="dock_label">Alert</p></div>
+  <div id="dock_icon_toast" class="dock_icon">✕<p class="dock_label">Toast</p></div>
 </div>
+<div id="quick_stats">
+  <p id="qs_title">SYSTEM</p>
+  <div id="qs_row1" class="qs_row">
+    <p class="qs_label">CPU</p>
+    <p class="qs_val">42%</p>
+    <div id="qs_dot1" class="qs_dot"></div>
+  </div>
+  <div id="qs_row2" class="qs_row">
+    <p class="qs_label">MEMORY</p>
+    <p class="qs_val">2.4 GB</p>
+    <div id="qs_dot2" class="qs_dot"></div>
+  </div>
+  <div id="qs_row3" class="qs_row">
+    <p class="qs_label">NETWORK</p>
+    <p class="qs_val">qberry</p>
+    <div id="qs_dot3" class="qs_dot"></div>
+  </div>
+  <div id="qs_bar"><div id="qs_bar_fill"></div></div>
+  <p id="qs_footer">61% CAPACITY</p>
+</div>
+<div id="vtoolbar">
+  <div id="vtb_home" class="vtb active">H</div>
+  <div id="vtb_net" class="vtb">N</div>
+  <div id="vtb_sec" class="vtb">S</div>
+  <div id="vtb_sep"></div>
+  <div id="vtb_app" class="vtb">A</div>
+  <div id="vtb_log" class="vtb">L</div>
+  <div id="vtb_sep2"></div>
+  <div id="vtb_ai" class="vtb">AI</div>
+  <div id="vtb_cfg" class="vtb">C</div>
+</div>
+<div id="ai_card">
+  <p id="ai_title">AI ASSISTANT</p>
+  <div id="ai_orb"></div>
+  <p id="ai_status">Ready</p>
+  <p id="ai_hint">Click to open</p>
+</div>
+<div id="status_card">
+  <p id="sc_title">CONNECTION</p>
+  <div id="sc_dot"></div>
+  <p id="sc_status">Connected</p>
+  <div id="sc_r1" class="sc_row">
+    <p class="sc_rlabel">LATENCY</p>
+    <p class="sc_rval">12ms</p>
+  </div>
+  <div id="sc_r2" class="sc_row">
+    <p class="sc_rlabel">PEERS</p>
+    <p class="sc_rval">7 online</p>
+  </div>
+</div>
+<!-- Notification pill -->
+<div id="notif_pill">
+  <div id="notif_dot"></div>
+  <p id="notif_text">VPN connected — 7 peers online</p>
+  <p id="notif_close">✕</p>
+</div>
+
+<!-- Media / Image card -->
+<div id="media_card">
+  <img id="media_img" src="avatar.jpg" alt="">
+  <p id="media_label">Preview</p>
+  <p id="media_sub">background-image</p>
+  <div id="media_badge">NEW</div>
+</div>
+
+<!-- Transfer card -->
+<div id="transfer_card">
+  <p id="tc_title">TRANSFER</p>
+  <div id="tc_icon"></div>
+  <p id="tc_val">68%  1.2 MB/s</p>
+  <div id="tc_bar_bg"><div id="tc_bar_fill"></div></div>
+</div>
+
+<!-- Pill tab bar -->
+<div id="tab_bar">
+  <div class="tab_pill active">All</div>
+  <div class="tab_pill">VPN</div>
+  <div class="tab_pill">Log</div>
+</div>
+
+<!-- Color swatches -->
+<div id="swatch_row">
+  <div id="sw1" class="swatch sel"></div>
+  <div id="sw2" class="swatch"></div>
+  <div id="sw3" class="swatch"></div>
+  <div id="sw4" class="swatch"></div>
+  <div id="sw5" class="swatch"></div>
+</div>
+
+<!-- Keyboard shortcuts card -->
+<div id="kbd_card">
+  <p id="kbd_title">SHORTCUTS</p>
+  <div id="kr1" class="kbd_row">
+    <p class="kbd_label">Connect</p>
+    <p class="kbd_key">⌘ C</p>
+  </div>
+  <div id="kr2" class="kbd_row">
+    <p class="kbd_label">Settings</p>
+    <p class="kbd_key">⌘ ,</p>
+  </div>
+  <div id="kr3" class="kbd_row">
+    <p class="kbd_label">Quit</p>
+    <p class="kbd_key">⌘ Q</p>
+  </div>
+</div>
+
+<div id="cmd_palette">
+  <p id="cmd_icon">⌘</p>
+  <p id="cmd_text">Search or type a command...</p>
+  <p id="cmd_key">⌘ K</p>
+</div>
+
+<!-- Floating Action Button -->
+<div id="fab">+</div>
+
 <div id="modal_overlay" class="overlay hidden">
   <div id="modal_dialog" class="window">
     <div id="modal_icon"></div>

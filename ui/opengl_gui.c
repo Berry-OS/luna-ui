@@ -22,6 +22,10 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_FAILURE_STRINGS
+#include "stb_image.h"
+
 #define CSS_PARSER_IMPLEMENTATION
 #include "cssparser.h"
 
@@ -149,6 +153,55 @@ const char* bg_fs =
     "    FragColor = vec4(finalColor.rgb, finalColor.a * alpha);\n"
     "}\0";
 
+// CSS box-shadow: Gaussian soft shadow via SDF of the rounded rect.
+// uShadowInset: top-left of actual element within the (padded) shadow rect (no offset).
+// uElemSize:    actual element size.
+// uOffset:      shadow offset (sh_dx, sh_dy) in FragPos space (x right, y down-flipped).
+const char* shadow_fs =
+    "#version 330 core\n"
+    "in vec2 FragPos;\n"
+    "out vec4 FragColor;\n"
+    "uniform vec4 uShadowColor;\n"
+    "uniform vec2 uShadowInset;\n"
+    "uniform vec2 uElemSize;\n"
+    "uniform vec2 uOffset;\n"
+    "uniform vec2 uSize;\n"
+    "uniform float uRadius;\n"
+    "uniform float uBlur;\n"
+    // Accurate erf approximation (A&S §7.1.26, max error < 1.5e-7)
+    "float erf_approx(float x) {\n"
+    "    float sign_x = x >= 0.0 ? 1.0 : -1.0;\n"
+    "    float ax = abs(x);\n"
+    "    float t = 1.0 / (1.0 + 0.3275911 * ax);\n"
+    "    float y = 1.0 - t*(0.254829592 + t*(-0.284496736 + t*(1.421413741\n"
+    "              + t*(-1.453152027 + t*1.061405429)))) * exp(-ax*ax);\n"
+    "    return sign_x * y;\n"
+    "}\n"
+    "float rr_sdf(vec2 p, vec2 hs, float r) {\n"
+    "    vec2 q = abs(p) - hs + vec2(r);\n"
+    "    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;\n"
+    "}\n"
+    "void main() {\n"
+    "    float r = clamp(uRadius, 0.0, min(uElemSize.x, uElemSize.y) * 0.5);\n"
+    "    vec2 hs = uElemSize * 0.5;\n"
+    "    // Shadow shape SDF (shifted by offset)\n"
+    "    vec2 posShadow = FragPos - uShadowInset - uOffset;\n"
+    "    float distShadow = rr_sdf(posShadow - hs, hs, r);\n"
+    "    float sigma = max(uBlur * 0.5, 0.001);\n"
+    "    float alpha = 0.5 - 0.5 * erf_approx(distShadow / (sigma * 1.41421356));\n"
+    "    // Clip shadow inside the element's own footprint to prevent dark bleed\n"
+    "    // at transparent rounded corners.  posElem anchors to the element's\n"
+    "    // bottom-left corner in FragPos space (fragpos.y = 0 at rect bottom):\n"
+    "    //   elem_fp_y = uSize.y - uShadowInset.y - uElemSize.y  (= bot_pad)\n"
+    "    //   This compensates for sh_dy baked into the rect height.\n"
+    "    vec2 posElem = vec2(FragPos.x - uShadowInset.x,\n"
+    "                        FragPos.y - (uSize.y - uShadowInset.y - uElemSize.y));\n"
+    "    float distElem = rr_sdf(posElem - hs, hs, r);\n"
+    "    alpha *= smoothstep(-1.0, 0.0, distElem);\n"
+    "    if (alpha < 0.004) discard;\n"
+    "    FragColor = vec4(uShadowColor.rgb, uShadowColor.a * alpha);\n"
+    "}\0";
+
 const char* text_vs =
     "#version 330 core\n"
     "layout (location = 0) in vec4 vertex;\n"
@@ -169,6 +222,29 @@ const char* text_fs =
     "void main() {\n"
     "    float sampled = texture(text, TexCoords).r;\n"
     "    FragColor = vec4(textColor.rgb, textColor.a * sampled);\n"
+    "}\0";
+
+// Image shader: renders a texture cropped to a rounded rect.
+// Uses same vertex shader as bg (bg_vs). FragPos.y is flipped (0=bottom, uSize.y=top).
+// stb_image is loaded with flip_vertically so UV = FragPos/uSize maps correctly.
+const char* img_fs =
+    "#version 330 core\n"
+    "in vec2 FragPos;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D uImage;\n"
+    "uniform vec2 uSize;\n"
+    "uniform float uRadius;\n"
+    "uniform float uAlpha;\n"
+    "void main() {\n"
+    "    vec2 halfSize = uSize / 2.0;\n"
+    "    float r = max(uRadius, 0.001);\n"
+    "    vec2 d = abs(FragPos - halfSize) - halfSize + vec2(r);\n"
+    "    float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);\n"
+    "    float alpha = 1.0 - smoothstep(r - 1.0, r + 0.5, dist);\n"
+    "    if(alpha <= 0.0) discard;\n"
+    "    vec2 uv = FragPos / uSize;\n"
+    "    vec4 tc = texture(uImage, uv);\n"
+    "    FragColor = vec4(tc.rgb, tc.a * alpha * uAlpha);\n"
     "}\0";
 
 #define MAX_GRAD_STOPS 4
@@ -381,6 +457,10 @@ typedef struct Element {
 
     int has_custom_bg, has_custom_color, has_custom_text, has_custom_border;
     EventHandler on_click;
+
+    int has_bg_image;
+    char bg_image_path[256];
+    GLuint bg_image_tex;
 } Element;
 
 // --- CSS Rule ---
@@ -512,6 +592,9 @@ typedef struct {
     int has_transform_ty; float transform_ty;
     int has_transition; float transition_duration;
     int has_pointer_events; int pointer_events_none;
+
+    int has_bg_image;
+    char bg_image_path[256];
 } StyleRule;
 
 #define MAX_ELEMENTS 500
@@ -522,8 +605,31 @@ StyleRule  css_rules[MAX_RULES];   int rule_count = 0;
 
 static int render_order[MAX_ELEMENTS];
 
-GLuint bg_program, text_program;
+GLuint bg_program, text_program, shadow_program, img_program;
 float  window_width = 1024.0f, window_height = 768.0f;
+
+// Cached uniform locations — queried once after program link, then reused every frame.
+static struct {
+    GLint uResolution, uPos, uSize, uColor, uBorderColor, uBorderWidth, uRadius;
+    GLint uGradient, uGradStopCount, uGradAngle, uGradCenter, uGradRadius;
+    GLint uGradColors[MAX_GRAD_STOPS], uGradStops[MAX_GRAD_STOPS];
+} bg_loc;
+static struct {
+    GLint uResolution, uPos, uSize;
+    GLint uShadowColor, uElemSize, uRadius, uBlur, uShadowInset, uOffset;
+} sh_loc;
+static struct {
+    GLint uResolution, textColor;
+} tx_loc;
+static struct {
+    GLint uResolution, uPos, uSize, uRadius, uAlpha, uImage;
+} img_loc;
+
+// Texture cache — path → GL texture ID (loaded once, reused)
+#define MAX_TEXTURES 64
+typedef struct { char path[512]; GLuint tex; } TexEntry;
+static TexEntry g_tex_cache[MAX_TEXTURES];
+static int g_tex_count = 0;
 GLFWwindow* g_window = NULL;
 static int g_desktop_mode = 0;
 static int g_fullscreen   = 0;
@@ -769,6 +875,23 @@ static float parse_float_val(const char* v) {
     return f;
 }
 
+static const char* skip_css_unit(const char* p) {
+    if (strncmp(p, "rem", 3) == 0) return p + 3;
+    if (strncmp(p, "px", 2) == 0 || strncmp(p, "em", 2) == 0 ||
+        strncmp(p, "vh", 2) == 0 || strncmp(p, "vw", 2) == 0 ||
+        strncmp(p, "pt", 2) == 0 || strncmp(p, "vmin", 4) == 0) return p + 2;
+    if (*p == '%') return p + 1;
+    return p;
+}
+
+static float read_css_length(const char** pp) {
+    char* endp;
+    float v = strtof(*pp, &endp);
+    *pp = skip_css_unit(endp);
+    while (isspace((unsigned char)**pp)) (*pp)++;
+    return v;
+}
+
 // Parse length with optional % (stored as 0.0-1.0 ratio when pct).
 static void parse_length(const char* val, float* out_num, int* out_pct) {
     char buf[32] = {0};
@@ -782,20 +905,44 @@ static void parse_length(const char* val, float* out_num, int* out_pct) {
     if (*out_pct) *out_num /= 100.0f;
 }
 
-// Parse box-shadow: dx dy blur color
-// Uses strtof so trailing color string (including rgba with spaces) is handled.
+// Parse box-shadow: [inset] <x> <y> [<blur>] [<spread>] <color>
+// Handles px/em units and multi-shadow (takes only the first shadow).
 static void parse_box_shadow(const char* val, StyleRule* rule) {
     const char* p = val;
-    char* endp;
-    float dx   = strtof(p, &endp); p = endp; while (isspace((unsigned char)*p)) p++;
-    float dy   = strtof(p, &endp); p = endp; while (isspace((unsigned char)*p)) p++;
-    float blur = strtof(p, &endp); p = endp; while (isspace((unsigned char)*p)) p++;
-    if (*p) {
-        float cr = 0, cg = 0, cb = 0, ca = 1;
-        parse_color(p, &cr, &cg, &cb, &ca);
-        rule->has_shadow = 1;
-        rule->sh_dx = dx; rule->sh_dy = dy; rule->sh_blur = blur;
-        rule->sh_r = cr; rule->sh_g = cg; rule->sh_b = cb; rule->sh_a = ca;
+    while (isspace((unsigned char)*p)) p++;
+    // skip "inset" keyword if present
+    if (strncmp(p, "inset", 5) == 0 && (isspace((unsigned char)p[5]) || !p[5]))
+        { p += 5; while (isspace((unsigned char)*p)) p++; }
+
+    float dx   = read_css_length(&p);
+    float dy   = read_css_length(&p);
+    float blur = read_css_length(&p);
+    // optional spread radius — skip it (detect by whether next token is a number)
+    if (*p && (*p == '-' || *p == '+' || isdigit((unsigned char)*p) || *p == '.')) {
+        read_css_length(&p);  // discard spread
+    }
+    // color: scan to top-level comma (second shadow) — skip commas inside rgba(...)
+    if (*p && *p != ',') {
+        char colbuf[128] = {0};
+        const char* end = p;
+        int depth = 0;
+        while (*end) {
+            if (*end == '(') depth++;
+            else if (*end == ')') depth--;
+            else if (*end == ',' && depth == 0) break;
+            end++;
+        }
+        int len = (int)(end - p);
+        if (len >= 127) len = 127;
+        strncpy(colbuf, p, len);
+        trim_whitespace(colbuf);
+        if (colbuf[0]) {
+            float cr = 0, cg = 0, cb = 0, ca = 1;
+            parse_color(colbuf, &cr, &cg, &cb, &ca);
+            rule->has_shadow = 1;
+            rule->sh_dx = dx; rule->sh_dy = dy; rule->sh_blur = blur;
+            rule->sh_r = cr; rule->sh_g = cg; rule->sh_b = cb; rule->sh_a = ca;
+        }
     }
 }
 
@@ -985,7 +1132,22 @@ static void parse_radial_gradient(const char* val, StyleRule* rule) {
     apply_gradient_rule(rule, GRAD_RADIAL, 0.0f, cx, cy, radius);
 }
 
-// Parse background shorthand: color or gradient(...)
+// Parse url(...) helper: extracts the path into out_path (max len), returns 1 on success
+static int parse_url(const char* val, char* out_path, int max_len) {
+    const char* up = strstr(val, "url(");
+    if (!up) return 0;
+    up += 4;
+    while (*up == ' ' || *up == '\'' || *up == '"') up++;
+    const char* ue = strpbrk(up, "'\") ");
+    if (!ue) ue = up + strlen(up);
+    int ulen = (int)(ue - up);
+    if (ulen <= 0 || ulen >= max_len) return 0;
+    strncpy(out_path, up, (size_t)ulen);
+    out_path[ulen] = '\0';
+    return 1;
+}
+
+// Parse background shorthand: color, gradient, or url(...)
 static void parse_background_shorthand(const char* val, StyleRule* rule) {
     char buf[512];
     strncpy(buf, val, sizeof(buf) - 1);
@@ -993,6 +1155,15 @@ static void parse_background_shorthand(const char* val, StyleRule* rule) {
     trim_whitespace(buf);
     if (strcmp(buf, "none") == 0) {
         rule->has_bg = 0;
+        return;
+    }
+    if (strncmp(buf, "url(", 4) == 0) {
+        char path[256];
+        if (parse_url(buf, path, sizeof(path))) {
+            rule->has_bg_image = 1;
+            strncpy(rule->bg_image_path, path, sizeof(rule->bg_image_path) - 1);
+            rule->bg_image_path[sizeof(rule->bg_image_path) - 1] = '\0';
+        }
         return;
     }
     if (strncmp(buf, "linear-gradient", 15) == 0) {
@@ -1605,6 +1776,14 @@ void parse_declarations(char* declarations, StyleRule* rule) {
 
             if      (strcmp(key, "background-color") == 0) { rule->has_bg = 1; parse_color(val, &rule->bg_r, &rule->bg_g, &rule->bg_b, &rule->bg_a); }
             else if (strcmp(key, "background") == 0)       { parse_background_shorthand(val, rule); }
+            else if (strcmp(key, "background-image") == 0) {
+                char path[256];
+                if (parse_url(val, path, sizeof(path))) {
+                    rule->has_bg_image = 1;
+                    strncpy(rule->bg_image_path, path, sizeof(rule->bg_image_path) - 1);
+                    rule->bg_image_path[sizeof(rule->bg_image_path) - 1] = '\0';
+                }
+            }
             else if (strcmp(key, "color") == 0)            { rule->has_color = 1; parse_color(val, &rule->c_r, &rule->c_g, &rule->c_b, &rule->c_a); }
             else if (strcmp(key, "border-radius") == 0)    { rule->has_radius = 1; rule->border_radius = parse_float_val(val); }
             else if (strcmp(key, "border-width") == 0)     { rule->has_border = 1; rule->border_width = parse_float_val(val); }
@@ -2139,7 +2318,7 @@ static void update_focus_within_styles(int idx) {
 }
 
 void update_element_style(Element* e) {
-    if (!e->has_custom_bg)     { e->r = 0.0f; e->g = 0.0f; e->b = 0.0f; e->a = 0.0f; e->has_gradient = 0; }
+    if (!e->has_custom_bg)     { e->r = 0.0f; e->g = 0.0f; e->b = 0.0f; e->a = 0.0f; e->has_gradient = 0; e->has_bg_image = 0; e->bg_image_path[0] = '\0'; e->bg_image_tex = 0; }
     if (!e->has_custom_color)  { e->t_r = 0.1f; e->t_g = 0.1f; e->t_b = 0.1f; e->t_a = 1.0f; }
     if (!e->has_custom_border) { e->border_width = 0; e->bd_r = 0; e->bd_g = 0; e->bd_b = 0; e->bd_a = 0; }
     e->outline_width = 0.0f;
@@ -2227,6 +2406,12 @@ void update_element_style(Element* e) {
             (e->id_idx != g_focused_element_idx || !g_focus_via_keyboard)) continue;
         if (r->is_focus_within && !element_contains_focus(e->id_idx)) continue;
 
+        if (r->has_bg_image && !e->has_custom_bg) {
+            e->has_bg_image = 1;
+            strncpy(e->bg_image_path, r->bg_image_path, sizeof(e->bg_image_path) - 1);
+            e->bg_image_path[sizeof(e->bg_image_path) - 1] = '\0';
+            e->bg_image_tex = 0;
+        }
         if (r->has_bg && !e->has_custom_bg) {
             e->r = r->bg_r; e->g = r->bg_g; e->b = r->bg_b; e->a = r->bg_a;
             if (r->has_gradient) {
@@ -2730,6 +2915,23 @@ void parse_html(const char* html) {
         strncpy(e.text, text, 255);
         e.cur_scale = 1.0f;
 
+        // <img src="..."> — treat src as background image
+        if (strcasecmp(type, "img") == 0) {
+            char src[256] = {0};
+            char* attr_src = strstr(tag_buf, "src=\"");
+            if (attr_src) sscanf(attr_src + 5, "%255[^\"]", src);
+            if (src[0]) {
+                e.has_bg_image = 1;
+                strncpy(e.bg_image_path, src, sizeof(e.bg_image_path) - 1);
+                e.bg_image_path[sizeof(e.bg_image_path) - 1] = '\0';
+            }
+            // alt attribute as fallback text
+            char alt[256] = {0};
+            char* attr_alt = strstr(tag_buf, "alt=\"");
+            if (attr_alt) sscanf(attr_alt + 5, "%255[^\"]", alt);
+            if (alt[0]) strncpy(e.text, alt, 255);
+        }
+
         elements[elem_count] = e;
         update_element_style(&elements[elem_count]);
 
@@ -2828,6 +3030,15 @@ void update_layout() {
         Element* e = &elements[i];
         int par = e->parent_idx;
         float parent_w, parent_h;
+
+        // body/html root element: always cover full window regardless of CSS sizes
+        if (par == -1 && e->z_index <= -9000 &&
+            (strcmp(e->type, "body") == 0 || strcmp(e->type, "html") == 0)) {
+            e->x = 0.0f; e->y = 0.0f;
+            e->w = window_width; e->h = window_height;
+            e->rel_x = 0.0f; e->rel_y = 0.0f;
+            continue;
+        }
 
         if (e->position_fixed || par == -1) {
             parent_w = window_width;
@@ -3024,6 +3235,8 @@ static void layout_flex_container(int container_idx) {
     for (int c = 0; c < elem_count; c++) {
         if (elements[c].parent_idx != container_idx) continue;
         if (!is_visible(c) || elements[c].position_fixed) continue;
+        // Absolutely positioned children are out of flow — don't include in flex layout.
+        if (elements[c].position_mode == POS_ABSOLUTE) continue;
         elements[c].flex_child = 1;
         kids[n++] = c;
     }
@@ -3303,6 +3516,7 @@ static void layout_grid_container(int container_idx) {
     for (int c = 0; c < elem_count; c++) {
         if (elements[c].parent_idx != container_idx) continue;
         if (!is_visible(c) || elements[c].position_fixed) continue;
+        if (elements[c].position_mode == POS_ABSOLUTE) continue;
         Element* ch = &elements[c];
         ch->grid_child = 1;
 
@@ -3988,13 +4202,13 @@ void update_animations(double dt) {
 // ============================================================
 
 // Effective z-index = max of self and all ancestors.
-// This ensures children are always rendered after (on top of) their parent,
-// even when the parent has a higher explicit z-index than the child.
+// Starts from element's own z_index so negative values (e.g. body=-9999) sort first.
 static int effective_z_index(int idx) {
-    int z = 0;
-    while (idx != -1) {
-        if (elements[idx].z_index > z) z = elements[idx].z_index;
-        idx = elements[idx].parent_idx;
+    int z = elements[idx].z_index;
+    int p = elements[idx].parent_idx;
+    while (p != -1) {
+        if (elements[p].z_index > z) z = elements[p].z_index;
+        p = elements[p].parent_idx;
     }
     return z;
 }
@@ -4116,6 +4330,59 @@ void init_rect_geometry() {
     glEnableVertexAttribArray(0);
 }
 
+// Load (or retrieve cached) texture from file path.
+static GLuint load_or_get_texture(const char* path) {
+    if (!path || !path[0]) return 0;
+    for (int i = 0; i < g_tex_count; i++)
+        if (strcmp(g_tex_cache[i].path, path) == 0) return g_tex_cache[i].tex;
+    if (g_tex_count >= MAX_TEXTURES) return 0;
+
+    char resolved[512];
+    resolve_resource_path(path, resolved, sizeof(resolved));
+
+    stbi_set_flip_vertically_on_load(1);
+    int w, h, ch;
+    unsigned char* data = stbi_load(resolved, &w, &h, &ch, 4);
+    if (!data) data = stbi_load(path, &w, &h, &ch, 4);
+    if (!data) return 0;
+
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    stbi_image_free(data);
+
+    strncpy(g_tex_cache[g_tex_count].path, path, sizeof(g_tex_cache[0].path) - 1);
+    g_tex_cache[g_tex_count].path[sizeof(g_tex_cache[0].path) - 1] = '\0';
+    g_tex_cache[g_tex_count].tex = tex;
+    g_tex_count++;
+    return tex;
+}
+
+// Draw a texture cropped to a rounded rect element.
+static void draw_image(float x, float y, float w, float h, float radius, GLuint tex, float alpha) {
+    if (!img_program || !tex || alpha <= 0.004f || w <= 0.0f || h <= 0.0f) return;
+    float half_min = (w < h ? w : h) * 0.5f;
+    if (radius > half_min) radius = half_min;
+    glUseProgram(img_program);
+    glUniform2f(img_loc.uResolution, window_width, window_height);
+    glUniform2f(img_loc.uPos,  x, y);
+    glUniform2f(img_loc.uSize, w, h);
+    glUniform1f(img_loc.uRadius, radius);
+    glUniform1f(img_loc.uAlpha, alpha);
+    if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i_(img_loc.uImage, 0);
+    glBindVertexArray(g_rect_vao);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 // Full-featured rect draw: solid color or gradient (linear/radial, multi-stop).
 void draw_rect_full(float x, float y, float w, float h,
                     float r, float g, float b, float a,
@@ -4125,36 +4392,38 @@ void draw_rect_full(float x, float y, float w, float h,
     int grad_mode = (ge && ge->has_gradient) ? ge->grad_type : GRAD_NONE;
     if (a <= 0.0f && bd_a <= 0.0f && grad_mode == GRAD_NONE) return;
 
+    // CSS border-radius: 50% is stored as 50 (parse_float_val ignores %).
+    // Cap to min(w,h)/2 so "50%" on small elements (e.g. 13px buttons) forms a circle.
+    float half_min = (w < h ? w : h) * 0.5f;
+    if (radius > half_min) radius = half_min;
+
     glUseProgram(bg_program);
-    glUniform2f(glGetUniformLocation(bg_program, "uResolution"), window_width, window_height);
-    glUniform2f(glGetUniformLocation(bg_program, "uPos"),  x, y);
-    glUniform2f(glGetUniformLocation(bg_program, "uSize"), w, h);
-    glUniform4f(glGetUniformLocation(bg_program, "uColor"),       r,    g,    b,    a);
-    glUniform4f(glGetUniformLocation(bg_program, "uBorderColor"), bd_r, bd_g, bd_b, bd_a);
-    glUniform1f(glGetUniformLocation(bg_program, "uBorderWidth"), b_w);
-    glUniform1f(glGetUniformLocation(bg_program, "uRadius"),      radius);
-    glUniform1i_(glGetUniformLocation(bg_program, "uGradient"), grad_mode);
+    glUniform2f(bg_loc.uResolution, window_width, window_height);
+    glUniform2f(bg_loc.uPos,  x, y);
+    glUniform2f(bg_loc.uSize, w, h);
+    glUniform4f(bg_loc.uColor,       r,    g,    b,    a);
+    glUniform4f(bg_loc.uBorderColor, bd_r, bd_g, bd_b, bd_a);
+    glUniform1f(bg_loc.uBorderWidth, b_w);
+    glUniform1f(bg_loc.uRadius,      radius);
+    glUniform1i_(bg_loc.uGradient, grad_mode);
     if (ge && ge->has_gradient) {
         int sc = ge->grad_stop_count;
         if (sc < 2) sc = 2;
         if (sc > MAX_GRAD_STOPS) sc = MAX_GRAD_STOPS;
-        glUniform1i_(glGetUniformLocation(bg_program, "uGradStopCount"), sc);
+        glUniform1i_(bg_loc.uGradStopCount, sc);
         for (int i = 0; i < MAX_GRAD_STOPS; i++) {
-            char uname[32];
             float pr = 0, pg = 0, pb = 0, pa = 0, pp = (float)i / (float)(MAX_GRAD_STOPS - 1);
-            if (ge && i < ge->grad_stop_count) {
+            if (i < ge->grad_stop_count) {
                 pr = ge->grad_stop_r[i]; pg = ge->grad_stop_g[i];
                 pb = ge->grad_stop_b[i]; pa = ge->grad_stop_a[i];
                 pp = ge->grad_stop_pos[i];
             }
-            snprintf(uname, sizeof(uname), "uGradColors[%d]", i);
-            glUniform4f(glGetUniformLocation(bg_program, uname), pr, pg, pb, pa);
-            snprintf(uname, sizeof(uname), "uGradStops[%d]", i);
-            glUniform1f(glGetUniformLocation(bg_program, uname), pp);
+            glUniform4f(bg_loc.uGradColors[i], pr, pg, pb, pa);
+            glUniform1f(bg_loc.uGradStops[i],  pp);
         }
-        glUniform1f(glGetUniformLocation(bg_program, "uGradAngle"), ge->grad_angle);
-        glUniform2f(glGetUniformLocation(bg_program, "uGradCenter"), ge->grad_rad_cx, ge->grad_rad_cy);
-        glUniform1f(glGetUniformLocation(bg_program, "uGradRadius"), ge->grad_rad_r);
+        glUniform1f(bg_loc.uGradAngle,  ge->grad_angle);
+        glUniform2f(bg_loc.uGradCenter, ge->grad_rad_cx, ge->grad_rad_cy);
+        glUniform1f(bg_loc.uGradRadius, ge->grad_rad_r);
     }
 
     glBindVertexArray(g_rect_vao);
@@ -4169,12 +4438,67 @@ void draw_rect(float x, float y, float w, float h,
     draw_rect_full(x, y, w, h, r, g, b, a, radius, b_w, bd_r, bd_g, bd_b, bd_a, NULL);
 }
 
+// CSS box-shadow: Gaussian soft shadow using dedicated SDF shader.
+static void draw_shadow(float ex, float ey, float ew, float eh,
+                        float sh_dx, float sh_dy, float sh_blur,
+                        float sh_r, float sh_g, float sh_b, float sh_a,
+                        float radius, float eff_op) {
+    if (!shadow_program || sh_a * eff_op <= 0.004f) return;
+    float blur = sh_blur > 0.0f ? sh_blur : 0.0f;
+    // Gaussian tail is visible up to ~1.65*blur from the shadow shape edge (discard < 0.004).
+    float pad  = blur * 1.75f + 2.0f;
+
+    // Shadow rect covers the full blurred area including offset:
+    //   left edge  : min(0, sh_dx) - pad
+    //   top edge   : min(0, sh_dy) - pad
+    //   right edge : max(0, sh_dx) + pad
+    //   bottom edge: max(0, sh_dy) + pad
+    float left  = (sh_dx < 0.0f ? sh_dx : 0.0f) - pad;
+    float top   = (sh_dy < 0.0f ? sh_dy : 0.0f) - pad;
+    float right = (sh_dx > 0.0f ? sh_dx : 0.0f) + pad;
+    float bot   = (sh_dy > 0.0f ? sh_dy : 0.0f) + pad;
+
+    float sx   = ex + left;
+    float sy   = ey + top;
+    float sw   = ew + (right - left);
+    float sh_h = eh + (bot  - top);
+
+    // FragPos = vec2(aPos.x, 1-aPos.y)*uSize: x is right, y is UP (flipped from screen y).
+    // inset = distance from shadow-rect corner to element corner, in FragPos space.
+    // For x (no flip): inset_x = -left = pad + max(0, -sh_dx).
+    // For y (flipped): the shadow rect y already encodes sh_dy via sh_h, so inset_y = -top.
+    float inset_x = -left;
+    float inset_y = -top;
+
+    // uOffset in FragPos space: x needs explicit sh_dx shift because the inset only places
+    // the element (not the shadow shape).  y is already baked in by the y-flip in the rect
+    // height, so off_y must be 0 to avoid double-counting sh_dy.
+    float off_x = sh_dx;
+    float off_y = 0.0f;
+
+    glUseProgram(shadow_program);
+    glUniform2f(sh_loc.uResolution, window_width, window_height);
+    glUniform2f(sh_loc.uPos,  sx, sy);
+    glUniform2f(sh_loc.uSize, sw, sh_h);
+    glUniform4f(sh_loc.uShadowColor, sh_r, sh_g, sh_b, sh_a * eff_op);
+    glUniform2f(sh_loc.uElemSize, ew, eh);
+    float half_min_s = (ew < eh ? ew : eh) * 0.5f;
+    if (radius > half_min_s) radius = half_min_s;
+    glUniform1f(sh_loc.uRadius, radius);
+    glUniform1f(sh_loc.uBlur,   blur);
+    glUniform2f(sh_loc.uShadowInset, inset_x, inset_y);
+    glUniform2f(sh_loc.uOffset,      off_x, off_y);
+
+    glBindVertexArray(g_rect_vao);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+}
+
 void render_text_pass(FontAtlas* atlas, const char* text,
                       float start_x, float baseline_y,
                       float r, float g, float b, float a) {
     glUseProgram(text_program);
-    glUniform2f(glGetUniformLocation(text_program, "uResolution"), window_width, window_height);
-    glUniform4f(glGetUniformLocation(text_program, "textColor"), r, g, b, a);
+    glUniform2f(tx_loc.uResolution, window_width, window_height);
+    glUniform4f(tx_loc.textColor,   r, g, b, a);
     if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, atlas->tex);
     glBindVertexArray(text_vao);
@@ -5247,6 +5571,59 @@ int main(int argc, char** argv) {
     glAttachShader(text_program, tvs); glAttachShader(text_program, tfs);
     glLinkProgram(text_program);
 
+    GLuint svs   = compile_shader(bg_vs,     GL_VERTEX_SHADER);
+    GLuint sfs   = compile_shader(shadow_fs, GL_FRAGMENT_SHADER);
+    shadow_program = glCreateProgram();
+    glAttachShader(shadow_program, svs); glAttachShader(shadow_program, sfs);
+    glLinkProgram(shadow_program);
+
+    GLuint ivs   = compile_shader(bg_vs,  GL_VERTEX_SHADER);
+    GLuint ifs   = compile_shader(img_fs, GL_FRAGMENT_SHADER);
+    img_program  = glCreateProgram();
+    glAttachShader(img_program, ivs); glAttachShader(img_program, ifs);
+    glLinkProgram(img_program);
+
+    // Cache uniform locations once so every draw call skips the driver string lookup.
+    bg_loc.uResolution  = glGetUniformLocation(bg_program, "uResolution");
+    bg_loc.uPos         = glGetUniformLocation(bg_program, "uPos");
+    bg_loc.uSize        = glGetUniformLocation(bg_program, "uSize");
+    bg_loc.uColor       = glGetUniformLocation(bg_program, "uColor");
+    bg_loc.uBorderColor = glGetUniformLocation(bg_program, "uBorderColor");
+    bg_loc.uBorderWidth = glGetUniformLocation(bg_program, "uBorderWidth");
+    bg_loc.uRadius      = glGetUniformLocation(bg_program, "uRadius");
+    bg_loc.uGradient    = glGetUniformLocation(bg_program, "uGradient");
+    bg_loc.uGradStopCount = glGetUniformLocation(bg_program, "uGradStopCount");
+    bg_loc.uGradAngle   = glGetUniformLocation(bg_program, "uGradAngle");
+    bg_loc.uGradCenter  = glGetUniformLocation(bg_program, "uGradCenter");
+    bg_loc.uGradRadius  = glGetUniformLocation(bg_program, "uGradRadius");
+    for (int i = 0; i < MAX_GRAD_STOPS; i++) {
+        char uname[32];
+        snprintf(uname, sizeof(uname), "uGradColors[%d]", i);
+        bg_loc.uGradColors[i] = glGetUniformLocation(bg_program, uname);
+        snprintf(uname, sizeof(uname), "uGradStops[%d]", i);
+        bg_loc.uGradStops[i]  = glGetUniformLocation(bg_program, uname);
+    }
+
+    sh_loc.uResolution  = glGetUniformLocation(shadow_program, "uResolution");
+    sh_loc.uPos         = glGetUniformLocation(shadow_program, "uPos");
+    sh_loc.uSize        = glGetUniformLocation(shadow_program, "uSize");
+    sh_loc.uShadowColor = glGetUniformLocation(shadow_program, "uShadowColor");
+    sh_loc.uElemSize    = glGetUniformLocation(shadow_program, "uElemSize");
+    sh_loc.uRadius      = glGetUniformLocation(shadow_program, "uRadius");
+    sh_loc.uBlur        = glGetUniformLocation(shadow_program, "uBlur");
+    sh_loc.uShadowInset = glGetUniformLocation(shadow_program, "uShadowInset");
+    sh_loc.uOffset      = glGetUniformLocation(shadow_program, "uOffset");
+
+    tx_loc.uResolution  = glGetUniformLocation(text_program, "uResolution");
+    tx_loc.textColor    = glGetUniformLocation(text_program, "textColor");
+
+    img_loc.uResolution = glGetUniformLocation(img_program, "uResolution");
+    img_loc.uPos        = glGetUniformLocation(img_program, "uPos");
+    img_loc.uSize       = glGetUniformLocation(img_program, "uSize");
+    img_loc.uRadius     = glGetUniformLocation(img_program, "uRadius");
+    img_loc.uAlpha      = glGetUniformLocation(img_program, "uAlpha");
+    img_loc.uImage      = glGetUniformLocation(img_program, "uImage");
+
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -5270,6 +5647,39 @@ int main(int argc, char** argv) {
         char* css_str = read_file(g_css_path);
         if (css_str) { parse_css(css_str); free(css_str); }
         else if (!g_desktop_mode) { parse_css(default_css); }
+    }
+
+    // Inject a full-screen body background element driven by CSS body/html rules.
+    // Inserted at the END with z_index=-9999 so it always sorts behind everything.
+    if (elem_count < MAX_ELEMENTS) {
+        Element body_e;
+        memset(&body_e, 0, sizeof(body_e));
+        strncpy(body_e.type, "body", 31);
+        body_e.id_idx      = elem_count;
+        body_e.parent_idx  = -1;
+        body_e.z_index     = -9999;
+        body_e.pct_w       = 1; body_e.raw_w = 1.0f;  // 100% of window
+        body_e.pct_h       = 1; body_e.raw_h = 1.0f;
+        body_e.x = 0.0f; body_e.y = 0.0f;
+        body_e.w = window_width; body_e.h = window_height;
+        body_e.opacity     = 1.0f;
+        body_e.transform_scale = 1.0f;
+        body_e.cur_scale   = 1.0f;
+        body_e.anim_speed  = 14.0f;
+        body_e.overflow_x  = OVERFLOW_VISIBLE;
+        body_e.overflow_y  = OVERFLOW_VISIBLE;
+        elements[elem_count] = body_e;
+        update_element_style(&elements[elem_count]);
+        // Force 100% size even if CSS min/max would resize
+        elements[elem_count].pct_w = 1; elements[elem_count].raw_w = 1.0f;
+        elements[elem_count].pct_h = 1; elements[elem_count].raw_h = 1.0f;
+        elements[elem_count].has_min_width = 0; elements[elem_count].has_max_width = 0;
+        elements[elem_count].has_min_height = 0; elements[elem_count].has_max_height = 0;
+        Element* ne = &elements[elem_count];
+        ne->cur_r = ne->r; ne->cur_g = ne->g; ne->cur_b = ne->b; ne->cur_a = ne->a;
+        ne->cur_bd_r = ne->bd_r; ne->cur_bd_g = ne->bd_g;
+        ne->cur_bd_b = ne->bd_b; ne->cur_bd_a = ne->bd_a;
+        elem_count++;
     }
 
     g_clock_idx = get_element_by_id("clock");
@@ -5383,7 +5793,7 @@ int main(int argc, char** argv) {
         window_height = (float)wh;
         glViewport(0, 0, fbw, fbh);
 
-        glClearColor(0.72f, 0.76f, 0.86f, 1.0f);
+        glClearColor(0.06f, 0.06f, 0.10f, 1.0f);  // dark fallback; body CSS drives actual bg
         glClear(GL_COLOR_BUFFER_BIT);
 
         tick_smooth_scroll(dt);
@@ -5417,29 +5827,9 @@ int main(int argc, char** argv) {
         build_render_order();
         glDisable(GL_SCISSOR_TEST);
 
-        // --- Shadow pass ---
-        for (int ri = 0; ri < elem_count; ri++) {
-            int i = render_order[ri];
-            Element* e = &elements[i];
-            if (!is_rendered(i) || !e->has_shadow || e->sh_a <= 0.0f) continue;
-            float eff_op = element_effective_opacity(i);
-            float bx, by, bw, bh;
-            get_element_draw_bounds(e, &bx, &by, &bw, &bh);
-            float spreads[3] = { e->sh_blur * 0.33f, e->sh_blur * 0.66f, e->sh_blur };
-            float alphas[3]  = { e->sh_a, e->sh_a * 0.55f, e->sh_a * 0.30f };
-            for (int L = 0; L < 3; L++) {
-                float sp = spreads[L];
-                set_element_scissor(i, fbw, fbh);
-                draw_rect(bx + e->sh_dx - sp,
-                          by + e->sh_dy - sp * 0.25f,
-                          bw + sp * 2.0f, bh + sp * 2.0f,
-                          e->sh_r, e->sh_g, e->sh_b, alphas[L] * eff_op,
-                          e->border_radius + sp, 0, 0, 0, 0, 0);
-                glDisable(GL_SCISSOR_TEST);
-            }
-        }
-
-        // --- Element pass ---
+        // --- Shadow + Element + Text pass (single pass, correct z-index ordering) ---
+        // Shadow, element rect, and text are all rendered together per element so that
+        // a higher-z element and its text correctly appear above lower-z elements.
         for (int ri = 0; ri < elem_count; ri++) {
             int i = render_order[ri];
             Element* e = &elements[i];
@@ -5449,6 +5839,16 @@ int main(int argc, char** argv) {
             float dx, dy, dw, dh;
             get_element_draw_bounds(e, &dx, &dy, &dw, &dh);
             float scale = e->cur_scale;
+
+            // Shadow sub-pass — clipped by ancestor overflow:hidden per CSS spec.
+            // Scissor is already disabled at loop start (glDisable at end of prev iter).
+            if (e->has_shadow && e->sh_a > 0.0f) {
+                set_element_scissor(i, fbw, fbh);
+                draw_shadow(dx, dy, dw, dh,
+                            e->sh_dx, e->sh_dy, e->sh_blur,
+                            e->sh_r, e->sh_g, e->sh_b, e->sh_a,
+                            e->border_radius * scale, eff_op);
+            }
 
             Element draw_e = *e;
             if (draw_e.has_gradient) {
@@ -5462,23 +5862,41 @@ int main(int argc, char** argv) {
                            draw_e.border_radius * scale, draw_e.border_width,
                            draw_e.cur_bd_r, draw_e.cur_bd_g, draw_e.cur_bd_b, draw_e.cur_bd_a * eff_op,
                            &draw_e);
-            glDisable(GL_SCISSOR_TEST);
-        }
 
-        // --- Text pass ---
-        for (int ri = 0; ri < elem_count; ri++) {
-            int i = render_order[ri];
-            Element* e = &elements[i];
-            if (!is_rendered(i) || !e->text[0]) continue;
-            float eff_op = element_effective_opacity(i);
-            float box_w = e->w - e->padding * 2.0f;
-            float box_h = e->h - e->padding * 2.0f;
-            set_element_scissor(i, fbw, fbh);
-            render_text(e->text,
-                        e->x + e->padding, e->y + e->padding,
-                        box_w, box_h, e->text_align,
-                        e->t_r, e->t_g, e->t_b, e->t_a * eff_op,
-                        e->font_size, e->font_bold);
+            // Background image: drawn over the fill colour, inset by border-width so
+            // the border is still visible around the image.
+            if (e->has_bg_image && e->bg_image_path[0]) {
+                if (!e->bg_image_tex)
+                    e->bg_image_tex = load_or_get_texture(e->bg_image_path);
+                if (e->bg_image_tex) {
+                    float bw = draw_e.border_width;
+                    draw_image(dx + bw, dy + bw, dw - 2.0f * bw, dh - 2.0f * bw,
+                               draw_e.border_radius * scale, e->bg_image_tex, eff_op);
+                }
+            }
+
+            // Text drawn immediately after rect (same scissor, correct z-order).
+            // Use dx/dy (transform-adjusted position) so text tracks translateX/Y.
+            if (e->text[0]) {
+                float pad = e->padding * scale;
+                float box_w = dw - pad * 2.0f;
+                float box_h = dh - pad * 2.0f;
+                int text_align = e->text_align;
+                if (text_align == 0) {
+                    if (e->justify_content == FLEX_JUSTIFY_CENTER ||
+                        e->justify_items  == FLEX_ALIGN_CENTER    ||
+                        e->justify_self   == FLEX_ALIGN_CENTER)
+                        text_align = 1;
+                    else if (e->justify_content == FLEX_JUSTIFY_END ||
+                             e->justify_self    == FLEX_ALIGN_END)
+                        text_align = 2;
+                }
+                render_text(e->text,
+                            dx + pad, dy + pad,
+                            box_w, box_h, text_align,
+                            e->t_r, e->t_g, e->t_b, e->t_a * eff_op,
+                            e->font_size, e->font_bold);
+            }
             glDisable(GL_SCISSOR_TEST);
         }
 
