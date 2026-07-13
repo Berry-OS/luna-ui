@@ -16,7 +16,8 @@ GLFW_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 GLFW_LIBS   := $(shell pkg-config --libs glfw3 2>/dev/null)
 
 .PHONY: all build build-dri build-webgl build-desktop build-shell symlinks \
-        run server demo webgl run-gtk desktop lu-session install stop clean
+        run server demo webgl run-gtk desktop lu-session install stop clean \
+        opengl_gui luna-ui
 
 all: build symlinks
 
@@ -31,7 +32,7 @@ build-webgl:
 
 build-desktop: build-dri build-shell symlinks
 
-build-shell: opengl_gui
+build-shell: opengl_gui luna-ui
 
 # Symlink libwayland-client.so.0 (SONAME expected by GTK4)
 symlinks:
@@ -42,9 +43,21 @@ symlinks:
 	ln -sf ../../opengl_gui $(TARGET)/lu-shell
 	@echo "✓ Done"
 
-opengl_gui: opengl_gui.c stb_truetype.h
+UI_DIR = ui
+
+$(UI_DIR)/demo.css.h $(UI_DIR)/demo.html.h: $(UI_DIR)/demo.css $(UI_DIR)/demo.html $(UI_DIR)/gen_include.sh
+	cd $(UI_DIR) && ./gen_include.sh demo.css demo.html
+
+$(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h: $(UI_DIR)/luna-ui.css $(UI_DIR)/luna-ui.html $(UI_DIR)/gen_include.sh
+	cd $(UI_DIR) && ./gen_include.sh luna-ui.css luna-ui.html
+
+opengl_gui: $(UI_DIR)/opengl_gui.c $(UI_DIR)/luna-ui.h $(UI_DIR)/stb_truetype.h $(UI_DIR)/stb_image_write.h $(UI_DIR)/demo.css.h $(UI_DIR)/demo.html.h
 	@echo "→ Building lu-shell (opengl_gui)"
-	gcc -O2 -Wall -Wextra $(GLFW_CFLAGS) opengl_gui.c -o opengl_gui -lm -lGL $(GLFW_LIBS)
+	gcc -O2 -Wall -Wextra $(GLFW_CFLAGS) -I$(UI_DIR) $(UI_DIR)/opengl_gui.c -o opengl_gui -lm -lGL $(GLFW_LIBS)
+
+luna-ui: $(UI_DIR)/luna-ui.c $(UI_DIR)/luna-ui.h $(UI_DIR)/stb_truetype.h $(UI_DIR)/stb_image_write.h $(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h
+	@echo "→ Building Aurora Noir demo (luna-ui)"
+	gcc -O2 -Wall -Wextra $(GLFW_CFLAGS) -I$(UI_DIR) $(UI_DIR)/luna-ui.c -o luna-ui -lm -lGL $(GLFW_LIBS)
 
 # Run app with Rust libwayland-client preloaded
 run: build symlinks
@@ -118,6 +131,7 @@ install: build-desktop
 	ln -sf libwayland_client.so $(LU_LIB)/libwayland-client.so.0
 	ln -sf libwayland_client.so $(LU_LIB)/libwayland-client.so
 	install -m 644 desktop/shell/layout.html desktop/shell/style.css $(PREFIX)/share/lu-desktop/shell/
+	install -m 644 ui/luna-ui.h ui/cssparser.h $(PREFIX)/share/lu-desktop/shell/
 	install -m 644 README.md $(PREFIX)/share/doc/lu-desktop/README.md 2>/dev/null || true
 	install -m 644 systemd/lu-desktop.service /etc/systemd/system/lu-desktop.service 2>/dev/null || \
 	  install -m 644 systemd/lu-desktop.service $(PREFIX)/share/lu-desktop/lu-desktop.service
@@ -134,4 +148,4 @@ stop:
 
 clean:
 	cargo clean
-	rm -f opengl_gui
+	rm -f opengl_gui luna-ui $(UI_DIR)/demo.css.h $(UI_DIR)/demo.html.h $(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h

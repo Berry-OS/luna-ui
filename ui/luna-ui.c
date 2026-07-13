@@ -1,5 +1,5 @@
 /*
- * lu-shell — GLFW demo host for Luna UI (luna-ui.h CSS engine)
+ * luna-ui — GLFW host for Aurora Noir (luna-ui.html + luna-ui.css)
  * Copyright © 2026 Yuichiro Nakada / Project Vespera — MPL 2.0
  */
 
@@ -8,35 +8,53 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include <GLFW/glfw3.h>
 #include "luna-ui.h"
 
-/* Demo shell state */
 static GLFWwindow* g_window = NULL;
 static int g_desktop_mode = 0;
 static int g_fullscreen = 0;
 
-/* demo.html element indices (resolved after load) */
 static int g_toast_idx = -1;
 static int g_modal_overlay_idx = -1;
 static int g_info_win_idx = -1;
 static int g_select_panel_idx = -1;
-static int g_clock_idx = -1;
-static double g_last_clock_update = 0.0;
+static int g_progress_fill_idx = -1;
+static int g_progress_track_idx = -1;
 
-static const char* g_layout_path = "ui/demo.html";
-static const char* g_css_path = "ui/demo.css";
+static const char* g_layout_path = "ui/luna-ui.html";
+static const char* g_css_path = "ui/luna-ui.css";
 #define DEMO_CSS_INCLUDE
 static const char* default_css =
-#include "demo.css.h"
+#include "luna-ui.css.h"
 ;
 #define DEMO_HTML_INCLUDE
 static const char* default_html =
-#include "demo.html.h"
+#include "luna-ui.html.h"
 ;
 
-/* ── GLFW-only handlers ── */
+static int el_has_class(LunaElement* e, const char* cls) {
+    return e && cls && strstr(e->class_name, cls) != NULL;
+}
+
+static int elem_idx(LunaElement* e) {
+    for (int i = 0; i < luna_element_count(); i++)
+        if (luna_element_at(i) == e) return i;
+    return -1;
+}
+
+static int find_child_knob(int toggle_idx) {
+    for (int i = 0; i < luna_element_count(); i++) {
+        LunaElement* el = luna_element_at(i);
+        if (el->parent_idx == toggle_idx && strstr(el->class_name, "toggle_knob"))
+            return i;
+    }
+    return -1;
+}
+
+/* ── GLFW window chrome ── */
 
 static void handle_close(LunaElement* e) {
     (void)e;
@@ -45,7 +63,15 @@ static void handle_close(LunaElement* e) {
     glfwSetWindowShouldClose(g_window, GLFW_TRUE);
 }
 
-static void onTabSwitch(LunaElement* e) {
+static void on_minimize(LunaElement* e) { (void)e; glfwIconifyWindow(g_window); }
+
+static void on_maximize(LunaElement* e) {
+    (void)e;
+    if (glfwGetWindowAttrib(g_window, GLFW_MAXIMIZED)) glfwRestoreWindow(g_window);
+    else glfwMaximizeWindow(g_window);
+}
+
+static void on_tab_switch(LunaElement* e) {
     if (!e || !e->data_tab[0]) return;
     char panel_id[64];
     snprintf(panel_id, sizeof(panel_id), "tab_%s", e->data_tab);
@@ -61,25 +87,7 @@ static void onTabSwitch(LunaElement* e) {
     if (panel != -1) { luna_add_class(panel, "active"); luna_update_element_style(panel); }
 }
 
-static void on_minimize(LunaElement* e) { (void)e; glfwIconifyWindow(g_window); }
-static void on_maximize(LunaElement* e) {
-    (void)e;
-    if (glfwGetWindowAttrib(g_window, GLFW_MAXIMIZED)) glfwRestoreWindow(g_window);
-    else glfwMaximizeWindow(g_window);
-}
-
-static void register_shell_handlers(void) {
-    luna_register_js_handler("onClose", handle_close);
-    luna_register_js_handler("onMinimize", on_minimize);
-    luna_register_js_handler("onMaximize", on_maximize);
-    luna_register_js_handler("onTabSwitch", onTabSwitch);
-}
-
-/* ── demo.html helpers & handlers ── */
-
-static int el_has_class(LunaElement* e, const char* cls) {
-    return e && cls && strstr(e->class_name, cls) != NULL;
-}
+/* ── Modal ── */
 
 static void close_modal(void) {
     if (g_modal_overlay_idx == -1) return;
@@ -118,21 +126,15 @@ static void modal_cancel_click(LunaElement* e) {
 
 static void modal_confirm_click(LunaElement* e) {
     (void)e;
-    int desc = luna_get_element_by_id("desc");
-    if (desc != -1) luna_set_text(desc, "Settings applied.");
     close_modal();
 }
 
-static int elem_idx(LunaElement* e) {
-    for (int i = 0; i < luna_element_count(); i++)
-        if (luna_element_at(i) == e) return i;
-    return -1;
-}
+/* ── Controls ── */
 
 static void toggle_click(LunaElement* e) {
     int ei = elem_idx(e);
     if (ei == -1) return;
-    int knob = luna_get_element_by_id("toggle_knob");
+    int knob = find_child_knob(ei);
     if (el_has_class(e, "on")) {
         luna_remove_class(ei, "on");
         if (knob != -1) {
@@ -152,41 +154,30 @@ static void toggle_click(LunaElement* e) {
 static void checkbox_click(LunaElement* e) {
     int ei = elem_idx(e);
     if (ei == -1) return;
-    int label = luna_get_element_by_id("chk_label");
-    if (el_has_class(e, "checked")) {
-        luna_remove_class(ei, "checked");
-        if (label != -1) luna_set_text(label, "Enable Notifications");
-    } else {
-        luna_add_class(ei, "checked");
-        if (label != -1) luna_set_text(label, "Notifications: On");
-    }
+    if (el_has_class(e, "checked")) luna_remove_class(ei, "checked");
+    else luna_add_class(ei, "checked");
     luna_update_element_style(ei);
 }
 
-static void toast_dismiss(LunaElement* e) {
-    (void)e;
-    if (g_toast_idx != -1) luna_element_at(g_toast_idx)->display_none = 1;
-}
-
-static void nav_click(LunaElement* e) {
+static void swatch_click(LunaElement* e) {
     int ei = elem_idx(e);
     if (ei == -1) return;
     for (int i = 0; i < luna_element_count(); i++) {
-        if (strstr(luna_element_at(i)->class_name, "nav_item"))
-            luna_remove_class(i, "active");
+        if (strstr(luna_element_at(i)->class_name, "swatch"))
+            luna_remove_class(i, "sel");
     }
-    luna_add_class(ei, "active");
+    luna_add_class(ei, "sel");
     luna_update_element_style(ei);
 }
 
-static void tool_click(LunaElement* e) {
+static void tab_pill_click(LunaElement* e) {
     int ei = elem_idx(e);
     if (ei == -1) return;
     int p = e->parent_idx;
     if (p != -1) {
         for (int i = 0; i < luna_element_count(); i++) {
             LunaElement* el = luna_element_at(i);
-            if (el->parent_idx == p && strstr(el->class_name, "tool_btn"))
+            if (el->parent_idx == p && strstr(el->class_name, "tab_pill"))
                 luna_remove_class(i, "active");
         }
     }
@@ -202,6 +193,8 @@ static void select_toggle_click(LunaElement* e) {
         luna_remove_class(g_select_panel_idx, "hidden");
         luna_update_element_style(g_select_panel_idx);
         luna_push_focus_trap(g_select_panel_idx, dismiss_select_trap, 0);
+        int box = luna_get_element_by_id("theme_select_box");
+        if (box != -1) luna_element_at(box)->aria_expanded = 1;
     } else {
         dismiss_select_trap(g_select_panel_idx);
     }
@@ -211,10 +204,15 @@ static void select_option_click(LunaElement* e) {
     int box = luna_get_element_by_id("theme_select_box");
     if (box != -1) {
         char buf[96];
-        snprintf(buf, sizeof(buf), "%.80s", e->text);
+        snprintf(buf, sizeof(buf), "%.80s ▾", e->text);
         luna_set_text(box, buf);
     }
     dismiss_select_trap(g_select_panel_idx);
+}
+
+static void toast_dismiss(LunaElement* e) {
+    (void)e;
+    if (g_toast_idx != -1) luna_element_at(g_toast_idx)->display_none = 1;
 }
 
 static void info_close_click(LunaElement* e) {
@@ -262,27 +260,14 @@ static void on_screenshot(LunaElement* e) {
         luna_take_screenshot("screenshot.png");
 }
 
-static void launcher_click(LunaElement* e) {
-    (void)e;
-    fprintf(stderr, "[lu-shell] Launcher\n");
-}
-
-static void bind_demo_indices(void) {
-    g_toast_idx         = luna_get_element_by_id("toast");
-    g_modal_overlay_idx = luna_get_element_by_id("modal_overlay");
-    g_info_win_idx      = luna_get_element_by_id("info_win");
-    g_select_panel_idx  = luna_get_element_by_id("select_panel");
-    g_clock_idx         = luna_get_element_by_id("clock");
-}
-
 static void register_demo_handlers(void) {
+    luna_register_js_handler("onClose", handle_close);
+    luna_register_js_handler("onMinimize", on_minimize);
+    luna_register_js_handler("onMaximize", on_maximize);
+    luna_register_js_handler("onTabSwitch", on_tab_switch);
     luna_register_js_handler("onApply", btn_click);
-    luna_register_js_handler("onNavClick", nav_click);
-    luna_register_js_handler("onToolClick", tool_click);
     luna_register_js_handler("onToggleClick", toggle_click);
     luna_register_js_handler("onCheckboxClick", checkbox_click);
-    luna_register_js_handler("onSelectToggle", select_toggle_click);
-    luna_register_js_handler("onSelectOption", select_option_click);
     luna_register_js_handler("onToastDismiss", toast_dismiss);
     luna_register_js_handler("onInfoClose", info_close_click);
     luna_register_js_handler("onDockInfo", dock_toggle_info_click);
@@ -292,9 +277,26 @@ static void register_demo_handlers(void) {
     luna_register_js_handler("onModalCancel", modal_cancel_click);
     luna_register_js_handler("onModalConfirm", modal_confirm_click);
     luna_register_js_handler("onScreenshot", on_screenshot);
-    luna_register_js_handler("onTabPillClick", tool_click);
-    luna_register_js_handler("onSwatchClick", tool_click);
-    luna_register_js_handler("onLauncher", launcher_click);
+    luna_register_js_handler("onSwatchClick", swatch_click);
+    luna_register_js_handler("onTabPillClick", tab_pill_click);
+}
+
+static void bind_demo_indices(void) {
+    g_toast_idx         = luna_get_element_by_id("toast");
+    g_modal_overlay_idx = luna_get_element_by_id("modal_overlay");
+    g_info_win_idx      = luna_get_element_by_id("info_win");
+    g_select_panel_idx  = luna_get_element_by_id("select_panel");
+    g_progress_fill_idx = luna_get_element_by_id("progress_fill");
+    g_progress_track_idx = luna_get_element_by_id("progress_track");
+}
+
+static void wire_extra_handlers(void) {
+    int box = luna_get_element_by_id("theme_select_box");
+    if (box != -1) luna_set_on_click(box, select_toggle_click);
+    for (int i = 0; i < luna_element_count(); i++) {
+        if (strstr(luna_element_at(i)->class_name, "select_option"))
+            luna_set_on_click(i, select_option_click);
+    }
 }
 
 static void on_mouse_release(int hit, int drag_moved) {
@@ -310,16 +312,12 @@ static void on_mouse_release(int hit, int drag_moved) {
     if (!inside) dismiss_select_trap(g_select_panel_idx);
 }
 
-static void update_clock(double now) {
-    if (g_clock_idx == -1) return;
-    if (now - g_last_clock_update < 1.0) return;
-    g_last_clock_update = now;
-    time_t t = time(NULL);
-    struct tm* tm_info = localtime(&t);
-    if (!tm_info) return;
-    char buf[32];
-    if (strftime(buf, sizeof(buf), "%H:%M", tm_info) > 0)
-        luna_set_text(g_clock_idx, buf);
+static void update_progress(double now) {
+    if (g_progress_fill_idx == -1) return;
+    float progress = fmodf((float)now * 0.09f, 1.0f);
+    float track_w = (g_progress_track_idx != -1)
+        ? luna_element_at(g_progress_track_idx)->w : 400.0f;
+    luna_element_at(g_progress_fill_idx)->w = track_w * progress;
 }
 
 static void parse_args(int argc, char** argv) {
@@ -332,7 +330,8 @@ static void parse_args(int argc, char** argv) {
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc)
             luna_request_screenshot(argv[++i]);
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            fprintf(stderr, "lu-shell [--desktop] [--fullscreen] [--size WxH] [--layout PATH] [--css PATH] [--screenshot PATH]\n");
+            fprintf(stderr, "luna-ui [--desktop] [--fullscreen] [--size WxH] [--layout PATH] [--css PATH] [--screenshot PATH]\n");
+            fprintf(stderr, "  Aurora Noir demo — luna-ui.html + luna-ui.css\n");
             fprintf(stderr, "  F12 — capture screenshot (PNG)\n");
             exit(0);
         }
@@ -377,6 +376,8 @@ static void on_scroll(GLFWwindow* w, double xo, double yo) { (void)w; luna_scrol
 static void on_key(GLFWwindow* w, int key, int sc, int act, int mods) { (void)w; luna_key(key, sc, act, mods); }
 
 int main(int argc, char** argv) {
+    luna_window_width = 1024.0f;
+    luna_window_height = 700.0f;
     parse_args(argc, argv);
 
 #if defined(GLFW_PLATFORM_WAYLAND)
@@ -391,7 +392,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_SAMPLES, 4);
     if (g_fullscreen) { glfwWindowHint(GLFW_DECORATED, GLFW_FALSE); glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE); }
 
-    const char* title = g_desktop_mode ? "Lu Shell" : (luna_doc_title[0] ? luna_doc_title : "Luna UI");
+    const char* title = g_desktop_mode ? "Lu Shell" : (luna_doc_title[0] ? luna_doc_title : "Aurora Noir");
     g_window = glfwCreateWindow((int)luna_window_width, (int)luna_window_height, title,
                                 g_fullscreen ? glfwGetPrimaryMonitor() : NULL, NULL);
     g_luna_glfw_window = g_window;
@@ -429,8 +430,8 @@ int main(int argc, char** argv) {
     }
     luna_inject_body_background();
     register_demo_handlers();
-    register_shell_handlers();
     luna_wire_onclick_handlers();
+    wire_extra_handlers();
     bind_demo_indices();
     luna_set_mouse_release_hook(on_mouse_release);
 
@@ -452,7 +453,7 @@ int main(int argc, char** argv) {
         glClearColor(0.06f, 0.06f, 0.10f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         luna_update(now, dt);
-        update_clock(now);
+        update_progress(now);
         luna_render(fbw, fbh);
         glfwSwapBuffers(g_window);
         luna_flush_pending_screenshot();

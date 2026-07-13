@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vespera GUI Engine v3.12</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" type="text/css" href="luna-ui.css">
+</head>
+<body>
+
+  <!-- ══ Main window ══ -->
+  <div id="main_win" class="window focused">
+
+    <!-- Title bar -->
+    <div id="title_bar">
+      <div class="title_drag"></div>
+      <div id="btn_close" class="btn_os" onclick="onClose()"></div>
+      <div id="btn_min"   class="btn_os" onclick="onMinimize()"></div>
+      <div id="btn_max"   class="btn_os" onclick="onMaximize()"></div>
+      <p id="title_text">System Preferences</p>
+    </div>
+
+    <!-- ── Sidebar ── -->
+    <div id="sidebar">
+      <div id="sidebar_avatar"></div>
+      <p id="sidebar_username">Vespera User</p>
+      <p id="sidebar_role">Administrator</p>
+
+      <nav id="sidebar_nav">
+        <div class="nav_item active" data-tab="general" onclick="onTabSwitch()">
+          General <span class="nav_dot green"></span>
+        </div>
+        <div class="nav_item" data-tab="appearance" onclick="onTabSwitch()">
+          Appearance <span class="nav_dot amber"></span>
+        </div>
+        <div class="nav_item" data-tab="layout" onclick="onTabSwitch()">Layout</div>
+        <div class="nav_item" data-tab="network" onclick="onTabSwitch()">Network</div>
+        <div class="nav_item" data-tab="security" onclick="onTabSwitch()">Security</div>
+      </nav>
+
+      <div id="sidebar_stats">
+        <div class="stat_row">
+          <span class="stat_key">CPU</span>
+          <div class="stat_bar_wrap"><div class="stat_bar_fill" style="width:42%"></div></div>
+          <span class="stat_num">42%</span>
+        </div>
+        <div class="stat_row">
+          <span class="stat_key">MEM</span>
+          <div class="stat_bar_wrap"><div class="stat_bar_fill mem" style="width:60%"></div></div>
+          <span class="stat_num">2.4G</span>
+        </div>
+        <div class="stat_row">
+          <span class="stat_key">NET</span>
+          <div class="stat_bar_wrap"><div class="stat_bar_fill net" style="width:28%"></div></div>
+          <span class="stat_num">72K</span>
+        </div>
+      </div>
+
+      <p id="sidebar_version">v3.12.0 — Vespera</p>
+    </div>
+
+    <!-- ── Content area ── -->
+    <div id="content">
+
+      <!-- ═══ TAB: General ═══ -->
+      <div class="tab_panel active" id="tab_general">
+        <p class="section_title">General</p>
+        <p class="section_desc">Configure display, notifications, and system behaviour.</p>
+        <div class="sep"></div>
+
+        <div id="toolbar">
+          <div class="tool_btn active" role="button">Save</div>
+          <div class="tool_btn" role="button">Reset</div>
+          <div class="tool_btn" role="button">Export</div>
+          <div id="apply_btn" role="button" onclick="onApply()">Apply Changes</div>
+        </div>
+
+        <div class="setting_row">
+          <span class="setting_label">Dark Mode</span>
+          <div class="toggle on" onclick="onToggleClick()"><div class="toggle_knob"></div></div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Enable Notifications</span>
+          <div class="checkbox checked" onclick="onCheckboxClick()"></div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Theme</span>
+          <div id="theme_combo">
+            <div id="theme_select_box" role="combobox">Indigo ▾</div>
+            <div id="select_panel" class="hidden">
+              <div class="select_option">Indigo</div>
+              <div class="select_option">Graphite</div>
+              <div class="select_option">Emerald</div>
+            </div>
+          </div>
+        </div>
+        <div class="setting_row col">
+          <span class="setting_label">Brightness <span class="setting_val">70%</span></span>
+          <div id="slider_track">
+            <div id="slider_fill"></div>
+            <div id="slider_thumb"></div>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+
+        <!-- Chip wrap demo -->
+        <div class="demo_label">flex-wrap · align-items · gap</div>
+        <div id="chip_row">
+          <div class="chip accent">CSS</div>
+          <div class="chip">Flex</div>
+          <div class="chip">Grid</div>
+          <div class="chip">HSL</div>
+          <div class="chip">Wrap</div>
+          <div class="chip">Self</div>
+          <div class="chip">Focus</div>
+          <div class="chip">Clip</div>
+        </div>
+
+        <!-- Hscroll + sticky pin -->
+        <div class="demo_label">overflow-x: auto · position: sticky</div>
+        <div id="hscroll_panel">
+          <div id="hscroll_inner">
+            <div class="hscroll_chip pinned">Pin</div>
+            <div class="hscroll_chip">Alpha</div>
+            <div class="hscroll_chip">Beta</div>
+            <div class="hscroll_chip">Gamma</div>
+            <div class="hscroll_chip">Delta</div>
+            <div class="hscroll_chip">Epsilon</div>
+            <div class="hscroll_chip">Zeta</div>
+          </div>
+        </div>
+
+        <!-- Progress -->
+        <div class="demo_label">animation · linear-gradient</div>
+        <div id="progress_track"><div id="progress_fill"></div></div>
+
+        <!-- Activity: sticky header/footer scroll -->
+        <div class="demo_label">overflow-y: auto · sticky top/bottom</div>
+        <div id="activity_panel">
+          <div class="activity_sticky">Recent Activity</div>
+          <div class="activity_line">Sync complete — 2 min ago</div>
+          <div class="activity_line">Theme applied — Indigo</div>
+          <div class="activity_line">Network profile updated</div>
+          <div class="activity_line">Backup finished — 128 files</div>
+          <div class="activity_line">Driver update available</div>
+          <div class="activity_line">VPN connected — qberry</div>
+          <div class="activity_sticky_bottom">End of feed</div>
+        </div>
+
+        <!-- Metrics + badges -->
+        <div id="metrics_row">
+          <div class="metric_pill online">
+            <p class="mp_val">Online</p><p class="mp_label">STATUS</p>
+          </div>
+          <div class="metric_pill peers">
+            <p class="mp_val">7</p><p class="mp_label">PEERS</p>
+          </div>
+          <div class="metric_pill latency">
+            <p class="mp_val">12ms</p><p class="mp_label">PING</p>
+          </div>
+          <div class="metric_pill badges">
+            <span class="badge green">Active</span>
+            <span class="badge amber">Update</span>
+            <span class="badge red">Error</span>
+          </div>
+        </div>
+
+        <p id="status_text">v3.12.0 — Vespera GUI Engine</p>
+      </div><!-- /tab_general -->
+
+      <!-- ═══ TAB: Appearance ═══ -->
+      <div class="tab_panel" id="tab_appearance">
+        <p class="section_title">Appearance</p>
+        <p class="section_desc">Colours, typography, and visual style.</p>
+        <div class="sep"></div>
+
+        <div class="setting_row">
+          <span class="setting_label">Accent colour</span>
+          <div style="display:flex;gap:6px;align-items:center">
+            <div class="swatch sel" style="background:#6366f1;box-shadow:0 0 9px rgba(99,102,241,.6)" onclick="onSwatchClick()"></div>
+            <div class="swatch" style="background:#ec4899" onclick="onSwatchClick()"></div>
+            <div class="swatch" style="background:#34d399" onclick="onSwatchClick()"></div>
+            <div class="swatch" style="background:#f59e0b" onclick="onSwatchClick()"></div>
+            <div class="swatch" style="background:#ef4444" onclick="onSwatchClick()"></div>
+          </div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Font size</span>
+          <div id="slider_track" class="slider_track2">
+            <div class="slider_fill2" style="width:55%"></div>
+            <div class="slider_thumb2" style="left:55%"></div>
+          </div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Transparency</span>
+          <div class="toggle on" onclick="onToggleClick()"><div class="toggle_knob"></div></div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Reduce motion</span>
+          <div class="toggle" onclick="onToggleClick()"><div class="toggle_knob"></div></div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Show tooltips</span>
+          <div class="checkbox checked" onclick="onCheckboxClick()"></div>
+        </div>
+
+        <div class="sep"></div>
+        <div class="demo_label">Tab bar · active pill</div>
+        <div class="tab_pill_bar">
+          <div class="tab_pill active" onclick="onTabPillClick()">All</div>
+          <div class="tab_pill" onclick="onTabPillClick()">VPN</div>
+          <div class="tab_pill" onclick="onTabPillClick()">Logs</div>
+          <div class="tab_pill" onclick="onTabPillClick()">Stats</div>
+        </div>
+
+        <div class="demo_label" style="margin-top:14px">Keyboard shortcuts</div>
+        <div class="kbd_card">
+          <div class="kbd_row"><span class="kbd_label">Connect</span><span class="kbd_key">⌘ C</span></div>
+          <div class="kbd_row"><span class="kbd_label">Settings</span><span class="kbd_key">⌘ ,</span></div>
+          <div class="kbd_row"><span class="kbd_label">Quit</span><span class="kbd_key">⌘ Q</span></div>
+          <div class="kbd_row"><span class="kbd_label">Search</span><span class="kbd_key">⌘ K</span></div>
+        </div>
+
+        <p id="status_text" style="margin-top:auto">v3.12.0 — Vespera GUI Engine</p>
+      </div><!-- /tab_appearance -->
+
+      <!-- ═══ TAB: Layout Demo ═══ -->
+      <div class="tab_panel" id="tab_layout">
+        <p class="section_title">Layout Demos</p>
+        <p class="section_desc">CSS layout techniques rendered as live widgets.</p>
+        <div class="sep"></div>
+
+        <!-- Row 1: Flexbox shrink + flex-grow -->
+        <div class="demo_card">
+          <div class="demo_card_head">
+            <span class="demo_tag">Flexbox</span>
+            <span class="demo_caption">flex-shrink · flex-grow · min-width:0</span>
+          </div>
+          <div class="demo_flex_shrink">
+            <div class="fs_item grow">grow</div>
+            <div class="fs_item">BB</div>
+            <div class="fs_item">CCC</div>
+            <div class="fs_item">DD</div>
+            <div class="fs_item shrink">shrink me</div>
+          </div>
+        </div>
+
+        <!-- Row 2: Grid row-dense -->
+        <div class="demo_card">
+          <div class="demo_card_head">
+            <span class="demo_tag indigo">Grid</span>
+            <span class="demo_caption">grid-auto-flow: row dense · span</span>
+          </div>
+          <div class="demo_grid_dense">
+            <div class="gc wide">Wide</div>
+            <div class="gc">1</div>
+            <div class="gc">2</div>
+            <div class="gc">3</div>
+            <div class="gc">4</div>
+            <div class="gc">5</div>
+          </div>
+        </div>
+
+        <!-- Row 3: Grid column-dense -->
+        <div class="demo_card">
+          <div class="demo_card_head">
+            <span class="demo_tag violet">Grid</span>
+            <span class="demo_caption">grid-auto-flow: column dense · row span</span>
+          </div>
+          <div class="demo_grid_col_dense">
+            <div class="gcc tall">Tall</div>
+            <div class="gcc b">B</div>
+            <div class="gcc">1</div>
+            <div class="gcc">2</div>
+            <div class="gcc">3</div>
+            <div class="gcc">4</div>
+          </div>
+        </div>
+
+        <!-- Row 4: align-self -->
+        <div class="demo_card">
+          <div class="demo_card_head">
+            <span class="demo_tag cyan">Flex</span>
+            <span class="demo_caption">align-self per item</span>
+          </div>
+          <div class="demo_align_self">
+            <div class="as_item start">start</div>
+            <div class="as_item center">center</div>
+            <div class="as_item end">end</div>
+            <div class="as_item stretch">stretch</div>
+            <div class="as_item baseline">base</div>
+          </div>
+        </div>
+
+        <!-- Row 5: grid template areas -->
+        <div class="demo_card">
+          <div class="demo_card_head">
+            <span class="demo_tag emerald">Grid</span>
+            <span class="demo_caption">grid-template-areas</span>
+          </div>
+          <div class="demo_areas">
+            <div class="area header">header</div>
+            <div class="area sidebar">side</div>
+            <div class="area main">main</div>
+            <div class="area footer">footer</div>
+          </div>
+        </div>
+
+        <!-- Row 6: min-content / max-content / fr -->
+        <div class="demo_card">
+          <div class="demo_card_head">
+            <span class="demo_tag amber">Grid</span>
+            <span class="demo_caption">min-content · max-content · 1fr</span>
+          </div>
+          <div class="demo_sizing">
+            <div class="sz_cell min">min</div>
+            <div class="sz_cell max">max-content here</div>
+            <div class="sz_cell fr">1fr</div>
+          </div>
+        </div>
+
+        <!-- Row 7: overflow clip + text-overflow -->
+        <div class="demo_card">
+          <div class="demo_card_head">
+            <span class="demo_tag pink">Clip</span>
+            <span class="demo_caption">overflow: hidden · text-overflow: ellipsis</span>
+          </div>
+          <div class="demo_clip_row">
+            <div class="clip_box"><span>This long text will be clipped with an ellipsis when it overflows the box boundary.</span></div>
+            <div class="clip_box clamp"><span>Multi-line text that gets clamped after two lines using -webkit-line-clamp and display box properties.</span></div>
+          </div>
+        </div>
+
+        <p id="status_text">v3.12.0 — Vespera GUI Engine</p>
+      </div><!-- /tab_layout -->
+
+      <!-- ═══ TAB: Network ═══ -->
+      <div class="tab_panel" id="tab_network">
+        <p class="section_title">Network</p>
+        <p class="section_desc">VPN, DNS, and connection settings.</p>
+        <div class="sep"></div>
+        <div class="setting_row">
+          <span class="setting_label">VPN</span>
+          <div class="toggle on" onclick="onToggleClick()"><div class="toggle_knob"></div></div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">DNS over HTTPS</span>
+          <div class="checkbox checked" onclick="onCheckboxClick()"></div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Proxy</span>
+          <div class="toggle" onclick="onToggleClick()"><div class="toggle_knob"></div></div>
+        </div>
+        <div class="sep"></div>
+        <div id="metrics_row">
+          <div class="metric_pill online"><p class="mp_val">Online</p><p class="mp_label">STATUS</p></div>
+          <div class="metric_pill peers"><p class="mp_val">7</p><p class="mp_label">PEERS</p></div>
+          <div class="metric_pill latency"><p class="mp_val">12ms</p><p class="mp_label">PING</p></div>
+        </div>
+        <p id="status_text" style="margin-top:auto">v3.12.0 — Vespera GUI Engine</p>
+      </div>
+
+      <!-- ═══ TAB: Security ═══ -->
+      <div class="tab_panel" id="tab_security">
+        <p class="section_title">Security</p>
+        <p class="section_desc">Firewall, encryption, and access control.</p>
+        <div class="sep"></div>
+        <div class="setting_row">
+          <span class="setting_label">Firewall</span>
+          <div class="toggle on" onclick="onToggleClick()"><div class="toggle_knob"></div></div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Two-factor Auth</span>
+          <div class="checkbox checked" onclick="onCheckboxClick()"></div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Auto-lock</span>
+          <div class="toggle on" onclick="onToggleClick()"><div class="toggle_knob"></div></div>
+        </div>
+        <div class="setting_row">
+          <span class="setting_label">Disk encryption</span>
+          <div class="checkbox" onclick="onCheckboxClick()"></div>
+        </div>
+        <p id="status_text" style="margin-top:auto">v3.12.0 — Vespera GUI Engine</p>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main_win -->
+
+  <!-- ── Toast ── -->
+  <div id="toast" class="window">
+    <div id="toast_icon"></div>
+    <div id="toast_body">
+      <p id="toast_title">Update Available</p>
+      <p id="toast_msg">Version 2.3 is ready to install.</p>
+    </div>
+    <div id="toast_close" onclick="onToastDismiss()"></div>
+  </div>
+
+  <!-- ── Info window ── -->
+  <div id="info_win" class="window">
+    <div id="info_close" onclick="onInfoClose()"></div>
+    <div id="info_icon"></div>
+    <p id="info_title">Vespera GUI Engine</p>
+    <p id="info_msg">OpenGL window manager with CSS styling, gradients, and smooth transitions.</p>
+  </div>
+
+  <!-- ── Dock ── -->
+  <div id="dock" class="window">
+    <div class="dock_icon" style="background:linear-gradient(135deg,rgba(52,211,153,.75),rgba(5,150,105,.65))" onclick="onDockInfo()">i<span class="dock_label">Info</span></div>
+    <div class="dock_icon" style="background:linear-gradient(135deg,rgba(251,191,36,.75),rgba(245,158,11,.65))" onclick="onDockTheme()">T<span class="dock_label">Theme</span></div>
+    <div class="dock_icon" style="background:linear-gradient(135deg,rgba(96,165,250,.75),rgba(99,102,241,.65))" onclick="onDockNotify()">N<span class="dock_label">Alert</span></div>
+    <div class="dock_icon" style="background:linear-gradient(135deg,rgba(248,113,113,.75),rgba(239,68,68,.65))" onclick="onDockToast()">✕<span class="dock_label">Toast</span></div>
+  </div>
+
+  <!-- ── Modal ── -->
+  <div id="modal_overlay" class="overlay hidden">
+    <div id="modal_dialog" class="window">
+      <div id="modal_icon"></div>
+      <p id="modal_title">Apply Changes?</p>
+      <p id="modal_msg">Your preferences will be updated immediately.</p>
+      <div class="modal_btn cancel" role="button" onclick="onModalCancel()">Cancel</div>
+      <div class="modal_btn confirm" role="button" onclick="onModalConfirm()">Apply</div>
+    </div>
+  </div>
+
+  <script>
+  function _el() { return event && event.currentTarget; }
+  function onClose() { window.close(); }
+  function onMinimize() {}
+  function onMaximize() {}
+  function onTabSwitch() {
+    const el = _el();
+    const tab = el.dataset.tab;
+    document.querySelectorAll('.nav_item').forEach(n => n.classList.remove('active'));
+    el.classList.add('active');
+    document.querySelectorAll('.tab_panel').forEach(p => p.classList.remove('active'));
+    const panel = document.getElementById('tab_' + tab);
+    if (panel) panel.classList.add('active');
+  }
+  function onToggleClick() { _el().classList.toggle('on'); }
+  function onCheckboxClick() { _el().classList.toggle('checked'); }
+  function onApply() { document.getElementById('modal_overlay').classList.remove('hidden'); }
+  function onModalCancel() { document.getElementById('modal_overlay').classList.add('hidden'); }
+  function onModalConfirm() { document.getElementById('modal_overlay').classList.add('hidden'); }
+  function onToastDismiss() { document.getElementById('toast').style.display = 'none'; }
+  function onInfoClose() { document.getElementById('info_win').style.display = 'none'; }
+  function onDockInfo() {
+    const w = document.getElementById('info_win');
+    w.style.display = w.style.display === 'none' ? '' : 'none';
+  }
+  function onDockTheme() { document.querySelector('.toggle')?.classList.toggle('on'); }
+  function onDockNotify() { document.querySelector('.checkbox')?.classList.toggle('checked'); }
+  function onDockToast() { document.getElementById('toast').style.display = ''; }
+  function onSwatchClick() {
+    const el = _el();
+    document.querySelectorAll('.swatch').forEach(s => s.classList.remove('sel'));
+    el.classList.add('sel');
+  }
+  function onTabPillClick() {
+    const el = _el();
+    el.parentElement.querySelectorAll('.tab_pill').forEach(p => p.classList.remove('active'));
+    el.classList.add('active');
+  }
+  function onScreenshot() { alert('Press F12 in Vespera GUI'); }
+  </script>
+</body>
+</html>
