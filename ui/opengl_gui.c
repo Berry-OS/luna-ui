@@ -13,6 +13,8 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <GLFW/glfw3.h>
 
 #ifndef M_PI
@@ -315,7 +317,9 @@ typedef struct Element {
 
     int pct_w, pct_h, pct_left, pct_top, pct_bottom, pct_right;
     float raw_w, raw_h, raw_left, raw_top, raw_bottom, raw_right;
+    float raw_w_off, raw_h_off, raw_left_off, raw_top_off;
     int has_bottom, has_right;
+    int has_top, has_left;
     float bottom_val, right_val;
     int pos_overridden_x, pos_overridden_y;
     int position_fixed;
@@ -355,8 +359,11 @@ typedef struct Element {
     float outline_offset;
     float ol_r, ol_g, ol_b, ol_a;
     int has_outline;
-    float padding;
+    float padding;                       /* legacy uniform value (== pad_t) */
+    float pad_t, pad_r, pad_b, pad_l;    /* resolved per-side padding */
     float margin_top, margin_right, margin_bottom, margin_left;
+
+    int margin_top_auto, margin_right_auto, margin_bottom_auto, margin_left_auto;
 
     float opacity;
     int display_none;
@@ -451,6 +458,8 @@ typedef struct Element {
     int visibility_hidden;
     float transform_scale;
     float transform_tx, transform_ty;
+    float raw_transform_tx, raw_transform_ty;
+    int transform_tx_pct, transform_ty_pct;
     float cur_tx, cur_ty;
     float anim_speed;
     int pointer_events_none;
@@ -473,6 +482,7 @@ typedef struct {
     char sel_id[64];
     char sel_classes[MAX_SEL_CLASSES][64];
     int  sel_class_count;
+    int  is_universal;
 } SimpleSelector;
 
 typedef struct {
@@ -491,7 +501,9 @@ typedef struct {
     int has_width;  float width;
     int has_height; float height;
     int has_padding; float padding;
+    float pad_t, pad_r, pad_b, pad_l;
     int has_margin; float margin_top, margin_right, margin_bottom, margin_left;
+    int margin_top_auto, margin_right_auto, margin_bottom_auto, margin_left_auto;
     int has_left;   float left;
     int has_top;    float top;
     int has_bottom; float bottom;
@@ -581,15 +593,17 @@ typedef struct {
 
     int has_z_index; int z_index;
 
-    int pct_w; float raw_w;
-    int pct_h; float raw_h;
-    int pct_left; float raw_left;
-    int pct_top; float raw_top;
+    int pct_w; float raw_w; float raw_w_off;
+    int pct_h; float raw_h; float raw_h_off;
+    int pct_left; float raw_left; float raw_left_off;
+    int pct_top; float raw_top; float raw_top_off;
 
     int has_visibility; int visibility_hidden;
     int has_transform; float transform_scale;
     int has_transform_tx; float transform_tx;
     int has_transform_ty; float transform_ty;
+    float raw_transform_tx, raw_transform_ty;
+    int transform_tx_pct, transform_ty_pct;
     int has_transition; float transition_duration;
     int has_pointer_events; int pointer_events_none;
 
@@ -602,6 +616,7 @@ typedef struct {
 
 Element  elements[MAX_ELEMENTS]; int elem_count = 0;
 StyleRule  css_rules[MAX_RULES];   int rule_count = 0;
+
 
 static int render_order[MAX_ELEMENTS];
 
@@ -894,54 +909,144 @@ static float read_css_length(const char** pp) {
 
 // Parse length with optional % (stored as 0.0-1.0 ratio when pct).
 static void parse_length(const char* val, float* out_num, int* out_pct) {
-    char buf[32] = {0};
+    char buf[64] = {0};
     strncpy(buf, val, sizeof(buf) - 1);
-    trim_whitespace(buf);
+    buf[sizeof(buf) - 1] = '\0';
+    /* strip leading whitespace */
+    char* st = buf; while (isspace((unsigned char)*st)) st++;
+    if (st != buf) memmove(buf, st, strlen(st) + 1);
     int len = (int)strlen(buf);
+    while (len > 0 && isspace((unsigned char)buf[len-1])) buf[--len] = '\0';
     *out_pct = 0;
-    if (len > 0 && buf[len - 1] == '%') { *out_pct = 1; buf[len - 1] = '\0'; }
     *out_num = 0.0f;
+    if (len > 0 && buf[len-1] == '%') { *out_pct = 1; buf[--len] = '\0'; }
+    if (*out_pct) { sscanf(buf, "%f", out_num); *out_num /= 100.0f; return; }
     sscanf(buf, "%f", out_num);
-    if (*out_pct) *out_num /= 100.0f;
 }
 
-// Parse box-shadow: [inset] <x> <y> [<blur>] [<spread>] <color>
-// Handles px/em units and multi-shadow (takes only the first shadow).
+/* Parse length including calc(X% +/- Ypx). Returns 1 if calc was parsed. */
+static int parse_length_calc(const char* val, float* out_num, int* out_pct, float* out_offset) {
+    *out_offset = 0.0f;
+    char buf[128] = {0};
+    strncpy(buf, val, sizeof(buf) - 1);
+    /* strip whitespace */
+    char* s = buf; while (isspace((unsigned char)*s)) s++;
+    if (s != buf) memmove(buf, s, strlen(s) + 1);
+    int bl = (int)strlen(buf);
+    while (bl > 0 && isspace((unsigned char)buf[bl-1])) buf[--bl] = '\0';
+    if (strncmp(buf, "calc(", 5) == 0) {
+        /* find the inner expression */
+        const char* inner = buf + 5;
+        /* trim trailing ) */
+        char expr[96] = {0}; strncpy(expr, inner, sizeof(expr) - 1);
+        int el = (int)strlen(expr);
+        while (el > 0 && (expr[el-1] == ')' || isspace((unsigned char)expr[el-1]))) expr[--el] = '\0';
+        /* parse: X% op Ypx */
+        char* endp = NULL;
+        float v1 = strtof(expr, &endp);
+        if (endp && *endp == '%') {
+            *out_pct = 1; *out_num = v1 / 100.0f;
+            endp++;
+            while (isspace((unsigned char)*endp)) endp++;
+            char op = *endp; if (op == '+' || op == '-') endp++;
+            while (isspace((unsigned char)*endp)) endp++;
+            float v2 = strtof(endp, NULL);
+            *out_offset = (op == '-') ? -v2 : v2;
+            return 1;
+        } else if (endp) {
+            /* Npx op X% */
+            float px_part = v1;
+            while (isspace((unsigned char)*endp)) endp++;
+            char op = *endp; if (op == '+' || op == '-') endp++;
+            while (isspace((unsigned char)*endp)) endp++;
+            float v2 = strtof(endp, &endp);
+            if (endp && *endp == '%') {
+                *out_pct = 1; *out_num = v2 / 100.0f;
+                *out_offset = (op == '-') ? -px_part : px_part;
+                return 1;
+            }
+            /* both px */
+            *out_pct = 0; *out_num = (op == '-') ? px_part - v2 : px_part + v2;
+            return 1;
+        }
+        *out_pct = 0; *out_num = 0.0f; return 1;
+    }
+    /* not calc - use regular parse */
+    parse_length(val, out_num, out_pct);
+    return 0;
+}
+
+
+// Parse box-shadow: multi-shadow, pick first non-inset shadow.
 static void parse_box_shadow(const char* val, StyleRule* rule) {
     const char* p = val;
-    while (isspace((unsigned char)*p)) p++;
-    // skip "inset" keyword if present
-    if (strncmp(p, "inset", 5) == 0 && (isspace((unsigned char)p[5]) || !p[5]))
-        { p += 5; while (isspace((unsigned char)*p)) p++; }
-
-    float dx   = read_css_length(&p);
-    float dy   = read_css_length(&p);
-    float blur = read_css_length(&p);
-    // optional spread radius — skip it (detect by whether next token is a number)
-    if (*p && (*p == '-' || *p == '+' || isdigit((unsigned char)*p) || *p == '.')) {
-        read_css_length(&p);  // discard spread
-    }
-    // color: scan to top-level comma (second shadow) — skip commas inside rgba(...)
-    if (*p && *p != ',') {
-        char colbuf[128] = {0};
-        const char* end = p;
+    int found_noninset = 0;
+    while (*p && !found_noninset) {
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        /* Find end of this shadow entry (comma at depth 0) */
+        const char* shadow_start = p;
         int depth = 0;
-        while (*end) {
-            if (*end == '(') depth++;
-            else if (*end == ')') depth--;
-            else if (*end == ',' && depth == 0) break;
-            end++;
+        while (*p) {
+            if (*p == '(') depth++;
+            else if (*p == ')') depth--;
+            else if (*p == ',' && depth == 0) break;
+            p++;
         }
-        int len = (int)(end - p);
-        if (len >= 127) len = 127;
-        strncpy(colbuf, p, len);
-        trim_whitespace(colbuf);
-        if (colbuf[0]) {
-            float cr = 0, cg = 0, cb = 0, ca = 1;
-            parse_color(colbuf, &cr, &cg, &cb, &ca);
-            rule->has_shadow = 1;
-            rule->sh_dx = dx; rule->sh_dy = dy; rule->sh_blur = blur;
-            rule->sh_r = cr; rule->sh_g = cg; rule->sh_b = cb; rule->sh_a = ca;
+        char shadow_buf[256] = {0};
+        int slen = (int)(p - shadow_start);
+        if (slen > 255) slen = 255;
+        strncpy(shadow_buf, shadow_start, slen);
+        /* skip trailing comma */
+        if (*p == ',') p++;
+
+        /* check if this shadow contains "inset" keyword */
+        char lower[256] = {0};
+        for (int i = 0; i < slen; i++) lower[i] = (char)tolower((unsigned char)shadow_buf[i]);
+        int is_inset = (strstr(lower, "inset") != NULL);
+        if (is_inset) continue;
+
+        /* Parse this non-inset shadow */
+        const char* sp = shadow_buf;
+        while (isspace((unsigned char)*sp)) sp++;
+        /* skip "inset" if somehow at start */
+        if (strncmp(sp, "inset", 5) == 0 && (isspace((unsigned char)sp[5]) || !sp[5]))
+            { sp += 5; while (isspace((unsigned char)*sp)) sp++; }
+
+        float dx   = read_css_length(&sp);
+        float dy   = read_css_length(&sp);
+        float blur = read_css_length(&sp);
+        /* optional spread - skip if next is a number */
+        if (*sp && (*sp == '-' || *sp == '+' || isdigit((unsigned char)*sp) || *sp == '.'))
+            read_css_length(&sp);
+        /* color */
+        if (*sp && *sp != ',' && *sp != '\0') {
+            char colbuf[128] = {0};
+            const char* end = sp;
+            int d2 = 0;
+            while (*end) {
+                if (*end == '(') d2++;
+                else if (*end == ')') d2--;
+                else if (*end == ',' && d2 == 0) break;
+                end++;
+            }
+            int clen = (int)(end - sp);
+            if (clen >= 127) clen = 127;
+            strncpy(colbuf, sp, clen);
+            /* strip trailing "inset" if present */
+            char* ins = strstr(colbuf, " inset");
+            if (ins) *ins = '\0';
+            /* trim */
+            int cl = (int)strlen(colbuf);
+            while (cl > 0 && isspace((unsigned char)colbuf[cl-1])) colbuf[--cl] = '\0';
+            if (colbuf[0]) {
+                float cr = 0, cg = 0, cb = 0, ca = 1;
+                parse_color(colbuf, &cr, &cg, &cb, &ca);
+                rule->has_shadow = 1;
+                rule->sh_dx = dx; rule->sh_dy = dy; rule->sh_blur = blur;
+                rule->sh_r = cr; rule->sh_g = cg; rule->sh_b = cb; rule->sh_a = ca;
+                found_noninset = 1;
+            }
         }
     }
 }
@@ -1188,15 +1293,21 @@ static void parse_padding_shorthand(const char* val, StyleRule* rule) {
         tok = strtok(NULL, " \t");
     }
     rule->has_padding = 1;
+    /* CSS shorthand: 1=all, 2=(v h), 3=(t h b), 4=(t r b l) */
     if (count == 1) {
-        rule->padding = vals[0];
+        rule->pad_t = rule->pad_r = rule->pad_b = rule->pad_l = vals[0];
     } else if (count == 2) {
-        rule->padding = vals[0];
+        rule->pad_t = rule->pad_b = vals[0];
+        rule->pad_r = rule->pad_l = vals[1];
     } else if (count == 3) {
-        rule->padding = vals[0];
-    } else if (count >= 4) {
-        rule->padding = vals[0];
+        rule->pad_t = vals[0];
+        rule->pad_r = rule->pad_l = vals[1];
+        rule->pad_b = vals[2];
+    } else {
+        rule->pad_t = vals[0]; rule->pad_r = vals[1];
+        rule->pad_b = vals[2]; rule->pad_l = vals[3];
     }
+    rule->padding = rule->pad_t;
 }
 
 static void parse_margin_shorthand(const char* val, StyleRule* rule) {
@@ -1288,7 +1399,7 @@ static void parse_scroll_padding_shorthand(const char* val, StyleRule* rule) {
     }
 }
 
-// Parse transform: scale(), translateX(), translateY() (may be combined)
+// Parse transform: scale(), translate(x,y), translateX(), translateY() (may be combined)
 static void parse_transform(const char* val, StyleRule* rule) {
     const char* p = val;
     while (p && *p) {
@@ -1299,18 +1410,49 @@ static void parse_transform(const char* val, StyleRule* rule) {
                 rule->has_transform = 1;
                 rule->transform_scale = s;
             }
-        } else if (strncmp(p, "translateX(", 11) == 0) {
-            float tx = 0.0f;
-            if (sscanf(p + 11, "%f", &tx) == 1) {
-                rule->has_transform_tx = 1;
-                rule->transform_tx = tx;
-            }
-        } else if (strncmp(p, "translateY(", 11) == 0) {
+        } else if (strncmp(p, "translate(", 10) == 0) {
+            const char* arg = p + 10;
+            char* endp;
+            float tx = strtof(arg, &endp);
+            int tx_pct = 0;
+            if (*endp == '%') { tx_pct = 1; tx /= 100.0f; endp++; }
+            /* find comma */
+            while (*endp && *endp != ',' && *endp != ')') endp++;
             float ty = 0.0f;
-            if (sscanf(p + 11, "%f", &ty) == 1) {
-                rule->has_transform_ty = 1;
-                rule->transform_ty = ty;
+            int ty_pct = 0;
+            if (*endp == ',') {
+                endp++;
+                while (*endp == ' ') endp++;
+                char* endp2;
+                ty = strtof(endp, &endp2);
+                if (*endp2 == '%') { ty_pct = 1; ty /= 100.0f; }
             }
+            rule->has_transform_tx = 1;
+            rule->has_transform_ty = 1;
+            rule->transform_tx_pct = tx_pct;
+            rule->transform_ty_pct = ty_pct;
+            if (tx_pct) { rule->raw_transform_tx = tx; rule->transform_tx = 0.0f; }
+            else rule->transform_tx = tx;
+            if (ty_pct) { rule->raw_transform_ty = ty; rule->transform_ty = 0.0f; }
+            else rule->transform_ty = ty;
+        } else if (strncmp(p, "translateX(", 11) == 0) {
+            char* endp;
+            float tx = strtof(p + 11, &endp);
+            int tx_pct = (*endp == '%');
+            if (tx_pct) tx /= 100.0f;
+            rule->has_transform_tx = 1;
+            rule->transform_tx_pct = tx_pct;
+            if (tx_pct) { rule->raw_transform_tx = tx; rule->transform_tx = 0.0f; }
+            else rule->transform_tx = tx;
+        } else if (strncmp(p, "translateY(", 11) == 0) {
+            char* endp;
+            float ty = strtof(p + 11, &endp);
+            int ty_pct = (*endp == '%');
+            if (ty_pct) ty /= 100.0f;
+            rule->has_transform_ty = 1;
+            rule->transform_ty_pct = ty_pct;
+            if (ty_pct) { rule->raw_transform_ty = ty; rule->transform_ty = 0.0f; }
+            else rule->transform_ty = ty;
         }
         const char* close = strchr(p, ')');
         if (!close) break;
@@ -1643,9 +1785,8 @@ static int element_overflow_visible(int idx) {
     while (p != -1) {
         Element* par = &elements[p];
         if (overflow_clips(par->overflow_x) || overflow_clips(par->overflow_y)) {
-            float pad = par->padding;
-            float cx = par->x + pad, cy = par->y + pad;
-            float cw = par->w - pad * 2.0f, ch = par->h - pad * 2.0f;
+            float cx = par->x + par->pad_l, cy = par->y + par->pad_t;
+            float cw = par->w - par->pad_l - par->pad_r, ch = par->h - par->pad_t - par->pad_b;
             if (cw <= 0.0f || ch <= 0.0f) return 0;
             int clip_x = overflow_clips(par->overflow_x);
             int clip_y = overflow_clips(par->overflow_y);
@@ -1688,8 +1829,8 @@ void parse_simple_selector(const char* sel_in, SimpleSelector* out) {
             char token[32] = {0}; int ti = 0;
             while (*p && *p != '.' && *p != '#' && ti < 31) token[ti++] = *p++;
             token[ti] = 0;
-            if (strcmp(token, "*") != 0 && strlen(token) > 0)
-                strncpy(out->sel_type, token, 31);
+            if (strcmp(token, "*") == 0) out->is_universal = 1;
+            else if (strlen(token) > 0) strncpy(out->sel_type, token, 31);
         }
     }
 }
@@ -1717,7 +1858,8 @@ int simple_selector_matches(SimpleSelector* s, Element* e) {
     if (s->sel_id[0]   && strcmp(s->sel_id,   e->id)   != 0) return 0;
     for (int i = 0; i < s->sel_class_count; i++)
         if (!element_has_class(e, s->sel_classes[i])) return 0;
-    if (!s->sel_type[0] && !s->sel_id[0] && s->sel_class_count == 0) return 0;
+    if (!s->sel_type[0] && !s->sel_id[0] && s->sel_class_count == 0)
+        return s->is_universal ? 1 : 0;
     return 1;
 }
 
@@ -1757,7 +1899,8 @@ void parse_declarations(char* declarations, StyleRule* rule);
 /* Apply one pre-tokenised CSS key/value to a StyleRule.
    Wraps parse_declarations so all property logic stays in one place. */
 static void apply_one_declaration(const char* key, const char* val, StyleRule* rule) {
-    /* buf = "key: val;" — parse_declarations handles the rest */
+    /* Skip CSS custom properties (--name: value) — resolved by cssparser.h */
+    if (strncmp(key, "--", 2) == 0) return;
     char buf[CSS_MAX_VALUE + CSS_MAX_STR + 4];
     snprintf(buf, sizeof(buf), "%s: %s;", key, val);
     parse_declarations(buf, rule);
@@ -1812,16 +1955,45 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             }
             else if (strcmp(key, "border-color") == 0)     { rule->has_border = 1; parse_color(val, &rule->bd_r, &rule->bd_g, &rule->bd_b, &rule->bd_a); }
             else if (strcmp(key, "border") == 0)           { parse_border_shorthand(val, rule); }
-            else if (strcmp(key, "width") == 0)            { rule->has_width = 1; parse_length(val, &rule->width, &rule->pct_w); if (rule->pct_w) rule->raw_w = rule->width; }
-            else if (strcmp(key, "height") == 0)           { rule->has_height = 1; parse_length(val, &rule->height, &rule->pct_h); if (rule->pct_h) rule->raw_h = rule->height; }
+            else if (strcmp(key, "border-top") == 0 || strcmp(key, "border-right") == 0 ||
+                     strcmp(key, "border-bottom") == 0 || strcmp(key, "border-left") == 0) {
+                /* Directional border: parse color only; do NOT set border_width
+                   (that would inflate element dimensions).  We only need the
+                   color for the divider effect rendered via the uniform border. */
+                float cr, cg, cb, ca = 1.0f;
+                const char* sp = val;
+                while (*sp && (*sp == ' ' || isdigit((unsigned char)*sp) || *sp == '.' || *sp == 'p' || *sp == 'x')) sp++;
+                if (*sp == ' ') sp++;
+                /* skip "solid"/"dashed"/"none" keyword */
+                while (*sp && !(*sp == 'r' || *sp == '#' || *sp == 'h' || *sp == 't')) sp++;
+                if (*sp) { parse_color(sp, &cr, &cg, &cb, &ca); rule->has_border = 1; rule->bd_r = cr; rule->bd_g = cg; rule->bd_b = cb; rule->bd_a = ca; }
+            }
+            else if (strcmp(key, "width") == 0) {
+                if (strcmp(val,"fit-content")==0 || strcmp(val,"max-content")==0 || strcmp(val,"min-content")==0) {
+                    /* leave has_css_width=0, let layout compute */
+                } else {
+                    rule->has_width = 1;
+                    parse_length_calc(val, &rule->width, &rule->pct_w, &rule->raw_w_off);
+                    if (rule->pct_w) rule->raw_w = rule->width;
+                }
+            }
+            else if (strcmp(key, "height") == 0) {
+                rule->has_height = 1;
+                parse_length_calc(val, &rule->height, &rule->pct_h, &rule->raw_h_off);
+                if (rule->pct_h) rule->raw_h = rule->height;
+            }
             else if (strcmp(key, "padding") == 0)          { parse_padding_shorthand(val, rule); }
+            else if (strcmp(key, "padding-top") == 0)      { rule->has_padding = 1; rule->pad_t = parse_float_val(val); }
+            else if (strcmp(key, "padding-right") == 0)    { rule->has_padding = 1; rule->pad_r = parse_float_val(val); }
+            else if (strcmp(key, "padding-bottom") == 0)   { rule->has_padding = 1; rule->pad_b = parse_float_val(val); }
+            else if (strcmp(key, "padding-left") == 0)     { rule->has_padding = 1; rule->pad_l = parse_float_val(val); }
             else if (strcmp(key, "margin") == 0)           { parse_margin_shorthand(val, rule); }
-            else if (strcmp(key, "margin-top") == 0)       { rule->has_margin = 1; rule->margin_top = parse_float_val(val); }
-            else if (strcmp(key, "margin-right") == 0)     { rule->has_margin = 1; rule->margin_right = parse_float_val(val); }
-            else if (strcmp(key, "margin-bottom") == 0)    { rule->has_margin = 1; rule->margin_bottom = parse_float_val(val); }
-            else if (strcmp(key, "margin-left") == 0)      { rule->has_margin = 1; rule->margin_left = parse_float_val(val); }
-            else if (strcmp(key, "left") == 0)             { rule->has_left = 1; parse_length(val, &rule->left, &rule->pct_left); if (rule->pct_left) rule->raw_left = rule->left; }
-            else if (strcmp(key, "top") == 0)              { rule->has_top = 1; parse_length(val, &rule->top, &rule->pct_top); if (rule->pct_top) rule->raw_top = rule->top; }
+            else if (strcmp(key, "margin-top") == 0)       { rule->has_margin = 1; if (strcmp(val,"auto")==0) rule->margin_top_auto=1; else rule->margin_top = parse_float_val(val); }
+            else if (strcmp(key, "margin-right") == 0)     { rule->has_margin = 1; if (strcmp(val,"auto")==0) rule->margin_right_auto=1; else rule->margin_right = parse_float_val(val); }
+            else if (strcmp(key, "margin-bottom") == 0)    { rule->has_margin = 1; if (strcmp(val,"auto")==0) rule->margin_bottom_auto=1; else rule->margin_bottom = parse_float_val(val); }
+            else if (strcmp(key, "margin-left") == 0)      { rule->has_margin = 1; if (strcmp(val,"auto")==0) rule->margin_left_auto=1; else rule->margin_left = parse_float_val(val); }
+            else if (strcmp(key, "left") == 0) { rule->has_left = 1; parse_length_calc(val, &rule->left, &rule->pct_left, &rule->raw_left_off); if (rule->pct_left) rule->raw_left = rule->left; }
+            else if (strcmp(key, "top") == 0)  { rule->has_top = 1; parse_length_calc(val, &rule->top, &rule->pct_top, &rule->raw_top_off); if (rule->pct_top) rule->raw_top = rule->top; }
             else if (strcmp(key, "bottom") == 0)           { rule->has_bottom = 1; parse_length(val, &rule->bottom, &rule->pct_bottom); if (rule->pct_bottom) rule->raw_bottom = rule->bottom; }
             else if (strcmp(key, "right") == 0)            { rule->has_right = 1; parse_length(val, &rule->right, &rule->pct_right); if (rule->pct_right) rule->raw_right = rule->right; }
             else if (strcmp(key, "position") == 0) {
@@ -2165,6 +2337,13 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             else if (strcmp(key, "font-size") == 0)   { rule->has_font_size = 1; rule->font_size = (int)parse_float_val(val); }
             else if (strcmp(key, "font-weight") == 0) { rule->has_font_weight = 1; rule->font_bold = (strstr(val, "bold") != NULL || atoi(val) >= 600); }
             else if (strcmp(key, "box-shadow") == 0)  { parse_box_shadow(val, rule); }
+            else if (strcmp(key, "inset") == 0) {
+                float v = parse_float_val(val);
+                rule->has_top = 1;    rule->top = v;
+                rule->has_right = 1;  rule->right = v;
+                rule->has_bottom = 1; rule->bottom = v;
+                rule->has_left = 1;   rule->left = v;
+            }
         }
         if (!semi) break;
         prop = semi + 1;
@@ -2196,6 +2375,9 @@ static void convert_selector(const CSSSelector *cs, SimpleSelector *ss,
             if (ss->sel_class_count < MAX_SEL_CLASSES)
                 strncpy(ss->sel_classes[ss->sel_class_count++], p->name, sizeof(ss->sel_classes[0]) - 1);
             break;
+        case CSS_SEL_UNIVERSAL:
+            ss->is_universal = 1;
+            break;
         case CSS_SEL_PSEUDO_CLASS:
             if      (strcmp(p->name, "hover")        == 0) *is_hover = 1;
             else if (strcmp(p->name, "active")       == 0) *is_active = 1;
@@ -2220,12 +2402,28 @@ static int simple_selector_spec(const SimpleSelector *ss) {
 static void ingest_parsed_rule(const CSSRule *pr) {
     /* Build declaration-derived template once */
     StyleRule tmpl; memset(&tmpl, 0, sizeof(tmpl));
-    for (int di = 0; di < pr->decl_count; di++)
+    int has_important = 0;
+    for (int di = 0; di < pr->decl_count; di++) {
         apply_one_declaration(pr->decls[di].property, pr->decls[di].value, &tmpl);
+        if (pr->decls[di].important) has_important = 1;
+    }
 
     for (int si = 0; si < pr->selector_count && rule_count < MAX_RULES; si++) {
         const CSSSelector *cs = &pr->selectors[si];
         if (cs->compound_count == 0) continue;
+
+        /* Pseudo-element targets (::before, ::after, ::-webkit-scrollbar,
+           ::selection, ...) do not match real DOM elements. This engine does
+           not render generated content, so drop such rules entirely; otherwise
+           their declarations (e.g. `width:4px`) would leak onto the element the
+           compound is attached to (e.g. `.tab_panel::-webkit-scrollbar`). */
+        {
+            const CSSCompound *tgt = &cs->compounds[cs->compound_count - 1];
+            int has_pseudo_elem = 0;
+            for (int pi = 0; pi < tgt->part_count; pi++)
+                if (tgt->parts[pi].type == CSS_SEL_PSEUDO_ELEM) { has_pseudo_elem = 1; break; }
+            if (has_pseudo_elem) continue;
+        }
 
         StyleRule rule = tmpl;
         int is_hover = 0, is_active = 0, is_focus = 0, is_fvis = 0, is_fwithin = 0;
@@ -2259,11 +2457,12 @@ static void ingest_parsed_rule(const CSSRule *pr) {
         int spec = simple_selector_spec(&rule.target);
         for (int a = 0; a < rule.ancestor_count; a++)
             spec += simple_selector_spec(&rule.ancestors[a]);
-        if (is_hover)   spec += 1000;
-        if (is_active)  spec += 2000;
-        if (is_fvis)    spec += 1600;
-        if (is_fwithin) spec += 1550;
+        if (is_hover)    spec += 1000;
+        if (is_active)   spec += 2000;
+        if (is_fvis)     spec += 1600;
+        if (is_fwithin)  spec += 1550;
         if (is_focus && !is_fvis) spec += 1500;
+        if (has_important) spec += 10000; /* !important boosts over any selector specificity */
         rule.specificity = spec;
 
         /* Store selector string for debugging */
@@ -2326,7 +2525,9 @@ void update_element_style(Element* e) {
     e->has_outline = 0;
     e->ol_r = 0.39f; e->ol_g = 0.40f; e->ol_b = 0.95f; e->ol_a = 0.5f;
     e->border_radius = 0; e->padding = 0;
+    e->pad_t = e->pad_r = e->pad_b = e->pad_l = 0;
     e->margin_top = e->margin_right = e->margin_bottom = e->margin_left = 0.0f;
+    e->margin_top_auto = e->margin_right_auto = e->margin_bottom_auto = e->margin_left_auto = 0;
     e->opacity = 1; e->display_none = 0; e->display_mode = DISPLAY_BLOCK;
     e->visibility_hidden = 0; e->cursor_pointer = 0;
     e->flex_direction = FLEX_DIR_ROW;
@@ -2388,13 +2589,18 @@ void update_element_style(Element* e) {
     e->css_positioned = 0;
     e->cursor_type = 0; e->position_fixed = 0;
     e->has_bottom = 0; e->has_right = 0;
+    e->has_top = 0; e->has_left = 0;
     e->text_align = 0; e->font_size = 16; e->font_bold = 0;
     e->has_shadow = 0; e->z_index = 0;
     e->transform_scale = 1.0f; e->transform_tx = 0.0f; e->transform_ty = 0.0f;
+    e->transform_tx_pct = 0; e->transform_ty_pct = 0;
+    e->raw_transform_tx = 0.0f; e->raw_transform_ty = 0.0f;
     e->anim_speed = 14.0f;
     e->pointer_events_none = 0;
     e->pct_w = 0; e->pct_h = 0; e->pct_left = 0; e->pct_top = 0;
     e->pct_bottom = 0; e->pct_right = 0;
+    e->raw_w_off = 0.0f; e->raw_h_off = 0.0f;
+    e->raw_left_off = 0.0f; e->raw_top_off = 0.0f;
 
     for (int i = 0; i < rule_count; i++) {
         StyleRule* r = &css_rules[i];
@@ -2445,20 +2651,28 @@ void update_element_style(Element* e) {
         if (r->has_radius)  e->border_radius = r->border_radius;
         if (r->has_width) {
             e->pct_w = r->pct_w;
-            if (r->pct_w) e->raw_w = r->raw_w;
+            if (r->pct_w) { e->raw_w = r->raw_w; e->raw_w_off = r->raw_w_off; }
             else { e->css_width = r->width; e->has_css_width = 1; e->w = r->width; }
         }
         if (r->has_height) {
             e->pct_h = r->pct_h;
-            if (r->pct_h) e->raw_h = r->raw_h;
+            if (r->pct_h) { e->raw_h = r->raw_h; e->raw_h_off = r->raw_h_off; }
             else { e->css_height = r->height; e->has_css_height = 1; e->h = r->height; }
         }
-        if (r->has_padding) e->padding = r->padding;
+        if (r->has_padding) {
+            e->padding = r->padding;
+            e->pad_t = r->pad_t; e->pad_r = r->pad_r;
+            e->pad_b = r->pad_b; e->pad_l = r->pad_l;
+        }
         if (r->has_margin) {
             e->margin_top = r->margin_top;
             e->margin_right = r->margin_right;
             e->margin_bottom = r->margin_bottom;
             e->margin_left = r->margin_left;
+            e->margin_top_auto = r->margin_top_auto;
+            e->margin_right_auto = r->margin_right_auto;
+            e->margin_bottom_auto = r->margin_bottom_auto;
+            e->margin_left_auto = r->margin_left_auto;
         }
         if (r->has_position) {
             e->position_fixed = r->position_fixed;
@@ -2466,12 +2680,16 @@ void update_element_style(Element* e) {
             if (r->position_mode != POS_UNSET) e->position_mode = r->position_mode;
         }
         if (r->has_left && !e->pos_overridden_x && offsets_should_apply(e)) {
-            e->pct_left = r->pct_left; if (r->pct_left) e->raw_left = r->raw_left; else e->rel_x = r->left;
-            e->has_right = 0; e->css_positioned |= 1;
+            e->pct_left = r->pct_left;
+            if (r->pct_left) { e->raw_left = r->raw_left; e->raw_left_off = r->raw_left_off; }
+            else e->rel_x = r->left;
+            e->has_left = 1; e->has_right = 0; e->css_positioned |= 1;
         }
         if (r->has_top && !e->pos_overridden_y && offsets_should_apply(e)) {
-            e->pct_top = r->pct_top; if (r->pct_top) e->raw_top = r->raw_top; else e->rel_y = r->top;
-            e->has_bottom = 0; e->css_positioned |= 2;
+            e->pct_top = r->pct_top;
+            if (r->pct_top) { e->raw_top = r->raw_top; e->raw_top_off = r->raw_top_off; }
+            else e->rel_y = r->top;
+            e->has_top = 1; e->has_bottom = 0; e->css_positioned |= 2;
         }
         if (r->has_bottom && !e->pos_overridden_y && offsets_should_apply(e)) {
             e->has_bottom = 1; e->pct_bottom = r->pct_bottom;
@@ -2628,8 +2846,16 @@ void update_element_style(Element* e) {
         }
         if (r->has_z_index) e->z_index = r->z_index;
         if (r->has_transform) e->transform_scale = r->transform_scale;
-        if (r->has_transform_tx) e->transform_tx = r->transform_tx;
-        if (r->has_transform_ty) e->transform_ty = r->transform_ty;
+        if (r->has_transform_tx) {
+            e->transform_tx = r->transform_tx;
+            e->transform_tx_pct = r->transform_tx_pct;
+            e->raw_transform_tx = r->raw_transform_tx;
+        }
+        if (r->has_transform_ty) {
+            e->transform_ty = r->transform_ty;
+            e->transform_ty_pct = r->transform_ty_pct;
+            e->raw_transform_ty = r->raw_transform_ty;
+        }
         if (r->has_transition) e->anim_speed = 1.0f / r->transition_duration;
     }
 }
@@ -2957,17 +3183,53 @@ FontAtlas* get_atlas(int size, int bold, int* out_is_fake_bold);
 float measure_text_width(FontAtlas* atlas, const char* text);
 
 static float flow_content_height(Element* e) {
+    int idx = (int)(e - elements);
+
+    /* Does this element have in-flow children? If so its auto height is derived
+       from them (sum for column/block, max for row); otherwise fall back to a
+       single text line. Without this, an auto-height container collapses to one
+       line-height and then flex-shrink crushes its children (e.g. #sidebar_nav
+       squashing its 34px nav items to ~3px). */
+    int n = 0;
+    float total = 0.0f, maxh = 0.0f;
+    for (int c = 0; c < elem_count; c++) {
+        Element* ch = &elements[c];
+        if (ch->parent_idx != idx) continue;
+        if (!is_visible(c)) continue;
+        if (ch->position_mode == POS_ABSOLUTE || ch->position_fixed) continue;
+        float chh;
+        if (ch->has_css_height && !ch->pct_h) {
+            chh = (ch->box_sizing == BOX_CONTENT)
+                ? ch->css_height + ch->pad_t + ch->pad_b + ch->border_width * 2.0f
+                : ch->css_height;
+        } else if (ch->pct_h) {
+            chh = 0.0f;              /* percentage height is not a definite size here */
+        } else {
+            chh = flow_content_height(ch);   /* recurse for auto-height children */
+        }
+        chh += ch->margin_top + ch->margin_bottom;
+        if (chh > maxh) maxh = chh;
+        total += chh;
+        n++;
+    }
+
+    if (n > 0) {
+        int row = (e->display_mode == DISPLAY_FLEX && e->flex_direction == FLEX_DIR_ROW);
+        float inner = row ? maxh : (total + (n > 1 ? e->flex_gap * (float)(n - 1) : 0.0f));
+        return inner + e->pad_t + e->pad_b;
+    }
+
     float lh = (float)e->font_size;
     if (lh < 10.0f) lh = 12.0f;
     lh *= 1.5f;
-    return lh + e->padding * 2.0f;
+    return lh + e->pad_t + e->pad_b;
 }
 
 static float flex_content_width(Element* ch) {
     if (ch->has_css_width && !ch->pct_w) return ch->css_width;
     if (ch->text[0] && font_loaded) {
         FontAtlas* atlas = get_atlas(ch->font_size, ch->font_bold, NULL);
-        return measure_text_width(atlas, ch->text) + ch->padding * 2.0f + 4.0f;
+        return measure_text_width(atlas, ch->text) + ch->pad_l + ch->pad_r + 4.0f;
     }
     if (ch->w > 0.0f && ch->w < 200.0f) return ch->w;
     return 40.0f;
@@ -2988,10 +3250,9 @@ static void layout_block_container(int container_idx) {
     if (cont->display_mode == DISPLAY_FLEX || cont->display_mode == DISPLAY_GRID) return;
     if (cont->display_mode == DISPLAY_NONE) return;
 
-    float pad = cont->padding;
-    float inner_w = cont->w - pad * 2.0f;
+    float inner_w = cont->w - cont->pad_l - cont->pad_r;
     if (inner_w < 0.0f) inner_w = 0.0f;
-    float y = pad;
+    float y = cont->pad_t;
 
     for (int c = 0; c < elem_count; c++) {
         if (elements[c].parent_idx != container_idx) continue;
@@ -3012,16 +3273,9 @@ static void layout_block_container(int container_idx) {
             if (ch->h < 14.0f) ch->h = 14.0f;
         }
 
-        ch->rel_x = pad + ch->margin_left;
+        ch->rel_x = cont->pad_l + ch->margin_left;
         ch->rel_y = y + ch->margin_top;
         y += ch->margin_top + ch->h + ch->margin_bottom;
-    }
-}
-
-static void layout_block_containers(void) {
-    for (int i = 0; i < elem_count; i++) {
-        if (!is_visible(i)) continue;
-        layout_block_container(i);
     }
 }
 
@@ -3048,18 +3302,18 @@ void update_layout() {
             parent_h = elements[par].h;
         }
 
-        if (e->pct_w) e->w = parent_w * e->raw_w;
-        if (e->pct_h) e->h = parent_h * e->raw_h;
+        if (e->pct_w) e->w = parent_w * e->raw_w + e->raw_w_off;
+        if (e->pct_h) e->h = parent_h * e->raw_h + e->raw_h_off;
 
         if (e->has_css_width && !e->pct_w) {
             if (e->box_sizing == BOX_CONTENT)
-                e->w = e->css_width + e->padding * 2.0f + e->border_width * 2.0f;
+                e->w = e->css_width + e->pad_l + e->pad_r + e->border_width * 2.0f;
             else
                 e->w = e->css_width;
         }
         if (e->has_css_height && !e->pct_h) {
             if (e->box_sizing == BOX_CONTENT)
-                e->h = e->css_height + e->padding * 2.0f + e->border_width * 2.0f;
+                e->h = e->css_height + e->pad_t + e->pad_b + e->border_width * 2.0f;
             else
                 e->h = e->css_height;
         }
@@ -3069,21 +3323,37 @@ void update_layout() {
         if (e->has_max_height && e->h > e->css_max_height) e->h = e->css_max_height;
 
         if (!e->pos_overridden_x) {
-            if (e->has_right) {
+            /* Both left+right set (no explicit width): stretch to fill (CSS inset). */
+            if (e->has_left && e->has_right && !e->has_css_width && !e->pct_w) {
+                float lv = e->pct_left ? (parent_w * e->raw_left + e->raw_left_off) : e->rel_x;
+                float rv = e->pct_right ? (parent_w * e->raw_right) : e->right_val;
+                e->rel_x = lv;
+                e->w = parent_w - lv - rv;
+            } else if (e->has_right && !e->has_left) {
+                /* Right-anchored only */
                 float off = e->pct_right ? (parent_w * e->raw_right) : e->right_val;
                 e->rel_x = parent_w - e->w - off;
             } else if (e->pct_left) {
-                e->rel_x = parent_w * e->raw_left;
+                e->rel_x = parent_w * e->raw_left + e->raw_left_off;
             }
+            /* non-percentage left: rel_x already holds the left value */
         }
 
         if (!e->pos_overridden_y) {
-            if (e->has_bottom) {
+            /* Both top+bottom set (no explicit height): stretch to fill. */
+            if (e->has_top && e->has_bottom && !e->has_css_height && !e->pct_h) {
+                float tv = e->pct_top ? (parent_h * e->raw_top + e->raw_top_off) : e->rel_y;
+                float bv = e->pct_bottom ? (parent_h * e->raw_bottom) : e->bottom_val;
+                e->rel_y = tv;
+                e->h = parent_h - tv - bv;
+            } else if (e->has_bottom && !e->has_top) {
+                /* Bottom-anchored only */
                 float off = e->pct_bottom ? (parent_h * e->raw_bottom) : e->bottom_val;
                 e->rel_y = parent_h - e->h - off;
             } else if (e->pct_top) {
-                e->rel_y = parent_h * e->raw_top;
+                e->rel_y = parent_h * e->raw_top + e->raw_top_off;
             }
+            /* non-percentage top: rel_y already holds the top value */
         }
 
         if (e->position_fixed || par == -1) {
@@ -3109,14 +3379,14 @@ static void place_flex_cross(Element* ch, Element* cont, int row_mode,
                              float pad, float inner_cross, float cross_len, int align) {
     (void)cont;
     if (row_mode) {
-        if (align == 3 && !(ch->css_positioned & 2)) { ch->h = inner_cross; return; }
+        if (align == 3 && !(ch->css_positioned & 2)) { ch->h = inner_cross; ch->rel_y = pad; return; }
         if (!(ch->css_positioned & 2)) {
             if (align == 1) ch->rel_y = pad + (inner_cross - cross_len) * 0.5f;
             else if (align == 2) ch->rel_y = pad + inner_cross - cross_len;
             else ch->rel_y = pad;
         }
     } else {
-        if (align == 3 && !(ch->css_positioned & 1)) { ch->w = inner_cross; return; }
+        if (align == 3 && !(ch->css_positioned & 1)) { ch->w = inner_cross; ch->rel_x = pad; return; }
         if (!(ch->css_positioned & 1)) {
             if (align == 1) ch->rel_x = pad + (inner_cross - cross_len) * 0.5f;
             else if (align == 2) ch->rel_x = pad + inner_cross - cross_len;
@@ -3143,7 +3413,8 @@ static float flex_min_main(Element* ch, int row_mode) {
 }
 
 static void layout_flex_line(Element* cont, int* kids, int n, int row_mode,
-                             float pad, float inner_main, float inner_cross, float gap) {
+                             float pad_main, float pad_cross,
+                             float inner_main, float inner_cross, float gap) {
     float main_sz[MAX_ELEMENTS];
     float fixed_main = 0.0f;
     int grow_n = 0;
@@ -3197,18 +3468,64 @@ static void layout_flex_line(Element* cont, int* kids, int n, int row_mode,
     for (int k = 0; k < n; k++) total += main_sz[k];
     total += gap * (float)(n > 1 ? n - 1 : 0);
 
-    float start = pad;
+    float start = pad_main;
     float use_gap = gap;
     if (cont->justify_content == FLEX_JUSTIFY_CENTER)
-        start = pad + (inner_main - total) * 0.5f;
+        start = pad_main + (inner_main - total) * 0.5f;
     else if (cont->justify_content == FLEX_JUSTIFY_END)
-        start = pad + inner_main - total;
+        start = pad_main + inner_main - total;
     else if (cont->justify_content == FLEX_JUSTIFY_SPACE_BETWEEN && n > 1) {
         float content = 0.0f;
         for (int k = 0; k < n; k++) content += main_sz[k];
         use_gap = (inner_main - content) / (float)(n - 1);
         if (use_gap < 0.0f) use_gap = 0.0f;
-        start = pad;
+        start = pad_main;
+    }
+
+    /* Auto-margin: find first item with margin_left_auto (row) or margin_top_auto (col) */
+    /* This item absorbs all free space as its margin, pushing it to the end */
+    int auto_margin_k = -1;
+    for (int k = 0; k < n; k++) {
+        Element* ch = &elements[kids[k]];
+        if (row_mode && ch->margin_left_auto) { auto_margin_k = k; break; }
+        if (!row_mode && ch->margin_top_auto) { auto_margin_k = k; break; }
+    }
+    if (auto_margin_k >= 0 && free_main > 0.0f) {
+        float cursor_a = pad_main;
+        for (int k = 0; k < auto_margin_k; k++) {
+            Element* ch = &elements[kids[k]];
+            float cross_len = row_mode ? ch->h : ch->w;
+            int align = child_cross_align(ch, cont, row_mode);
+            if (row_mode) {
+                if (!(ch->css_positioned & 1)) { ch->w = main_sz[k]; ch->rel_x = cursor_a; }
+                place_flex_cross(ch, cont, 1, pad_cross, inner_cross, cross_len, align);
+                if (!(ch->css_positioned & 1)) cursor_a += main_sz[k] + use_gap;
+            } else {
+                if (!(ch->css_positioned & 2)) { ch->h = main_sz[k]; ch->rel_y = cursor_a; }
+                place_flex_cross(ch, cont, 0, pad_cross, inner_cross, cross_len, align);
+                if (!(ch->css_positioned & 2)) cursor_a += main_sz[k] + use_gap;
+            }
+        }
+        float after_total = 0.0f;
+        for (int k = auto_margin_k; k < n; k++) after_total += main_sz[k];
+        after_total += use_gap * (float)(n - auto_margin_k - 1);
+        float cursor_b = pad_main + inner_main - after_total;
+        if (cursor_b < cursor_a) cursor_b = cursor_a;
+        for (int k = auto_margin_k; k < n; k++) {
+            Element* ch = &elements[kids[k]];
+            float cross_len = row_mode ? ch->h : ch->w;
+            int align = child_cross_align(ch, cont, row_mode);
+            if (row_mode) {
+                if (!(ch->css_positioned & 1)) { ch->w = main_sz[k]; ch->rel_x = cursor_b; }
+                place_flex_cross(ch, cont, 1, pad_cross, inner_cross, cross_len, align);
+                if (!(ch->css_positioned & 1)) cursor_b += main_sz[k] + use_gap;
+            } else {
+                if (!(ch->css_positioned & 2)) { ch->h = main_sz[k]; ch->rel_y = cursor_b; }
+                place_flex_cross(ch, cont, 0, pad_cross, inner_cross, cross_len, align);
+                if (!(ch->css_positioned & 2)) cursor_b += main_sz[k] + use_gap;
+            }
+        }
+        return; /* skip normal placement */
     }
 
     float cursor = start;
@@ -3218,11 +3535,11 @@ static void layout_flex_line(Element* cont, int* kids, int n, int row_mode,
         int align = child_cross_align(ch, cont, row_mode);
         if (row_mode) {
             if (!(ch->css_positioned & 1)) { ch->w = main_sz[k]; ch->rel_x = cursor; }
-            place_flex_cross(ch, cont, 1, pad, inner_cross, cross_len, align);
+            place_flex_cross(ch, cont, 1, pad_cross, inner_cross, cross_len, align);
             if (!(ch->css_positioned & 1)) cursor += main_sz[k] + use_gap;
         } else {
             if (!(ch->css_positioned & 2)) { ch->h = main_sz[k]; ch->rel_y = cursor; }
-            place_flex_cross(ch, cont, 0, pad, inner_cross, cross_len, align);
+            place_flex_cross(ch, cont, 0, pad_cross, inner_cross, cross_len, align);
             if (!(ch->css_positioned & 2)) cursor += main_sz[k] + use_gap;
         }
     }
@@ -3243,17 +3560,20 @@ static void layout_flex_container(int container_idx) {
     if (n == 0) return;
 
     int row_mode = (cont->flex_direction == FLEX_DIR_ROW);
-    float pad = cont->padding;
     float gap = cont->flex_gap;
-    float inner_w = cont->w - pad * 2.0f;
-    float inner_h = cont->h - pad * 2.0f;
+    float inner_w = cont->w - cont->pad_l - cont->pad_r;
+    float inner_h = cont->h - cont->pad_t - cont->pad_b;
     if (inner_w < 0.0f) inner_w = 0.0f;
     if (inner_h < 0.0f) inner_h = 0.0f;
     float inner_main = row_mode ? inner_w : inner_h;
     float inner_cross = row_mode ? inner_h : inner_w;
+    /* Main axis runs along flex-direction; cross axis is perpendicular. */
+    float pad_main  = row_mode ? cont->pad_l : cont->pad_t;
+    float pad_cross = row_mode ? cont->pad_t : cont->pad_l;
+    float pad_cross_end = row_mode ? cont->pad_b : cont->pad_r;
 
     if (cont->flex_wrap == FLEX_WRAP_NOWRAP || !row_mode) {
-        layout_flex_line(cont, kids, n, row_mode, pad, inner_main, inner_cross, gap);
+        layout_flex_line(cont, kids, n, row_mode, pad_main, pad_cross, inner_main, inner_cross, gap);
         return;
     }
 
@@ -3301,24 +3621,24 @@ static void layout_flex_container(int container_idx) {
     float cross_free = inner_cross - total_cross;
     if (cross_free < 0.0f) cross_free = 0.0f;
 
-    float cross_start = pad;
+    float cross_start = pad_cross;
     float cross_gap = gap;
     if (cont->align_content == FLEX_ALIGN_CENTER)
-        cross_start = pad + cross_free * 0.5f;
+        cross_start = pad_cross + cross_free * 0.5f;
     else if (cont->align_content == FLEX_ALIGN_END)
-        cross_start = pad + cross_free;
+        cross_start = pad_cross + cross_free;
     else if (cont->align_content == FLEX_ALIGN_SPACE_BETWEEN && num_lines > 1) {
         float content = 0.0f;
         for (int i = 0; i < num_lines; i++) content += lines[i].cross_sz;
         cross_gap = (inner_cross - content) / (float)(num_lines - 1);
         if (cross_gap < 0.0f) cross_gap = 0.0f;
-        cross_start = pad;
+        cross_start = pad_cross;
     } else if (cont->align_content == FLEX_ALIGN_SPACE_AROUND && num_lines > 0) {
         float content = 0.0f;
         for (int i = 0; i < num_lines; i++) content += lines[i].cross_sz;
         float slack = inner_cross - content;
         if (slack < 0.0f) slack = 0.0f;
-        cross_start = pad + slack / (float)(num_lines * 2);
+        cross_start = pad_cross + slack / (float)(num_lines * 2);
         cross_gap = gap + slack / (float)num_lines;
     } else if (cont->align_content == FLEX_ALIGN_STRETCH && num_lines > 0) {
         float extra = cross_free / (float)num_lines;
@@ -3331,7 +3651,7 @@ static void layout_flex_container(int container_idx) {
         int line_kids[MAX_ELEMENTS];
         for (int li = 0; li < lines[i].count; li++)
             line_kids[li] = kids[lines[i].start + li];
-        layout_flex_line(cont, line_kids, lines[i].count, 1, pad, inner_main, inner_cross, gap);
+        layout_flex_line(cont, line_kids, lines[i].count, 1, pad_main, pad_cross, inner_main, inner_cross, gap);
         if (cont->align_content == FLEX_ALIGN_STRETCH) {
             for (int li = 0; li < lines[i].count; li++) {
                 Element* ch = &elements[line_kids[li]];
@@ -3341,14 +3661,14 @@ static void layout_flex_container(int container_idx) {
         for (int li = 0; li < lines[i].count; li++) {
             Element* ch = &elements[line_kids[li]];
             if (!(ch->css_positioned & 2))
-                ch->rel_y += cross_cursor - pad;
+                ch->rel_y += cross_cursor - pad_cross;
         }
         cross_cursor += lines[i].cross_sz;
         if (i < num_lines - 1) cross_cursor += cross_gap;
     }
 
     if (cont->flex_wrap == FLEX_WRAP_WRAP && row_mode && !cont->has_css_height && !cont->pct_h) {
-        float needed_h = cross_cursor + pad;
+        float needed_h = cross_cursor + pad_cross_end;
         if (cont->has_min_height && needed_h < cont->css_min_height)
             needed_h = cont->css_min_height;
         if (needed_h > cont->h) cont->h = needed_h;
@@ -3672,13 +3992,20 @@ static void layout_flex_containers(void) {
         elements[i].grid_child = 0;
         elements[i].flow_child = 0;
     }
+    /* Single top-down pass in document order (parent index < child index),
+       so a container's own width/height is finalized by its parent before its
+       children are sized. Dispatch each container by display mode; mixing flex
+       and block containers in one ordered pass ensures width propagates
+       parent -> child (e.g. content(block) -> tab_panel(flex) -> toolbar). */
     for (int i = 0; i < elem_count; i++) {
-        if (elements[i].display_mode == DISPLAY_FLEX && is_visible(i))
+        if (!is_visible(i)) continue;
+        if (elements[i].display_mode == DISPLAY_FLEX)
             layout_flex_container(i);
-        else if (elements[i].display_mode == DISPLAY_GRID && is_visible(i))
+        else if (elements[i].display_mode == DISPLAY_GRID)
             layout_grid_container(i);
+        else
+            layout_block_container(i);
     }
-    layout_block_containers();
     for (int i = 0; i < elem_count; i++) {
         Element* e = &elements[i];
         int par = e->parent_idx;
@@ -3699,6 +4026,12 @@ void update_layout_pass(void) {
     apply_scroll_metrics();
     apply_scroll_offsets();
     apply_sticky_positions();
+    /* Resolve percentage-based transforms after element sizes are known */
+    for (int i = 0; i < elem_count; i++) {
+        Element* e = &elements[i];
+        if (e->transform_tx_pct) e->transform_tx = e->raw_transform_tx * e->w;
+        if (e->transform_ty_pct) e->transform_ty = e->raw_transform_ty * e->h;
+    }
 }
 
 static void apply_sticky_positions(void) {
@@ -3716,13 +4049,12 @@ static void apply_sticky_positions(void) {
 
         if (scroll_y != -1) {
             Element* par = &elements[scroll_y];
-            float pad = par->padding;
             if (e->sticky_use_bottom) {
-                float stick_y = par->y + par->h - pad - e->h - e->sticky_bottom;
+                float stick_y = par->y + par->h - par->pad_b - e->h - e->sticky_bottom;
                 if (e->y > stick_y) e->y = stick_y;
             } else if (e->sticky_use_top) {
-                float min_y = par->y + pad + e->sticky_top;
-                float max_y = par->y + par->h - pad - e->h;
+                float min_y = par->y + par->pad_t + e->sticky_top;
+                float max_y = par->y + par->h - par->pad_b - e->h;
                 if (max_y < min_y) max_y = min_y;
                 if (e->y < min_y) e->y = min_y;
                 if (e->y > max_y) e->y = max_y;
@@ -3731,12 +4063,11 @@ static void apply_sticky_positions(void) {
 
         if (scroll_x != -1) {
             Element* par = &elements[scroll_x];
-            float pad = par->padding;
             if (e->sticky_use_left) {
-                float min_x = par->x + pad + e->sticky_left;
+                float min_x = par->x + par->pad_l + e->sticky_left;
                 if (e->x < min_x) e->x = min_x;
             } else if (e->sticky_use_right) {
-                float stick_x = par->x + par->w - pad - e->w - e->sticky_right;
+                float stick_x = par->x + par->w - par->pad_r - e->w - e->sticky_right;
                 if (e->x > stick_x) e->x = stick_x;
             }
         }
@@ -4110,11 +4441,27 @@ static float element_effective_opacity(int idx) {
     return op;
 }
 
+/* Sum of cur_tx/cur_ty of all ANCESTORS (excluding idx itself). A CSS transform
+   on an element establishes a coordinate system for its descendants, so a
+   child's on-screen position must include every ancestor's translate. Layout
+   x/y are transform-free (parent.x + rel_x); the transform offset is applied
+   here at draw time so animated transforms don't require re-layout. */
+static void accum_ancestor_transform(int idx, float* tx, float* ty) {
+    float ax = 0.0f, ay = 0.0f;
+    for (int p = elements[idx].parent_idx; p != -1; p = elements[p].parent_idx) {
+        ax += elements[p].cur_tx;
+        ay += elements[p].cur_ty;
+    }
+    *tx = ax; *ty = ay;
+}
+
 static void get_element_draw_bounds(Element* e, float* out_x, float* out_y, float* out_w, float* out_h) {
     float scale = e->cur_scale;
     float dw = e->w * scale, dh = e->h * scale;
-    *out_x = e->x + (e->w - dw) * 0.5f + e->cur_tx;
-    *out_y = e->y + (e->h - dh) * 0.5f + e->cur_ty;
+    float atx, aty;
+    accum_ancestor_transform((int)(e - elements), &atx, &aty);
+    *out_x = e->x + (e->w - dw) * 0.5f + e->cur_tx + atx;
+    *out_y = e->y + (e->h - dh) * 0.5f + e->cur_ty + aty;
     *out_w = dw;
     *out_h = dh;
 }
@@ -4125,9 +4472,11 @@ static int get_overflow_clip_rect(int idx, float* cx, float* cy, float* cw, floa
     while (p != -1) {
         Element* par = &elements[p];
         if (overflow_clips(par->overflow_x) || overflow_clips(par->overflow_y)) {
-            float pad = par->padding;
-            float px = par->x + pad, py = par->y + pad;
-            float pw = par->w - pad * 2.0f, ph = par->h - pad * 2.0f;
+            float ptx, pty;
+            accum_ancestor_transform(p, &ptx, &pty);
+            ptx += par->cur_tx; pty += par->cur_ty;
+            float px = par->x + par->pad_l + ptx, py = par->y + par->pad_t + pty;
+            float pw = par->w - par->pad_l - par->pad_r, ph = par->h - par->pad_t - par->pad_b;
             if (pw <= 0.0f || ph <= 0.0f) return 0;
             float clip_x = overflow_clips(par->overflow_x) ? px : -1e7f;
             float clip_y = overflow_clips(par->overflow_y) ? py : -1e7f;
@@ -4246,50 +4595,118 @@ int bake_font_set(const unsigned char* ttf_buffer, FontAtlas* atlases) {
     return 1;
 }
 
+// ---- font scanning helpers ----------------------------------------
+
+// Returns 1 if the filename extension is a supported font format.
+static int is_font_file(const char* name) {
+    size_t n = strlen(name);
+    if (n < 4) return 0;
+    const char* ext = name + n - 4;
+    return (strcasecmp(ext, ".ttf") == 0 ||
+            strcasecmp(ext, ".otf") == 0 ||
+            strcasecmp(ext + 1, "tc") == 0); // .ttc / .otc (n>=5 implied by ext check)
+}
+
+// Returns 1 if the filename looks like a bold variant.
+static int is_bold_name(const char* name) {
+    // Case-insensitive search for "bold" in the basename.
+    char lower[512];
+    size_t n = strlen(name);
+    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+    for (size_t i = 0; i < n; i++) lower[i] = (char)tolower((unsigned char)name[i]);
+    lower[n] = '\0';
+    return strstr(lower, "bold") != NULL;
+}
+
+// Dynamic font path list.
+typedef struct {
+    char** paths;
+    int    count;
+    int    cap;
+} FontPathList;
+
+static void fpl_add(FontPathList* fpl, const char* path) {
+    if (fpl->count >= fpl->cap) {
+        fpl->cap = fpl->cap ? fpl->cap * 2 : 64;
+        fpl->paths = realloc(fpl->paths, sizeof(char*) * fpl->cap);
+    }
+    fpl->paths[fpl->count++] = strdup(path);
+}
+
+static void fpl_free(FontPathList* fpl) {
+    for (int i = 0; i < fpl->count; i++) free(fpl->paths[i]);
+    free(fpl->paths);
+    fpl->paths = NULL; fpl->count = fpl->cap = 0;
+}
+
+// Recursively scan dir and collect font paths into reg/bold lists.
+static void scan_fonts_dir(const char* dir, FontPathList* reg, FontPathList* bold) {
+    DIR* d = opendir(dir);
+    if (!d) return;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue; // skip . and ..
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            scan_fonts_dir(path, reg, bold); // recurse
+        } else if (S_ISREG(st.st_mode) && is_font_file(ent->d_name)) {
+            if (is_bold_name(ent->d_name))
+                fpl_add(bold, path);
+            else
+                fpl_add(reg, path);
+        }
+    }
+    closedir(d);
+}
+
+// Try each path in the list; return first successfully loaded buffer.
+static unsigned char* try_load_font_list(FontPathList* fpl) {
+    for (int i = 0; i < fpl->count; i++) {
+        unsigned char* buf = read_file_bytes(fpl->paths[i], NULL);
+        if (buf) {
+            fprintf(stderr, "[vespera] Font loaded: %s\n", fpl->paths[i]);
+            return buf;
+        }
+    }
+    return NULL;
+}
+
+// ------------------------------------------------------------------
+
 void init_font() {
-    const char* regular_paths[] = {
-        "/usr/share/fonts/ja/TrueType/NotoSansCJKjp-Regular.otf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        NULL
-    };
-    const char* bold_paths[] = {
-        "/usr/share/fonts/ja/TrueType/NotoSansCJKjp-Bold.otf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        NULL
-    };
+    FontPathList reg  = {0};
+    FontPathList bold_list = {0};
 
-    unsigned char* reg_buf = NULL;
-    for (int i = 0; regular_paths[i]; i++) {
-        reg_buf = read_file_bytes(regular_paths[i], NULL);
-        if (reg_buf) break;
-    }
-    if (!reg_buf) { fprintf(stderr, "[vespera] Warning: no font found\n"); return; }
-    bake_font_set(reg_buf, font_regular);
-    free(reg_buf);
+    scan_fonts_dir("/usr/share/fonts", &reg, &bold_list);
 
-    unsigned char* bold_buf = NULL;
-    for (int i = 0; bold_paths[i]; i++) {
-        bold_buf = read_file_bytes(bold_paths[i], NULL);
-        if (bold_buf) break;
+    unsigned char* reg_buf = try_load_font_list(&reg);
+    if (!reg_buf) { fprintf(stderr, "[vespera] Warning: no regular font found under /usr/share/fonts\n"); }
+    else {
+        bake_font_set(reg_buf, font_regular);
+        free(reg_buf);
     }
+
+    unsigned char* bold_buf = try_load_font_list(&bold_list);
     if (bold_buf) {
         bake_font_set(bold_buf, font_bold_atlas);
         bold_font_loaded = 1;
         free(bold_buf);
     }
 
+    fpl_free(&reg);
+    fpl_free(&bold_list);
+
     glCreateVertexArrays(1, &text_vao); glGenBuffers(1, &text_vbo);
     glBindVertexArray(text_vao); glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 4 * 4, NULL, GL_DYNAMIC_DRAW);
     glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), 0);
     glEnableVertexAttribArray(0);
-    font_loaded = 1;
+    if (reg_buf || bold_buf) font_loaded = 1;
 }
 
 FontAtlas* get_atlas(int size, int bold, int* out_is_fake_bold) {
@@ -5513,12 +5930,12 @@ static void parse_args(int argc, char** argv) {
 
 #define DEMO_CSS_INCLUDE
 static const char* default_css =
-#include "demo_style.css.h"
+#include "demo.css.h"
 ;
 
 #define DEMO_HTML_INCLUDE
 static const char* default_html =
-#include "demo_layout.html.h"
+#include "demo.html.h"
 ;
 
 // ============================================================

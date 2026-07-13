@@ -4,7 +4,7 @@
     "  <meta charset=\"utf-8\">\n"
     "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
     "  <title>Vespera GUI Engine v3.12</title>\n"
-    "  <link rel=\"stylesheet\" type=\"text/css\" href=\"demo_style.css\">\n"
+    "  <link rel=\"stylesheet\" type=\"text/css\" href=\"demo.css\">\n"
     "</head>\n"
     "<body>\n"
     "<div id=\"main_win\" class=\"window focused\">\n"
