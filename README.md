@@ -4,6 +4,8 @@ A **pure Rust** Wayland compositor + custom `libwayland-client` implementation +
 
 [![Sponsor](https://img.shields.io/badge/Sponsor%20this%20project-%E2%9D%A4%EF%B8%8F-white?logo=githubsponsors&logoColor=EA4AAA&labelColor=EA4AAA)](https://github.com/sponsors/yui0)
 
+[Screenshot](screenshot.png)
+
 ---
 
 ## 🏷️ Product Names & Layers
@@ -19,8 +21,6 @@ A **pure Rust** Wayland compositor + custom `libwayland-client` implementation +
 **Internal codename:** Vespera
 **User-facing name:** **Lu** (short, memorable, like GNOME/KDE)
 
----
-
 ## 🔄 Boot Flow (After Kernel)
 
 ```bash
@@ -33,8 +33,6 @@ systemd / init
 
 Wayland protocol is used as an **internal bus**. No Weston, Mutter, or Xorg needed. GTK4 connects directly to the Vespera compositor.
 
----
-
 ## 🛠️ Try It on Your Dev Machine
 
 ```bash
@@ -46,8 +44,6 @@ make desktop-soft         # 💻 Software backend (great for VMs)
 LU_APPS="target/release/hello-gtk" make desktop
 ```
 
----
-
 ## 📦 Production Install (Launch Desktop on tty1)
 
 ```bash
@@ -57,8 +53,6 @@ sudo systemctl start lu-desktop.service
 ```
 
 Works alongside `getty@tty1` auto-login. For manual testing with existing sessions, just run `lu-session`.
-
----
 
 ## 📁 Directory Structure
 
@@ -73,8 +67,6 @@ vespera/
 ├── wayland-server-rs/         # Pure Rust Wayland server (no libwayland-server!)
 └── hello-gtk/                 # Sample GTK4 app
 ```
-
----
 
 ## ⚡ Quick Start
 
@@ -97,8 +89,6 @@ PORT=9090 ./run-gtk
 Open `http://localhost:8081/` → Real-time 1280×720 RGBA streaming via WebGL!
 🖱️ Click & type directly in the browser — input goes to the GTK app.
 
----
-
 ### 💻 **Software Rendering Demo**
 
 ```bash
@@ -115,8 +105,6 @@ cargo build -p wayland-server-rs --features dri
 ./target/debug/vespera-server --backend dri
 ```
 
----
-
 ## 🛠️ Build Commands
 
 ```bash
@@ -126,8 +114,6 @@ cargo build --features webgl   # + WebGL backend
 make build
 make build-webgl
 ```
-
----
 
 ## 🧠 Design Highlights
 

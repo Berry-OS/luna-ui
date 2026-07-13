@@ -10,19 +10,19 @@
 <div id="main_win" class="window focused">
   <div id="title_bar">
     <div id="title_drag" class="title_drag" draggable="1"></div>
-    <div id="btn_close" class="btn_os"></div>
-    <div id="btn_min" class="btn_os"></div>
-    <div id="btn_max" class="btn_os"></div>
+    <div id="btn_close" class="btn_os" onclick="onClose()"></div>
+    <div id="btn_min" class="btn_os" onclick="onMinimize()"></div>
+    <div id="btn_max" class="btn_os" onclick="onMaximize()"></div>
     <p id="title_text">System Preferences</p>
   </div>
   <div id="sidebar">
     <div id="sidebar_avatar"></div>
     <p id="sidebar_username">Vespera User</p>
     <p id="sidebar_role">Administrator</p>
-    <div id="nav_1" class="nav_item active">General<div id="nav_dot_1" class="nav_dot"></div></div>
-    <div id="nav_2" class="nav_item">Appearance<div id="nav_dot_2" class="nav_dot"></div></div>
-    <div id="nav_3" class="nav_item">Network</div>
-    <div id="nav_4" class="nav_item">Security</div>
+    <div id="nav_1" class="nav_item active" onclick="onNavClick()">General<div id="nav_dot_1" class="nav_dot"></div></div>
+    <div id="nav_2" class="nav_item" onclick="onNavClick()">Appearance<div id="nav_dot_2" class="nav_dot"></div></div>
+    <div id="nav_3" class="nav_item" onclick="onNavClick()">Network</div>
+    <div id="nav_4" class="nav_item" onclick="onNavClick()">Security</div>
     <div id="tag_cloud">
       <div class="tag">CSS</div>
       <div class="tag">Flex</div>
@@ -73,11 +73,11 @@
     <p id="desc" aria-live="polite">Position, px units, browser-matched CSS.</p>
     <div id="sep1"></div>
     <div id="toolbar">
-      <div id="tool_save" class="tool_btn active" role="button" aria-label="Save settings">Save</div>
-      <div id="tool_reset" class="tool_btn" role="button">Reset</div>
-      <div id="tool_export" class="tool_btn" role="button">Export</div>
+      <div id="tool_save" class="tool_btn active" role="button" aria-label="Save settings" onclick="onToolClick()">Save</div>
+      <div id="tool_reset" class="tool_btn" role="button" onclick="onToolClick()">Reset</div>
+      <div id="tool_export" class="tool_btn" role="button" onclick="onToolClick()">Export</div>
     </div>
-    <div id="apply_btn" aria-label="Apply all pending settings">Apply Changes</div>
+    <div id="apply_btn" aria-label="Apply all pending settings" onclick="onApply()">Apply Changes</div>
     <div id="chip_row">
       <div class="chip accent" aria-hidden="true">CSS</div>
       <div class="chip" aria-hidden="true">Flex</div>
@@ -90,18 +90,18 @@
       <div class="chip">Focus</div>
     </div>
     <p id="toggle_row_label">Dark Mode</p>
-    <div id="toggle_knob_track" class="toggle">
+    <div id="toggle_knob_track" class="toggle" onclick="onToggleClick()">
       <div id="toggle_knob" class="toggle_knob"></div>
     </div>
-    <div id="checkbox_notify" class="checkbox"></div>
+    <div id="checkbox_notify" class="checkbox" onclick="onCheckboxClick()"></div>
     <p id="chk_label">Enable Notifications</p>
     <p id="theme_label">Theme</p>
     <div id="theme_combo">
-      <div id="theme_select_box" role="combobox" aria-label="Theme" aria-expanded="false">Indigo  ▾</div>
+      <div id="theme_select_box" role="combobox" aria-label="Theme" aria-expanded="false" onclick="onSelectToggle()">Indigo  ▾</div>
       <div id="select_panel" class="card hidden">
-        <div id="opt_blue" class="select_option">Indigo</div>
-        <div id="opt_graphite" class="select_option">Graphite</div>
-        <div id="opt_green" class="select_option">Emerald</div>
+        <div id="opt_blue" class="select_option" onclick="onSelectOption()">Indigo</div>
+        <div id="opt_graphite" class="select_option" onclick="onSelectOption()">Graphite</div>
+        <div id="opt_green" class="select_option" onclick="onSelectOption()">Emerald</div>
       </div>
     </div>
     <p id="slider_label">Brightness: 70%</p>
@@ -162,21 +162,21 @@
     <div id="toast_icon"></div>
     <p id="toast_title">Update Available</p>
     <p id="toast_msg">Version 2.3 is ready to install.</p>
-    <div id="toast_close"></div>
+    <div id="toast_close" onclick="onToastDismiss()"></div>
   </div>
 </div>
 <div id="info_win" class="window card">
   <div id="info_drag" draggable="1"></div>
-  <div id="info_close"></div>
+  <div id="info_close" onclick="onInfoClose()"></div>
   <div id="info_icon"></div>
   <p id="info_title">Vespera GUI Engine</p>
   <p id="info_msg">OpenGL window manager with CSS styling, gradients, and smooth transitions.</p>
 </div>
 <div id="dock" class="window">
-  <div id="dock_icon_info" class="dock_icon">i<p class="dock_label">Info</p></div>
-  <div id="dock_icon_theme" class="dock_icon">T<p class="dock_label">Theme</p></div>
-  <div id="dock_icon_notify" class="dock_icon">N<p class="dock_label">Alert</p></div>
-  <div id="dock_icon_toast" class="dock_icon">✕<p class="dock_label">Toast</p></div>
+  <div id="dock_icon_info" class="dock_icon" onclick="onDockInfo()">i<p class="dock_label">Info</p></div>
+  <div id="dock_icon_theme" class="dock_icon" onclick="onDockTheme()">T<p class="dock_label">Theme</p></div>
+  <div id="dock_icon_notify" class="dock_icon" onclick="onDockNotify()">N<p class="dock_label">Alert</p></div>
+  <div id="dock_icon_toast" class="dock_icon" onclick="onDockToast()">✕<p class="dock_label">Toast</p></div>
 </div>
 <div id="quick_stats">
   <p id="qs_title">SYSTEM</p>
@@ -253,18 +253,18 @@
 
 <!-- Pill tab bar -->
 <div id="tab_bar">
-  <div class="tab_pill active">All</div>
-  <div class="tab_pill">VPN</div>
-  <div class="tab_pill">Log</div>
+  <div class="tab_pill active" onclick="onTabPillClick()">All</div>
+  <div class="tab_pill" onclick="onTabPillClick()">VPN</div>
+  <div class="tab_pill" onclick="onTabPillClick()">Log</div>
 </div>
 
 <!-- Color swatches -->
 <div id="swatch_row">
-  <div id="sw1" class="swatch sel"></div>
-  <div id="sw2" class="swatch"></div>
-  <div id="sw3" class="swatch"></div>
-  <div id="sw4" class="swatch"></div>
-  <div id="sw5" class="swatch"></div>
+  <div id="sw1" class="swatch sel" onclick="onSwatchClick()"></div>
+  <div id="sw2" class="swatch" onclick="onSwatchClick()"></div>
+  <div id="sw3" class="swatch" onclick="onSwatchClick()"></div>
+  <div id="sw4" class="swatch" onclick="onSwatchClick()"></div>
+  <div id="sw5" class="swatch" onclick="onSwatchClick()"></div>
 </div>
 
 <!-- Keyboard shortcuts card -->
@@ -291,16 +291,79 @@
 </div>
 
 <!-- Floating Action Button -->
-<div id="fab">+</div>
+<div id="fab" onclick="onScreenshot()" title="Screenshot (F12)">📷</div>
 
 <div id="modal_overlay" class="overlay hidden">
   <div id="modal_dialog" class="window">
     <div id="modal_icon"></div>
     <p id="modal_title">Apply Changes?</p>
     <p id="modal_msg">Your preferences will be updated immediately.</p>
-    <div id="modal_cancel" role="button" aria-label="Cancel dialog">Cancel</div>
-    <div id="modal_confirm" role="button" aria-label="Confirm and apply">Apply</div>
+    <div id="modal_cancel" role="button" aria-label="Cancel dialog" onclick="onModalCancel()">Cancel</div>
+    <div id="modal_confirm" role="button" aria-label="Confirm and apply" onclick="onModalConfirm()">Apply</div>
   </div>
 </div>
+<script>
+/* Browser implementations — opengl_gui maps the same names to C handlers */
+function _el() { return event && event.currentTarget; }
+function onClose() { window.close(); }
+function onMinimize() {}
+function onMaximize() {}
+function onApply() {
+  document.getElementById('modal_overlay').classList.remove('hidden');
+}
+function onModalCancel() {
+  document.getElementById('modal_overlay').classList.add('hidden');
+}
+function onModalConfirm() {
+  document.getElementById('desc').textContent = 'Settings applied. Gradient CSS engine active!';
+  document.getElementById('modal_overlay').classList.add('hidden');
+}
+function onNavClick() {
+  const el = _el();
+  for (let i = 1; i <= 4; i++) document.getElementById('nav_' + i)?.classList.remove('active');
+  el.classList.add('active');
+  document.getElementById('section_title').textContent = el.childNodes[0].textContent.trim();
+}
+function onToolClick() {
+  const el = _el();
+  document.querySelectorAll('.tool_btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('desc').textContent = 'Toolbar: ' + el.textContent + ' selected.';
+}
+function onToggleClick() { _el().classList.toggle('on'); }
+function onCheckboxClick() {
+  const el = _el();
+  el.classList.toggle('checked');
+  document.getElementById('chk_label').textContent = el.classList.contains('checked') ? 'Notifications: On' : 'Enable Notifications';
+}
+function onSelectToggle() {
+  document.getElementById('select_panel').classList.toggle('hidden');
+}
+function onSelectOption() {
+  const el = _el();
+  document.getElementById('theme_select_box').textContent = el.textContent + '  ▾';
+  document.getElementById('select_panel').classList.add('hidden');
+}
+function onToastDismiss() { document.getElementById('toast').style.display = 'none'; }
+function onInfoClose() { document.getElementById('info_win').style.display = 'none'; }
+function onDockInfo() {
+  const w = document.getElementById('info_win');
+  w.style.display = w.style.display === 'none' ? '' : 'none';
+}
+function onDockTheme() { onToggleClick.call(document.getElementById('toggle_knob_track')); }
+function onDockNotify() { onCheckboxClick.call(document.getElementById('checkbox_notify')); }
+function onDockToast() { document.getElementById('toast').style.display = ''; }
+function onSwatchClick() {
+  const el = _el();
+  document.querySelectorAll('.swatch').forEach(s => s.classList.remove('sel'));
+  el.classList.add('sel');
+}
+function onTabPillClick() {
+  const el = _el();
+  el.parentElement.querySelectorAll('.tab_pill').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+}
+function onScreenshot() { alert('Screenshot: press F12 in Vespera GUI, or use Print Screen in browser.'); }
+</script>
 </body>
 </html>

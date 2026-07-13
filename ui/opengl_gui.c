@@ -28,6 +28,9 @@
 #define STBI_NO_FAILURE_STRINGS
 #include "stb_image.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 #define CSS_PARSER_IMPLEMENTATION
 #include "cssparser.h"
 
@@ -372,6 +375,10 @@ typedef struct Element {
     int text_align;
     int font_size;
     int font_bold;
+    float line_height;
+    int white_space;    /* 0=normal 1=nowrap */
+    int text_overflow;  /* 0=clip 1=ellipsis */
+    int overflow_wrap;  /* 0=normal 1=break-word */
 
     int has_shadow;
     float sh_dx, sh_dy, sh_blur;
@@ -466,6 +473,26 @@ typedef struct Element {
 
     int has_custom_bg, has_custom_color, has_custom_text, has_custom_border;
     EventHandler on_click;
+    char onclick[64];
+    char data_tab[32];
+    char inline_style[256];
+    int has_inline_style;
+
+    /* CSS @keyframes animation state */
+    char anim_name[64];
+    float anim_duration;
+    float anim_delay;
+    int anim_infinite;
+    int anim_alternate;
+    int anim_easing; /* 0=linear 1=ease-in-out */
+    int has_css_animation;
+    double anim_start_time;
+    int anim_override_layout;
+    float anim_base_w;
+    float anim_base_left;
+    int anim_base_w_pct;
+    int anim_base_left_pct;
+    int anim_base_captured;
 
     int has_bg_image;
     char bg_image_path[256];
@@ -579,6 +606,10 @@ typedef struct {
     int has_text_align; int text_align;
     int has_font_size;  int font_size;
     int has_font_weight; int font_bold;
+    int has_line_height; float line_height;
+    int has_white_space; int white_space;
+    int has_text_overflow; int text_overflow;
+    int has_overflow_wrap; int overflow_wrap;
     int has_shadow; float sh_dx, sh_dy, sh_blur, sh_r, sh_g, sh_b, sh_a;
 
     // Gradient
@@ -607,15 +638,51 @@ typedef struct {
     int has_transition; float transition_duration;
     int has_pointer_events; int pointer_events_none;
 
+    int has_animation;
+    char anim_name[64];
+    float anim_duration;
+    float anim_delay;
+    int anim_infinite;
+    int anim_alternate;
+    int anim_easing;
+
     int has_bg_image;
     char bg_image_path[256];
 } StyleRule;
 
 #define MAX_ELEMENTS 500
 #define MAX_RULES    600
+#define MAX_KF_ANIMS 48
+#define MAX_KF_STOPS 8
+#define MAX_JS_HANDLERS 64
+
+typedef struct {
+    float position;
+    int has_width; float width; int width_pct;
+    int has_left; float left; int left_pct;
+    int has_opacity; float opacity;
+    int has_transform_scale; float transform_scale;
+    int has_transform_tx; float transform_tx;
+    int has_transform_ty; float transform_ty;
+} KeyframeStop;
+
+typedef struct {
+    char name[64];
+    KeyframeStop stops[MAX_KF_STOPS];
+    int stop_count;
+} CssKeyframe;
+
+typedef struct {
+    const char* name;
+    EventHandler fn;
+} JsHandlerEntry;
 
 Element  elements[MAX_ELEMENTS]; int elem_count = 0;
 StyleRule  css_rules[MAX_RULES];   int rule_count = 0;
+CssKeyframe g_keyframes[MAX_KF_ANIMS];
+int g_keyframe_count = 0;
+JsHandlerEntry g_js_handlers[MAX_JS_HANDLERS];
+int g_js_handler_count = 0;
 
 
 static int render_order[MAX_ELEMENTS];
@@ -699,8 +766,6 @@ typedef struct {
 FontAtlas font_regular[NUM_FONT_SIZES];
 FontAtlas font_bold_atlas[NUM_FONT_SIZES];
 
-int g_progress_fill_idx  = -1;
-int g_progress_track_idx = -1;
 int g_toast_idx          = -1;
 int g_modal_overlay_idx  = -1;
 int g_info_win_idx       = -1;
@@ -711,6 +776,10 @@ int g_brightness_fill_idx   = -1;
 int g_brightness_value_idx  = -1;
 int g_clock_idx             = -1;
 static double g_last_clock_update = 0.0;
+static char g_screenshot_path[512] = {0};
+static int g_screenshot_pending = 0;
+static int g_layout_dirty = 1;
+static float g_last_window_w = 0.0f, g_last_window_h = 0.0f;
 
 // ============================================================
 // Utilities
@@ -1729,6 +1798,178 @@ void set_on_click(int idx, EventHandler cb) {
     if (idx >= 0 && idx < elem_count) elements[idx].on_click = cb;
 }
 
+static void register_js_handler(const char* name, EventHandler fn) {
+    if (!name || !name[0] || !fn) return;
+    for (int i = 0; i < g_js_handler_count; i++) {
+        if (strcmp(g_js_handlers[i].name, name) == 0) {
+            g_js_handlers[i].fn = fn;
+            return;
+        }
+    }
+    if (g_js_handler_count < MAX_JS_HANDLERS) {
+        g_js_handlers[g_js_handler_count].name = name;
+        g_js_handlers[g_js_handler_count].fn = fn;
+        g_js_handler_count++;
+    }
+}
+
+static EventHandler lookup_js_handler(const char* name) {
+    if (!name || !name[0]) return NULL;
+    for (int i = 0; i < g_js_handler_count; i++)
+        if (strcmp(g_js_handlers[i].name, name) == 0)
+            return g_js_handlers[i].fn;
+    return NULL;
+}
+
+/* Parse onclick="onButton()" / "onButton(); return false;" → "onButton" */
+static void parse_onclick_expr(const char* expr, char* out, int out_len) {
+    if (!expr || !out || out_len <= 0) { if (out) out[0] = '\0'; return; }
+    const char* p = expr;
+    while (*p && isspace((unsigned char)*p)) p++;
+    int i = 0;
+    while (*p && (isalnum((unsigned char)*p) || *p == '_') && i < out_len - 1)
+        out[i++] = *p++;
+    out[i] = '\0';
+}
+
+static void wire_element_onclick_handlers(void) {
+    for (int i = 0; i < elem_count; i++) {
+        if (!elements[i].onclick[0]) continue;
+        EventHandler fn = lookup_js_handler(elements[i].onclick);
+        if (fn) elements[i].on_click = fn;
+        else fprintf(stderr, "[vespera] Unknown onclick handler: %s (id=%s)\n",
+                     elements[i].onclick, elements[i].id[0] ? elements[i].id : "(none)");
+    }
+}
+
+static int extract_html_attr(const char* tag_buf, const char* attr, char* out, int out_len) {
+    if (!tag_buf || !attr || !out || out_len <= 0) return 0;
+    char needle[64];
+    snprintf(needle, sizeof(needle), "%s=\"", attr);
+    char* p = strstr(tag_buf, needle);
+    if (!p) {
+        snprintf(needle, sizeof(needle), "%s='", attr);
+        p = strstr(tag_buf, needle);
+        if (!p) return 0;
+        p += strlen(attr) + 2;
+        char* end = strchr(p, '\'');
+        if (!end) return 0;
+        int n = (int)(end - p);
+        if (n >= out_len) n = out_len - 1;
+        strncpy(out, p, (size_t)n);
+        out[n] = '\0';
+        return 1;
+    }
+    p += strlen(attr) + 2;
+    char* end = strchr(p, '"');
+    if (!end) return 0;
+    int n = (int)(end - p);
+    if (n >= out_len) n = out_len - 1;
+    strncpy(out, p, (size_t)n);
+    out[n] = '\0';
+    return 1;
+}
+
+void parse_declarations(char* declarations, StyleRule* rule);
+
+static void apply_element_inline_style(Element* e) {
+    if (!e || !e->has_inline_style || !e->inline_style[0]) return;
+    StyleRule rule;
+    memset(&rule, 0, sizeof(rule));
+    char buf[320];
+    strncpy(buf, e->inline_style, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    parse_declarations(buf, &rule);
+
+    if (rule.has_bg) {
+        e->r = rule.bg_r; e->g = rule.bg_g; e->b = rule.bg_b; e->a = rule.bg_a;
+        e->has_custom_bg = 1;
+        if (rule.has_gradient) {
+            e->has_gradient = 1;
+            e->grad_type = rule.grad_type;
+            e->grad_stop_count = rule.grad_stop_count;
+            for (int s = 0; s < rule.grad_stop_count; s++) {
+                e->grad_stop_pos[s] = rule.grad_stop_pos[s];
+                e->grad_stop_r[s] = rule.grad_stop_r[s];
+                e->grad_stop_g[s] = rule.grad_stop_g[s];
+                e->grad_stop_b[s] = rule.grad_stop_b[s];
+                e->grad_stop_a[s] = rule.grad_stop_a[s];
+            }
+            e->grad_angle = rule.grad_angle;
+            e->grad_rad_cx = rule.grad_rad_cx;
+            e->grad_rad_cy = rule.grad_rad_cy;
+            e->grad_rad_r = rule.grad_rad_r;
+        }
+    }
+    if (rule.has_color) {
+        e->t_r = rule.c_r; e->t_g = rule.c_g; e->t_b = rule.c_b; e->t_a = rule.c_a;
+        e->has_custom_color = 1;
+    }
+    if (rule.has_width) {
+        e->has_css_width = 1;
+        e->pct_w = rule.pct_w;
+        e->raw_w = rule.raw_w;
+        e->raw_w_off = rule.raw_w_off;
+        e->css_width = rule.width;
+    }
+    if (rule.has_height) {
+        e->has_css_height = 1;
+        e->pct_h = rule.pct_h;
+        e->raw_h = rule.raw_h;
+        e->raw_h_off = rule.raw_h_off;
+        e->css_height = rule.height;
+    }
+    if (rule.has_left) {
+        e->has_left = 1;
+        e->pct_left = rule.pct_left;
+        e->raw_left = rule.left;
+        e->raw_left_off = rule.raw_left_off;
+        e->css_positioned |= 1;
+    }
+    if (rule.has_top) {
+        e->has_top = 1;
+        e->pct_top = rule.pct_top;
+        e->raw_top = rule.top;
+        e->raw_top_off = rule.raw_top_off;
+        e->css_positioned |= 2;
+    }
+    if (rule.has_display) {
+        e->display_none = rule.display_none;
+        e->display_mode = rule.display_mode;
+    }
+    if (rule.has_margin) {
+        e->margin_top = rule.margin_top;
+        e->margin_right = rule.margin_right;
+        e->margin_bottom = rule.margin_bottom;
+        e->margin_left = rule.margin_left;
+    }
+    if (rule.has_shadow) {
+        e->has_shadow = 1;
+        e->sh_dx = rule.sh_dx; e->sh_dy = rule.sh_dy; e->sh_blur = rule.sh_blur;
+        e->sh_r = rule.sh_r; e->sh_g = rule.sh_g; e->sh_b = rule.sh_b; e->sh_a = rule.sh_a;
+    }
+    if (rule.has_flex_direction || rule.has_display) {
+        if (rule.display_mode == DISPLAY_FLEX) e->display_mode = DISPLAY_FLEX;
+        if (rule.has_flex_direction) e->flex_direction = rule.flex_direction;
+        if (rule.has_align_items) e->align_items = rule.align_items;
+        if (rule.has_gap) e->flex_gap = rule.flex_gap;
+    }
+    if (rule.has_border) {
+        e->border_width = rule.border_width;
+        e->bd_r = rule.bd_r; e->bd_g = rule.bd_g; e->bd_b = rule.bd_b; e->bd_a = rule.bd_a;
+        e->has_custom_border = 1;
+    }
+    if (rule.has_radius) e->border_radius = rule.border_radius;
+    if (rule.has_text_align) e->text_align = rule.text_align;
+    if (rule.has_font_size) e->font_size = rule.font_size;
+    if (rule.has_font_weight) e->font_bold = rule.font_bold;
+    if (rule.has_line_height) e->line_height = rule.line_height;
+    if (rule.has_white_space) e->white_space = rule.white_space;
+    if (rule.has_text_overflow) e->text_overflow = rule.text_overflow;
+    if (rule.has_overflow_wrap) e->overflow_wrap = rule.overflow_wrap;
+    g_layout_dirty = 1;
+}
+
 int element_has_class(Element* e, const char* cls) {
     char buf[96]; strncpy(buf, e->class_name, sizeof(buf) - 1); buf[sizeof(buf)-1] = 0;
     char* tok = strtok(buf, " ");
@@ -2328,6 +2569,59 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 }
                 if (sec > 0.0f) { rule->has_transition = 1; rule->transition_duration = sec; }
             }
+            else if (strcmp(key, "animation") == 0 || strcmp(key, "animation-name") == 0) {
+                if (strcmp(key, "animation-name") == 0) {
+                    rule->has_animation = 1;
+                    strncpy(rule->anim_name, val, sizeof(rule->anim_name) - 1);
+                } else {
+                    rule->has_animation = 1;
+                    char abuf[128];
+                    strncpy(abuf, val, sizeof(abuf) - 1);
+                    abuf[sizeof(abuf) - 1] = '\0';
+                    char* tok = strtok(abuf, " \t,");
+                    int part = 0;
+                    while (tok) {
+                        trim_whitespace(tok);
+                        if (part == 0 && strcmp(tok, "none") != 0)
+                            strncpy(rule->anim_name, tok, sizeof(rule->anim_name) - 1);
+                        else if (strchr(tok, 's') || isdigit((unsigned char)tok[0])) {
+                            float sec = 0.0f;
+                            if (strstr(tok, "ms")) sec = (float)atof(tok) / 1000.0f;
+                            else sec = (float)atof(tok);
+                            if (part == 0 && rule->anim_duration <= 0.0f) rule->anim_duration = sec;
+                            else if (rule->anim_duration <= 0.0f) rule->anim_duration = sec;
+                            else rule->anim_delay = sec;
+                        } else if (strstr(tok, "ease-in-out")) rule->anim_easing = 1;
+                        else if (strstr(tok, "linear")) rule->anim_easing = 0;
+                        else if (strcmp(tok, "infinite") == 0) rule->anim_infinite = 1;
+                        else if (strcmp(tok, "alternate") == 0) rule->anim_alternate = 1;
+                        part++;
+                        tok = strtok(NULL, " \t,");
+                    }
+                }
+            }
+            else if (strcmp(key, "animation-duration") == 0) {
+                rule->has_animation = 1;
+                if (strstr(val, "ms")) rule->anim_duration = (float)atof(val) / 1000.0f;
+                else rule->anim_duration = (float)atof(val);
+            }
+            else if (strcmp(key, "animation-delay") == 0) {
+                rule->has_animation = 1;
+                if (strstr(val, "ms")) rule->anim_delay = (float)atof(val) / 1000.0f;
+                else rule->anim_delay = (float)atof(val);
+            }
+            else if (strcmp(key, "animation-iteration-count") == 0) {
+                rule->has_animation = 1;
+                if (strcmp(val, "infinite") == 0) rule->anim_infinite = 1;
+            }
+            else if (strcmp(key, "animation-direction") == 0) {
+                rule->has_animation = 1;
+                if (strcmp(val, "alternate") == 0) rule->anim_alternate = 1;
+            }
+            else if (strcmp(key, "animation-timing-function") == 0) {
+                rule->has_animation = 1;
+                rule->anim_easing = (strstr(val, "ease-in-out") != NULL) ? 1 : 0;
+            }
             else if (strcmp(key, "text-align") == 0) {
                 rule->has_text_align = 1;
                 if      (strcmp(val, "center") == 0) rule->text_align = 1;
@@ -2336,6 +2630,25 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             }
             else if (strcmp(key, "font-size") == 0)   { rule->has_font_size = 1; rule->font_size = (int)parse_float_val(val); }
             else if (strcmp(key, "font-weight") == 0) { rule->has_font_weight = 1; rule->font_bold = (strstr(val, "bold") != NULL || atoi(val) >= 600); }
+            else if (strcmp(key, "line-height") == 0) {
+                rule->has_line_height = 1;
+                if (strcmp(val, "normal") == 0) rule->line_height = 0.0f;
+                else rule->line_height = parse_float_val(val);
+            }
+            else if (strcmp(key, "white-space") == 0) {
+                rule->has_white_space = 1;
+                rule->white_space = (strstr(val, "nowrap") != NULL) ? 1 : 0;
+            }
+            else if (strcmp(key, "text-overflow") == 0) {
+                rule->has_text_overflow = 1;
+                rule->text_overflow = (strstr(val, "ellipsis") != NULL) ? 1 : 0;
+            }
+            else if (strcmp(key, "overflow-wrap") == 0 || strcmp(key, "word-wrap") == 0 ||
+                     strcmp(key, "word-break") == 0) {
+                rule->has_overflow_wrap = 1;
+                rule->overflow_wrap =
+                    (strstr(val, "break") != NULL || strstr(val, "anywhere") != NULL) ? 1 : 0;
+            }
             else if (strcmp(key, "box-shadow") == 0)  { parse_box_shadow(val, rule); }
             else if (strcmp(key, "inset") == 0) {
                 float v = parse_float_val(val);
@@ -2473,8 +2786,93 @@ static void ingest_parsed_rule(const CSSRule *pr) {
     }
 }
 
+static float parse_keyframe_stop_pos(const char* sel) {
+    if (!sel) return 0.0f;
+    if (strcasecmp(sel, "from") == 0 || strcasecmp(sel, "0%") == 0) return 0.0f;
+    if (strcasecmp(sel, "to") == 0 || strcasecmp(sel, "100%") == 0) return 1.0f;
+    if (strchr(sel, '%')) return (float)atof(sel) / 100.0f;
+    return (float)atof(sel);
+}
+
+static void keyframe_stop_from_rule(const CSSRule* kr, KeyframeStop* stop) {
+    memset(stop, 0, sizeof(*stop));
+    for (int di = 0; di < kr->decl_count; di++) {
+        StyleRule tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        apply_one_declaration(kr->decls[di].property, kr->decls[di].value, &tmp);
+        if (tmp.has_width) {
+            stop->has_width = 1;
+            stop->width = tmp.width;
+            stop->width_pct = tmp.pct_w;
+        }
+        if (tmp.has_left) {
+            stop->has_left = 1;
+            stop->left = tmp.left;
+            stop->left_pct = tmp.pct_left;
+        }
+        if (tmp.has_opacity) { stop->has_opacity = 1; stop->opacity = tmp.opacity; }
+        if (tmp.has_transform) {
+            if (tmp.transform_scale != 1.0f) {
+                stop->has_transform_scale = 1;
+                stop->transform_scale = tmp.transform_scale;
+            }
+            if (tmp.has_transform_tx) { stop->has_transform_tx = 1; stop->transform_tx = tmp.transform_tx; }
+            if (tmp.has_transform_ty) { stop->has_transform_ty = 1; stop->transform_ty = tmp.transform_ty; }
+        }
+        if (tmp.has_shadow) {
+            /* orb-pulse style animations use box-shadow blur */
+            (void)tmp;
+        }
+    }
+}
+
+static void ingest_keyframes_from_sheet(const CSSStyleSheet* sheet) {
+    if (!sheet) return;
+    for (int ai = 0; ai < sheet->at_rule_count && g_keyframe_count < MAX_KF_ANIMS; ai++) {
+        const CSSAtRule* at = &sheet->at_rules[ai];
+        if (at->type != CSS_AT_KEYFRAMES) continue;
+        CssKeyframe kf;
+        memset(&kf, 0, sizeof(kf));
+        char name[64] = {0};
+        strncpy(name, at->prelude, sizeof(name) - 1);
+        trim_whitespace(name);
+        strncpy(kf.name, name, sizeof(kf.name) - 1);
+        for (int ri = 0; ri < at->nested_rule_count && kf.stop_count < MAX_KF_STOPS; ri++) {
+            const CSSRule* kr = &at->nested_rules[ri];
+            if (kr->selector_count == 0 || kr->selectors[0].compound_count == 0) continue;
+            const CSSCompound* cmp = &kr->selectors[0].compounds[0];
+            if (cmp->part_count == 0) continue;
+            KeyframeStop stop;
+            keyframe_stop_from_rule(kr, &stop);
+            stop.position = parse_keyframe_stop_pos(cmp->parts[0].name);
+            kf.stops[kf.stop_count++] = stop;
+        }
+        if (kf.stop_count > 0) {
+            /* Sort stops and insert implicit 0% keyframe when only `to` is defined */
+            for (int si = 0; si < kf.stop_count - 1; si++) {
+                for (int sj = si + 1; sj < kf.stop_count; sj++) {
+                    if (kf.stops[sj].position < kf.stops[si].position) {
+                        KeyframeStop tmp = kf.stops[si];
+                        kf.stops[si] = kf.stops[sj];
+                        kf.stops[sj] = tmp;
+                    }
+                }
+            }
+            if (kf.stops[0].position > 0.001f && kf.stop_count < MAX_KF_STOPS) {
+                memmove(&kf.stops[1], &kf.stops[0],
+                        (size_t)kf.stop_count * sizeof(KeyframeStop));
+                memset(&kf.stops[0], 0, sizeof(KeyframeStop));
+                kf.stops[0].position = 0.0f;
+                kf.stop_count++;
+            }
+            g_keyframes[g_keyframe_count++] = kf;
+        }
+    }
+}
+
 void parse_css(const char* css_text) {
     rule_count = 0;
+    g_keyframe_count = 0;
     CSSStyleSheet *sheet = css_parse(css_text, 0);
     if (!sheet) return;
 
@@ -2489,6 +2887,8 @@ void parse_css(const char* css_text) {
         for (int j = 0; j < at->nested_rule_count && rule_count < MAX_RULES; j++)
             ingest_parsed_rule(&at->nested_rules[j]);
     }
+
+    ingest_keyframes_from_sheet(sheet);
 
     css_free(sheet);
     qsort(css_rules, rule_count, sizeof(StyleRule), cmp_rules_by_specificity);
@@ -2591,6 +2991,7 @@ void update_element_style(Element* e) {
     e->has_bottom = 0; e->has_right = 0;
     e->has_top = 0; e->has_left = 0;
     e->text_align = 0; e->font_size = 16; e->font_bold = 0;
+    e->line_height = 0.0f; e->white_space = 0; e->text_overflow = 0; e->overflow_wrap = 1;
     e->has_shadow = 0; e->z_index = 0;
     e->transform_scale = 1.0f; e->transform_tx = 0.0f; e->transform_ty = 0.0f;
     e->transform_tx_pct = 0; e->transform_ty_pct = 0;
@@ -2601,6 +3002,14 @@ void update_element_style(Element* e) {
     e->pct_bottom = 0; e->pct_right = 0;
     e->raw_w_off = 0.0f; e->raw_h_off = 0.0f;
     e->raw_left_off = 0.0f; e->raw_top_off = 0.0f;
+
+    e->has_css_animation = 0;
+    e->anim_name[0] = '\0';
+    e->anim_duration = 0.0f;
+    e->anim_delay = 0.0f;
+    e->anim_infinite = 0;
+    e->anim_alternate = 0;
+    e->anim_easing = 0;
 
     for (int i = 0; i < rule_count; i++) {
         StyleRule* r = &css_rules[i];
@@ -2839,6 +3248,10 @@ void update_element_style(Element* e) {
         if (r->has_text_align)  e->text_align = r->text_align;
         if (r->has_font_size)   e->font_size = r->font_size;
         if (r->has_font_weight) e->font_bold = r->font_bold;
+        if (r->has_line_height) e->line_height = r->line_height;
+        if (r->has_white_space) e->white_space = r->white_space;
+        if (r->has_text_overflow) e->text_overflow = r->text_overflow;
+        if (r->has_overflow_wrap) e->overflow_wrap = r->overflow_wrap;
         if (r->has_shadow) {
             e->has_shadow = 1;
             e->sh_dx = r->sh_dx; e->sh_dy = r->sh_dy; e->sh_blur = r->sh_blur;
@@ -2857,6 +3270,26 @@ void update_element_style(Element* e) {
             e->raw_transform_ty = r->raw_transform_ty;
         }
         if (r->has_transition) e->anim_speed = 1.0f / r->transition_duration;
+        if (r->has_animation && r->anim_name[0]) {
+            e->has_css_animation = 1;
+            strncpy(e->anim_name, r->anim_name, sizeof(e->anim_name) - 1);
+            if (r->anim_duration > 0.0f) e->anim_duration = r->anim_duration;
+            e->anim_delay = r->anim_delay;
+            e->anim_infinite = r->anim_infinite;
+            e->anim_alternate = r->anim_alternate;
+            e->anim_easing = r->anim_easing;
+            if (e->anim_start_time < 0.0) e->anim_start_time = glfwGetTime();
+        }
+    }
+
+    apply_element_inline_style(e);
+
+    if (e->has_css_animation && !e->anim_base_captured) {
+        e->anim_base_w = e->has_css_width ? e->css_width : e->w;
+        e->anim_base_w_pct = e->pct_w;
+        e->anim_base_left = e->has_left ? e->raw_left : e->rel_x;
+        e->anim_base_left_pct = e->pct_left;
+        e->anim_base_captured = 1;
     }
 }
 
@@ -3069,12 +3502,19 @@ void parse_html(const char* html) {
 
         char id[64] = {0}, class_name[96] = {0};
         int draggable = 0;
+        char onclick_expr[96] = {0};
+        char style_attr[256] = {0};
+        char data_tab[32] = {0};
         char* attr_id    = strstr(tag_buf, "id=\"");
         if (attr_id) sscanf(attr_id + 4, "%63[^\"]", id);
         char* attr_class = strstr(tag_buf, "class=\"");
         if (attr_class) sscanf(attr_class + 7, "%95[^\"]", class_name);
         char* attr_drag  = strstr(tag_buf, "draggable=\"");
         if (attr_drag) sscanf(attr_drag + 11, "%d", &draggable);
+        if (!extract_html_attr(tag_buf, "onclick", onclick_expr, sizeof(onclick_expr)))
+            extract_html_attr(tag_buf, "onClick", onclick_expr, sizeof(onclick_expr));
+        extract_html_attr(tag_buf, "style", style_attr, sizeof(style_attr));
+        extract_html_attr(tag_buf, "data-tab", data_tab, sizeof(data_tab));
         int tabindex = -2;
         char* attr_tab = strstr(tag_buf, "tabindex=\"");
         if (attr_tab) sscanf(attr_tab + 10, "%d", &tabindex);
@@ -3139,7 +3579,14 @@ void parse_html(const char* html) {
         strncpy(e.class_name, class_name, 95);
         strncpy(e.id, id, 63);
         strncpy(e.text, text, 255);
+        if (onclick_expr[0]) parse_onclick_expr(onclick_expr, e.onclick, (int)sizeof(e.onclick));
+        if (data_tab[0]) strncpy(e.data_tab, data_tab, sizeof(e.data_tab) - 1);
+        if (style_attr[0]) {
+            strncpy(e.inline_style, style_attr, sizeof(e.inline_style) - 1);
+            e.has_inline_style = 1;
+        }
         e.cur_scale = 1.0f;
+        e.anim_start_time = -1.0;
 
         // <img src="..."> — treat src as background image
         if (strcasecmp(type, "img") == 0) {
@@ -4546,6 +4993,205 @@ void update_animations(double dt) {
     }
 }
 
+static float css_anim_ease(int easing, float t) {
+    if (easing == 1) return t * t * (3.0f - 2.0f * t);
+    return t;
+}
+
+static const CssKeyframe* find_keyframe_anim(const char* name) {
+    if (!name || !name[0]) return NULL;
+    for (int i = 0; i < g_keyframe_count; i++)
+        if (strcmp(g_keyframes[i].name, name) == 0)
+            return &g_keyframes[i];
+    return NULL;
+}
+
+static float kf_stop_width_px(const Element* e, const KeyframeStop* stop) {
+    if (!stop->has_width) {
+        if (e && e->anim_base_captured) {
+            if (e->anim_base_w_pct) {
+                int par = e->parent_idx;
+                float pw = (par != -1) ? elements[par].w : window_width;
+                return pw * e->raw_w;
+            }
+            return e->anim_base_w;
+        }
+        return 0.0f;
+    }
+    if (stop->width_pct) {
+        int par = e ? e->parent_idx : -1;
+        float pw = (par != -1) ? elements[par].w : window_width;
+        return pw * stop->width;
+    }
+    return stop->width;
+}
+
+static float kf_stop_left_px(const Element* e, const KeyframeStop* stop) {
+    if (!stop->has_left) {
+        if (e && e->anim_base_captured) {
+            if (e->anim_base_left_pct) {
+                int par = e->parent_idx;
+                float pw = (par != -1) ? elements[par].w : window_width;
+                return pw * e->anim_base_left;
+            }
+            return e->anim_base_left;
+        }
+        return 0.0f;
+    }
+    if (stop->left_pct) {
+        int par = e ? e->parent_idx : -1;
+        float pw = (par != -1) ? elements[par].w : window_width;
+        return pw * stop->left;
+    }
+    return stop->left;
+}
+
+static void lerp_keyframe_stop(const KeyframeStop* a, const KeyframeStop* b, float u,
+                               KeyframeStop* out, const Element* e) {
+    memset(out, 0, sizeof(*out));
+    if (a->has_width || b->has_width || (e && e->anim_base_captured)) {
+        out->has_width = 1;
+        out->width_pct = 0;
+        float av = kf_stop_width_px(e, a);
+        float bv = kf_stop_width_px(e, b);
+        out->width = av * (1.0f - u) + bv * u;
+    }
+    if (a->has_left || b->has_left || (e && e->anim_base_captured)) {
+        out->has_left = 1;
+        out->left_pct = 0;
+        float av = kf_stop_left_px(e, a);
+        float bv = kf_stop_left_px(e, b);
+        out->left = av * (1.0f - u) + bv * u;
+    }
+    if (a->has_opacity || b->has_opacity) {
+        out->has_opacity = 1;
+        float av = a->has_opacity ? a->opacity : 1.0f;
+        float bv = b->has_opacity ? b->opacity : 1.0f;
+        out->opacity = av * (1.0f - u) + bv * u;
+    }
+    if (a->has_transform_scale || b->has_transform_scale) {
+        out->has_transform_scale = 1;
+        float av = a->has_transform_scale ? a->transform_scale : 1.0f;
+        float bv = b->has_transform_scale ? b->transform_scale : 1.0f;
+        out->transform_scale = av * (1.0f - u) + bv * u;
+    }
+    if (a->has_transform_tx || b->has_transform_tx) {
+        out->has_transform_tx = 1;
+        float av = a->has_transform_tx ? a->transform_tx : 0.0f;
+        float bv = b->has_transform_tx ? b->transform_tx : 0.0f;
+        out->transform_tx = av * (1.0f - u) + bv * u;
+    }
+    if (a->has_transform_ty || b->has_transform_ty) {
+        out->has_transform_ty = 1;
+        float av = a->has_transform_ty ? a->transform_ty : 0.0f;
+        float bv = b->has_transform_ty ? b->transform_ty : 0.0f;
+        out->transform_ty = av * (1.0f - u) + bv * u;
+    }
+}
+
+static void sample_keyframe(const CssKeyframe* kf, float t, KeyframeStop* out, const Element* e) {
+    memset(out, 0, sizeof(*out));
+    if (!kf || kf->stop_count <= 0) return;
+    if (t <= kf->stops[0].position) {
+        lerp_keyframe_stop(&kf->stops[0], &kf->stops[0], 0.0f, out, e);
+        return;
+    }
+    if (t >= kf->stops[kf->stop_count - 1].position) {
+        lerp_keyframe_stop(&kf->stops[kf->stop_count - 1], &kf->stops[kf->stop_count - 1], 1.0f, out, e);
+        return;
+    }
+    for (int i = 0; i < kf->stop_count - 1; i++) {
+        const KeyframeStop* a = &kf->stops[i];
+        const KeyframeStop* b = &kf->stops[i + 1];
+        if (t >= a->position && t <= b->position) {
+            float span = b->position - a->position;
+            float u = (span > 0.0001f) ? (t - a->position) / span : 0.0f;
+            lerp_keyframe_stop(a, b, u, out, e);
+            return;
+        }
+    }
+    lerp_keyframe_stop(&kf->stops[kf->stop_count - 1], &kf->stops[kf->stop_count - 1], 1.0f, out, e);
+}
+
+static void apply_keyframe_stop_to_element(Element* e, const KeyframeStop* stop) {
+    if (stop->has_width) {
+        e->anim_override_layout = 1;
+        e->pct_w = 0;
+        e->has_css_width = 1;
+        e->css_width = stop->width;
+        e->w = stop->width;
+    }
+    if (stop->has_left) {
+        e->anim_override_layout = 1;
+        e->has_left = 1;
+        e->pct_left = 0;
+        e->rel_x = stop->left;
+        e->pos_overridden_x = 1;
+    }
+    if (stop->has_opacity) e->opacity = stop->opacity;
+    if (stop->has_transform_scale) e->transform_scale = stop->transform_scale;
+    if (stop->has_transform_tx) { e->transform_tx = stop->transform_tx; e->has_custom_bg = 0; }
+    if (stop->has_transform_ty) e->transform_ty = stop->transform_ty;
+}
+
+static void update_css_keyframe_animations(double now) {
+    for (int i = 0; i < elem_count; i++) {
+        Element* e = &elements[i];
+        if (!e->has_css_animation || !e->anim_name[0]) continue;
+        const CssKeyframe* kf = find_keyframe_anim(e->anim_name);
+        if (!kf) continue;
+        float duration = e->anim_duration > 0.0f ? e->anim_duration : 1.0f;
+        float elapsed = (float)(now - e->anim_start_time) - e->anim_delay;
+        if (elapsed < 0.0f) continue;
+        float cycle_t = elapsed / duration;
+        int rev = 0;
+        if (e->anim_infinite) {
+            if (e->anim_alternate) {
+                int seg = (int)cycle_t;
+                rev = seg % 2;
+                cycle_t = cycle_t - (float)seg;
+                if (rev) cycle_t = 1.0f - cycle_t;
+            } else {
+                cycle_t = cycle_t - floorf(cycle_t);
+            }
+        } else {
+            if (cycle_t > 1.0f) cycle_t = 1.0f;
+            if (e->anim_alternate && cycle_t > 0.5f) cycle_t = 1.0f - (cycle_t - 0.5f) * 2.0f;
+        }
+        cycle_t = css_anim_ease(e->anim_easing, cycle_t);
+        KeyframeStop sampled;
+        sample_keyframe(kf, cycle_t, &sampled, e);
+        apply_keyframe_stop_to_element(e, &sampled);
+    }
+}
+
+static int take_screenshot(const char* path) {
+    if (!path || !path[0] || !g_window) return 0;
+    int fbw = 0, fbh = 0;
+    glfwGetFramebufferSize(g_window, &fbw, &fbh);
+    if (fbw <= 0 || fbh <= 0) return 0;
+    size_t npix = (size_t)fbw * (size_t)fbh;
+    unsigned char* pixels = (unsigned char*)malloc(npix * 4);
+    unsigned char* flipped = (unsigned char*)malloc(npix * 3);
+    if (!pixels || !flipped) { free(pixels); free(flipped); return 0; }
+    glReadPixels(0, 0, fbw, fbh, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    for (int y = 0; y < fbh; y++) {
+        const unsigned char* src = pixels + (size_t)(fbh - 1 - y) * (size_t)fbw * 4;
+        unsigned char* dst = flipped + (size_t)y * (size_t)fbw * 3;
+        for (int x = 0; x < fbw; x++) {
+            dst[x * 3 + 0] = src[x * 4 + 0];
+            dst[x * 3 + 1] = src[x * 4 + 1];
+            dst[x * 3 + 2] = src[x * 4 + 2];
+        }
+    }
+    int ok = stbi_write_png(path, fbw, fbh, 3, flipped, fbw * 3);
+    free(pixels);
+    free(flipped);
+    if (ok) fprintf(stderr, "[vespera] Screenshot saved: %s (%dx%d)\n", path, fbw, fbh);
+    else fprintf(stderr, "[vespera] Screenshot failed: %s\n", path);
+    return ok != 0;
+}
+
 // ============================================================
 // Render-order sorting by z-index
 // ============================================================
@@ -4730,6 +5376,30 @@ float measure_text_width(FontAtlas* atlas, const char* text) {
         if (c >= 32 && c < 128) w += atlas->cdata[c - 32].xadvance;
     }
     return w;
+}
+
+static float measure_text_range(FontAtlas* atlas, const char* start, int len) {
+    float w = 0.0f;
+    for (int i = 0; i < len && start[i]; i++) {
+        unsigned char c = (unsigned char)start[i];
+        if (c >= 32 && c < 128) w += atlas->cdata[c - 32].xadvance;
+    }
+    return w;
+}
+
+static int fit_text_chars(FontAtlas* atlas, const char* text, int len, float max_w) {
+    if (max_w <= 0.0f) return 0;
+    float w = 0.0f;
+    int last_fit = 0;
+    for (int i = 0; i < len && text[i]; i++) {
+        unsigned char c = (unsigned char)text[i];
+        float adv = (c >= 32 && c < 128) ? atlas->cdata[c - 32].xadvance : 0.0f;
+        if (w + adv > max_w && last_fit > 0) break;
+        if (w + adv > max_w) return 0;
+        w += adv;
+        last_fit = i + 1;
+    }
+    return last_fit;
 }
 
 // ============================================================
@@ -4939,19 +5609,73 @@ void render_text_pass(FontAtlas* atlas, const char* text,
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
+                            float line_h, int max_lines,
+                            int white_space, int text_overflow, int overflow_wrap) {
+    const char* p = text;
+    int line_no = 0;
+    while (*p && line_no < max_lines) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        int remaining = (int)strlen(p);
+        int hard_break = -1;
+        for (int i = 0; i < remaining; i++) {
+            if (p[i] == '\n' || p[i] == '\r') { hard_break = i; break; }
+        }
+        int para_len = hard_break >= 0 ? hard_break : remaining;
+        if (para_len <= 0) { p += 1; continue; }
+
+        int take = para_len;
+        if (white_space == 1) {
+            take = fit_text_chars(atlas, p, para_len, box_w);
+            if (take < para_len && text_overflow == 1 && box_w > 0.0f) {
+                float ell_w = measure_text_width(atlas, "...");
+                int base = fit_text_chars(atlas, p, para_len, box_w - ell_w);
+                if (base < 0) base = 0;
+                take = base;
+            }
+        } else {
+            take = fit_text_chars(atlas, p, para_len, box_w);
+            if (take <= 0 && para_len > 0) take = 1;
+            if (take < para_len && !overflow_wrap) {
+                int last_space = -1;
+                for (int i = 0; i < take; i++)
+                    if (p[i] == ' ' || p[i] == '\t') last_space = i;
+                if (last_space > 0) take = last_space;
+            } else if (take < para_len) {
+                int last_space = -1;
+                for (int i = 0; i < take; i++)
+                    if (p[i] == ' ' || p[i] == '\t') last_space = i;
+                if (last_space > 0 && measure_text_range(atlas, p, take) > box_w * 0.65f)
+                    take = last_space;
+            }
+        }
+
+        int is_last_visible_line = (line_no == max_lines - 1);
+        int has_more = (take < para_len) || (hard_break >= 0 && p[hard_break + 1]);
+        if (white_space == 1 || is_last_visible_line) {
+            line_no++;
+            break;
+        }
+        (void)has_more;
+        line_no++;
+        p += take;
+        while (*p == ' ' || *p == '\t') p++;
+        if (hard_break >= 0 && take >= hard_break) p++;
+    }
+    return line_no;
+}
+
 void render_text(const char* text, float x, float y, float box_w, float box_h, int align,
-                 float r, float g, float b, float a, int fsize, int bold) {
+                 int v_align, float r, float g, float b, float a, int fsize, int bold,
+                 float css_line_height, int white_space, int text_overflow, int overflow_wrap) {
     if (!font_loaded || !text || !*text || a <= 0.0f) return;
+    if (box_w <= 0.0f || box_h <= 0.0f) return;
 
     int is_fake_bold = 0;
     FontAtlas* atlas = get_atlas(fsize, bold, &is_fake_bold);
     if (!atlas->loaded) return;
-
-    float text_w = measure_text_width(atlas, text);
-    float start_x = x;
-    if      (align == 1) start_x = x + (box_w - text_w) / 2.0f;
-    else if (align == 2) start_x = x + (box_w - text_w);
-    if (start_x < x) start_x = x;
 
     float used_size = font_sizes[0];
     for (int i = 0; i < NUM_FONT_SIZES; i++) {
@@ -4960,11 +5684,110 @@ void render_text(const char* text, float x, float y, float box_w, float box_h, i
         }
     }
     float cap_h   = used_size * 0.72f;
-    float baseline = y + (box_h - cap_h) / 2.0f + cap_h;
-    if (baseline < y + cap_h) baseline = y + cap_h;
+    float line_h = css_line_height > 0.0f ? css_line_height : used_size * 1.25f;
+    if (line_h < cap_h + 1.0f) line_h = cap_h + 1.0f;
 
-    render_text_pass(atlas, text, start_x, baseline, r, g, b, a);
-    if (is_fake_bold) render_text_pass(atlas, text, start_x + 1.0f, baseline, r, g, b, a);
+    int max_lines = (int)floorf(box_h / line_h);
+    if (max_lines < 1) max_lines = (box_h >= cap_h) ? 1 : 0;
+    if (max_lines <= 0) return;
+
+    int line_count = count_text_lines(atlas, text, box_w, line_h, max_lines,
+                                      white_space, text_overflow, overflow_wrap);
+    if (line_count < 1) line_count = 1;
+    float used_h = (float)line_count * line_h;
+    float y_off = 0.0f;
+    if (used_h < box_h) {
+        if (v_align == 2)
+            y_off = box_h - used_h;
+        else if (v_align != 0)
+            y_off = (box_h - used_h) * 0.5f;
+    }
+
+    const char* p = text;
+    int line_no = 0;
+    while (*p && line_no < max_lines) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        int remaining = (int)strlen(p);
+        int hard_break = -1;
+        for (int i = 0; i < remaining; i++) {
+            if (p[i] == '\n' || p[i] == '\r') { hard_break = i; break; }
+        }
+        int para_len = hard_break >= 0 ? hard_break : remaining;
+        if (para_len <= 0) { p += 1; continue; }
+
+        int take = para_len;
+        if (white_space == 1) {
+            take = fit_text_chars(atlas, p, para_len, box_w);
+            if (take < para_len && text_overflow == 1 && box_w > 0.0f) {
+                float ell_w = measure_text_width(atlas, "...");
+                int base = fit_text_chars(atlas, p, para_len, box_w - ell_w);
+                if (base < 0) base = 0;
+                take = base;
+            }
+        } else {
+            take = fit_text_chars(atlas, p, para_len, box_w);
+            if (take <= 0 && para_len > 0) take = 1;
+            if (take < para_len && !overflow_wrap) {
+                int last_space = -1;
+                for (int i = 0; i < take; i++)
+                    if (p[i] == ' ' || p[i] == '\t') last_space = i;
+                if (last_space > 0) take = last_space;
+            } else if (take < para_len) {
+                int last_space = -1;
+                for (int i = 0; i < take; i++)
+                    if (p[i] == ' ' || p[i] == '\t') last_space = i;
+                if (last_space > 0 && measure_text_range(atlas, p, take) > box_w * 0.65f)
+                    take = last_space;
+            }
+        }
+
+        int is_last_visible_line = (line_no == max_lines - 1);
+        int has_more = (take < para_len) || (hard_break >= 0 && p[hard_break + 1]);
+        char line[512];
+        int n = take;
+        if (n > (int)sizeof(line) - 8) n = (int)sizeof(line) - 8;
+        memcpy(line, p, (size_t)n);
+        line[n] = '\0';
+        while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t')) line[--n] = '\0';
+
+        if ((white_space == 1 || is_last_visible_line) && text_overflow == 1 && has_more) {
+            float ell_w = measure_text_width(atlas, "...");
+            while (n > 0 && measure_text_range(atlas, line, n) + ell_w > box_w)
+                line[--n] = '\0';
+            if (n + 3 < (int)sizeof(line)) strcat(line, "...");
+        }
+
+        float line_w = measure_text_width(atlas, line);
+        float start_x = x;
+        if      (align == 1) start_x = x + (box_w - line_w) / 2.0f;
+        else if (align == 2) start_x = x + (box_w - line_w);
+        if (start_x < x) start_x = x;
+
+        int single_line = (white_space == 1 || line_count == 1);
+        float baseline;
+        if (single_line) {
+            if (v_align == 2)
+                baseline = y + box_h - (line_h - cap_h) * 0.5f;
+            else if (v_align == 0)
+                baseline = y + (line_h - cap_h) * 0.5f + cap_h;
+            else
+                baseline = y + (box_h - cap_h) * 0.5f + cap_h;
+        } else {
+            baseline = y + y_off + line_no * line_h + (line_h - cap_h) * 0.5f + cap_h;
+        }
+        if (baseline < y + cap_h) baseline = y + cap_h;
+        if (baseline + (line_h - cap_h) * 0.5f > y + box_h + 0.5f) break;
+        render_text_pass(atlas, line, start_x, baseline, r, g, b, a);
+        if (is_fake_bold) render_text_pass(atlas, line, start_x + 1.0f, baseline, r, g, b, a);
+
+        line_no++;
+        if (white_space == 1 || is_last_visible_line) break;
+        p += take;
+        while (*p == ' ' || *p == '\t') p++;
+        if (hard_break >= 0 && take >= hard_break) p++;
+    }
 }
 
 static void draw_scrollbars(void) {
@@ -5064,15 +5887,15 @@ static void draw_a11y_live_region(void) {
     float tx = 20.0f;
     if (tx + tw > window_width - 20.0f) tx = window_width - 20.0f - tw;
     if (tx < 20.0f) tx = 20.0f;
-    render_text(buf, tx, bar_y + 4.0f, window_width - 40.0f, bar_h - 4.0f, 0,
-                0.88f, 0.90f, 0.96f, 1.0f, 12, 0);
+    render_text(buf, tx, bar_y + 4.0f, window_width - 40.0f, bar_h - 4.0f, 0, 1,
+                0.88f, 0.90f, 0.96f, 1.0f, 12, 0, 0.0f, 1, 1, 1);
 }
 
 // ============================================================
 // Event callbacks
 // ============================================================
 
-void modal_cancel_click(Element* e);
+static void modal_cancel_click(Element* e);
 
 static void focus_element(int idx);
 static void focus_element_ex(int idx, int via_keyboard);
@@ -5442,17 +6265,138 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 }
 
 // ============================================================
-// Demo button callbacks
+// Demo button callbacks (JS-compatible names via onclick="...")
 // ============================================================
 
-void handle_close(Element* e) {
+static void handle_close(Element* e);
+static void handle_minimize(Element* e);
+static void handle_maximize(Element* e);
+static void modal_cancel_click(Element* e);
+static void btn_click(Element* e);
+static void nav_click(Element* e);
+static void tool_click(Element* e);
+static void toggle_click(Element* e);
+static void checkbox_click(Element* e);
+static void select_toggle_click(Element* e);
+static void select_option_click(Element* e);
+static void toast_dismiss(Element* e);
+static void info_close_click(Element* e);
+static void dock_toggle_info_click(Element* e);
+static void dock_toggle_theme_click(Element* e);
+static void dock_toggle_notify_click(Element* e);
+static void dock_reopen_toast_click(Element* e);
+static void modal_confirm_click(Element* e);
+static void launcher_click(Element* e);
+static int take_screenshot(const char* path);
+
+void onScreenshot(Element* e) {
+    (void)e;
+    char path[512];
+    time_t t = time(NULL);
+    struct tm* tm_info = localtime(&t);
+    if (tm_info && strftime(path, sizeof(path), "screenshot_%Y%m%d_%H%M%S.png", tm_info) > 0)
+        take_screenshot(path);
+    else
+        take_screenshot("screenshot.png");
+}
+
+void onTabSwitch(Element* e) {
+    if (!e || !e->data_tab[0]) return;
+    char panel_id[64];
+    snprintf(panel_id, sizeof(panel_id), "tab_%s", e->data_tab);
+    for (int i = 0; i < elem_count; i++) {
+        if (element_has_class(&elements[i], "nav_item"))
+            remove_class(&elements[i], "active");
+        if (element_has_class(&elements[i], "tab_panel"))
+            remove_class(&elements[i], "active");
+    }
+    add_class(e, "active");
+    update_element_style(e);
+    int panel = get_element_by_id(panel_id);
+    if (panel != -1) {
+        add_class(&elements[panel], "active");
+        update_element_style(&elements[panel]);
+    }
+}
+
+void onToggleClick(Element* e) { toggle_click(e); }
+void onCheckboxClick(Element* e) { checkbox_click(e); }
+void onSwatchClick(Element* e) {
+    int p = e->parent_idx;
+    if (p != -1) {
+        for (int i = 0; i < elem_count; i++) {
+            if (elements[i].parent_idx == p && element_has_class(&elements[i], "swatch"))
+                remove_class(&elements[i], "sel");
+        }
+    }
+    add_class(e, "sel");
+    update_element_style(e);
+}
+
+void onTabPillClick(Element* e) {
+    int p = e->parent_idx;
+    if (p != -1) {
+        for (int i = 0; i < elem_count; i++) {
+            if (elements[i].parent_idx == p && element_has_class(&elements[i], "tab_pill"))
+                remove_class(&elements[i], "active");
+        }
+    }
+    add_class(e, "active");
+    update_element_style(e);
+}
+
+void onToolClick(Element* e) { tool_click(e); }
+void onNavClick(Element* e) { nav_click(e); }
+void onApply(Element* e) { btn_click(e); }
+void onSelectToggle(Element* e) { select_toggle_click(e); }
+void onSelectOption(Element* e) { select_option_click(e); }
+void onToastDismiss(Element* e) { toast_dismiss(e); }
+void onInfoClose(Element* e) { info_close_click(e); }
+void onDockInfo(Element* e) { dock_toggle_info_click(e); }
+void onDockTheme(Element* e) { dock_toggle_theme_click(e); }
+void onDockNotify(Element* e) { dock_toggle_notify_click(e); }
+void onDockToast(Element* e) { dock_reopen_toast_click(e); }
+void onModalCancel(Element* e) { modal_cancel_click(e); }
+void onModalConfirm(Element* e) { modal_confirm_click(e); }
+void onClose(Element* e) { handle_close(e); }
+void onMinimize(Element* e) { handle_minimize(e); }
+void onMaximize(Element* e) { handle_maximize(e); }
+void onLauncher(Element* e) { launcher_click(e); }
+
+static void register_demo_js_handlers(void) {
+    register_js_handler("onClose", onClose);
+    register_js_handler("onMinimize", onMinimize);
+    register_js_handler("onMaximize", onMaximize);
+    register_js_handler("onApply", onApply);
+    register_js_handler("onNavClick", onNavClick);
+    register_js_handler("onTabSwitch", onTabSwitch);
+    register_js_handler("onToolClick", onToolClick);
+    register_js_handler("onToggleClick", onToggleClick);
+    register_js_handler("onCheckboxClick", onCheckboxClick);
+    register_js_handler("onSelectToggle", onSelectToggle);
+    register_js_handler("onSelectOption", onSelectOption);
+    register_js_handler("onToastDismiss", onToastDismiss);
+    register_js_handler("onInfoClose", onInfoClose);
+    register_js_handler("onDockInfo", onDockInfo);
+    register_js_handler("onDockTheme", onDockTheme);
+    register_js_handler("onDockNotify", onDockNotify);
+    register_js_handler("onDockToast", onDockToast);
+    register_js_handler("onModalCancel", onModalCancel);
+    register_js_handler("onModalConfirm", onModalConfirm);
+    register_js_handler("onScreenshot", onScreenshot);
+    register_js_handler("onSwatchClick", onSwatchClick);
+    register_js_handler("onTabPillClick", onTabPillClick);
+    register_js_handler("onLauncher", onLauncher);
+}
+
+static void handle_close(Element* e) {
     (void)e;
     int title = get_element_by_id("title_text");
     if (title != -1) set_text(title, "Closing...");
     if (g_window) glfwSetWindowShouldClose(g_window, GLFW_TRUE);
 }
 
-void btn_click(Element* e) {
+static void btn_click(Element* e) {
     (void)e;
     if (g_modal_overlay_idx != -1) {
         g_focus_before_trap = g_focused_element_idx;
@@ -5463,7 +6407,7 @@ void btn_click(Element* e) {
     }
 }
 
-void modal_cancel_click(Element* e) {
+static void modal_cancel_click(Element* e) {
     (void)e;
     if (g_modal_overlay_idx != -1) {
         add_class(&elements[g_modal_overlay_idx], "hidden");
@@ -5475,7 +6419,7 @@ void modal_cancel_click(Element* e) {
     }
 }
 
-void modal_confirm_click(Element* e) {
+static void modal_confirm_click(Element* e) {
     (void)e;
     int desc = get_element_by_id("desc");
     if (desc != -1) set_text(desc, "Settings applied. Gradient CSS engine active!");
@@ -5489,7 +6433,7 @@ void modal_confirm_click(Element* e) {
     }
 }
 
-void toggle_click(Element* e) {
+static void toggle_click(Element* e) {
     int knob = get_element_by_id("toggle_knob");
     if (element_has_class(e, "on")) {
         remove_class(e, "on");
@@ -5501,7 +6445,7 @@ void toggle_click(Element* e) {
     update_element_style(e);
 }
 
-void checkbox_click(Element* e) {
+static void checkbox_click(Element* e) {
     if (element_has_class(e, "checked")) {
         remove_class(e, "checked");
         set_text(get_element_by_id("chk_label"), "Enable Notifications");
@@ -5512,12 +6456,12 @@ void checkbox_click(Element* e) {
     update_element_style(e);
 }
 
-void toast_dismiss(Element* e) {
+static void toast_dismiss(Element* e) {
     (void)e;
     if (g_toast_idx != -1) elements[g_toast_idx].display_none = 1;
 }
 
-void tool_click(Element* e) {
+static void tool_click(Element* e) {
     for (int i = 0; i < elem_count; i++) {
         if (element_has_class(&elements[i], "tool_btn"))
             remove_class(&elements[i], "active");
@@ -5538,7 +6482,7 @@ void tool_click(Element* e) {
     }
 }
 
-void nav_click(Element* e) {
+static void nav_click(Element* e) {
     for (int i = 1; i <= 4; i++) {
         char nid[16];
         snprintf(nid, sizeof(nid), "nav_%d", i);
@@ -5551,7 +6495,7 @@ void nav_click(Element* e) {
     if (title != -1) set_text(title, e->text);
 }
 
-void select_toggle_click(Element* e) {
+static void select_toggle_click(Element* e) {
     (void)e;
     if (g_select_panel_idx == -1) return;
     Element* panel = &elements[g_select_panel_idx];
@@ -5574,7 +6518,7 @@ void select_toggle_click(Element* e) {
     }
 }
 
-void select_option_click(Element* e) {
+static void select_option_click(Element* e) {
     int box = get_element_by_id("theme_select_box");
     if (box != -1) {
         char buf[96];
@@ -5594,40 +6538,44 @@ void select_option_click(Element* e) {
     }
 }
 
-void info_close_click(Element* e) {
+static void info_close_click(Element* e) {
     (void)e;
     if (g_info_win_idx != -1) elements[g_info_win_idx].display_none = 1;
 }
 
-void dock_toggle_info_click(Element* e) {
+static void dock_toggle_info_click(Element* e) {
     (void)e;
     if (g_info_win_idx != -1)
         elements[g_info_win_idx].display_none = !elements[g_info_win_idx].display_none;
 }
 
-void dock_toggle_theme_click(Element* e) {
+static void dock_toggle_theme_click(Element* e) {
     (void)e;
     int t = get_element_by_id("toggle_knob_track");
-    if (t != -1) toggle_click(&elements[t]);
+    if (t != -1) { toggle_click(&elements[t]); return; }
+    for (int i = 0; i < elem_count; i++)
+        if (element_has_class(&elements[i], "toggle")) { toggle_click(&elements[i]); return; }
 }
 
-void dock_toggle_notify_click(Element* e) {
+static void dock_toggle_notify_click(Element* e) {
     (void)e;
     int c = get_element_by_id("checkbox_notify");
-    if (c != -1) checkbox_click(&elements[c]);
+    if (c != -1) { checkbox_click(&elements[c]); return; }
+    for (int i = 0; i < elem_count; i++)
+        if (element_has_class(&elements[i], "checkbox")) { checkbox_click(&elements[i]); return; }
 }
 
-void dock_reopen_toast_click(Element* e) {
+static void dock_reopen_toast_click(Element* e) {
     (void)e;
     if (g_toast_idx != -1) elements[g_toast_idx].display_none = 0;
 }
 
-void handle_minimize(Element* e) {
+static void handle_minimize(Element* e) {
     (void)e;
     if (g_window) glfwIconifyWindow(g_window);
 }
 
-void handle_maximize(Element* e) {
+static void handle_maximize(Element* e) {
     (void)e;
     if (!g_window) return;
     if (glfwGetWindowAttrib(g_window, GLFW_MAXIMIZED))
@@ -5636,7 +6584,7 @@ void handle_maximize(Element* e) {
         glfwMaximizeWindow(g_window);
 }
 
-void launcher_click(Element* e) {
+static void launcher_click(Element* e) {
     (void)e;
     fprintf(stderr, "[lu-shell] Launcher clicked\n");
 }
@@ -5661,7 +6609,7 @@ static void framebuffer_size_callback(GLFWwindow* window, int width, int height)
     (void)window;
     (void)width;
     (void)height;
-    /* Layout is recomputed every frame from glfwGetWindowSize. */
+    g_layout_dirty = 1;
 }
 
 static int element_is_inert(int idx) {
@@ -5765,6 +6713,11 @@ static void focus_select_option_step(int backward) {
 
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     (void)scancode;
+    if (action == GLFW_PRESS && key == GLFW_KEY_F12) {
+        onScreenshot(NULL);
+        return;
+    }
+
     if (action == GLFW_PRESS && key == GLFW_KEY_ESCAPE) {
         int trap = get_focus_trap_root();
         if (trap != -1) {
@@ -5911,8 +6864,12 @@ static void parse_args(int argc, char** argv) {
             g_layout_path = argv[++i];
         } else if (strcmp(argv[i], "--css") == 0 && i + 1 < argc) {
             g_css_path = argv[++i];
+        } else if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
+            strncpy(g_screenshot_path, argv[++i], sizeof(g_screenshot_path) - 1);
+            g_screenshot_pending = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            fprintf(stderr, "lu-shell [--desktop] [--fullscreen] [--size WxH] [--layout PATH] [--css PATH]\n");
+            fprintf(stderr, "lu-shell [--desktop] [--fullscreen] [--size WxH] [--layout PATH] [--css PATH] [--screenshot PATH]\n");
+            fprintf(stderr, "  F12 — capture screenshot (PNG)\n");
             exit(0);
         }
     }
@@ -6099,6 +7056,10 @@ int main(int argc, char** argv) {
         elem_count++;
     }
 
+    g_layout_dirty = 1;
+    register_demo_js_handlers();
+    wire_element_onclick_handlers();
+
     g_clock_idx = get_element_by_id("clock");
     update_clock(glfwGetTime() + 1.0);
 
@@ -6108,70 +7069,7 @@ int main(int argc, char** argv) {
         g_top_z = elements[main_win].z_index > g_top_z ? elements[main_win].z_index : g_top_z;
     }
 
-    // Wire up callbacks
-    int btn_close = get_element_by_id("btn_close");
-    if (btn_close != -1) set_on_click(btn_close, handle_close);
-
-    int btn_min = get_element_by_id("btn_min");
-    if (btn_min != -1) set_on_click(btn_min, handle_minimize);
-
-    int btn_max = get_element_by_id("btn_max");
-    if (btn_max != -1) set_on_click(btn_max, handle_maximize);
-
-    int btn_apply = get_element_by_id("apply_btn");
-    if (btn_apply != -1) set_on_click(btn_apply, btn_click);
-
-    for (int n = 1; n <= 4; n++) {
-        char nid[16];
-        snprintf(nid, sizeof(nid), "nav_%d", n);
-        int nav = get_element_by_id(nid);
-        if (nav != -1) set_on_click(nav, nav_click);
-    }
-
-    const char* tool_ids[] = { "tool_save", "tool_reset", "tool_export", NULL };
-    for (int t = 0; tool_ids[t]; t++) {
-        int tb = get_element_by_id(tool_ids[t]);
-        if (tb != -1) set_on_click(tb, tool_click);
-    }
-
-    int toggle_track = get_element_by_id("toggle_knob_track");
-    if (toggle_track != -1) set_on_click(toggle_track, toggle_click);
-
-    int checkbox = get_element_by_id("checkbox_notify");
-    if (checkbox != -1) set_on_click(checkbox, checkbox_click);
-
-    int select_box = get_element_by_id("theme_select_box");
-    if (select_box != -1) set_on_click(select_box, select_toggle_click);
-    int opt_blue = get_element_by_id("opt_blue");
-    if (opt_blue != -1) set_on_click(opt_blue, select_option_click);
-    int opt_graphite = get_element_by_id("opt_graphite");
-    if (opt_graphite != -1) set_on_click(opt_graphite, select_option_click);
-    int opt_green = get_element_by_id("opt_green");
-    if (opt_green != -1) set_on_click(opt_green, select_option_click);
-
-    int toast_close = get_element_by_id("toast_close");
-    if (toast_close != -1) set_on_click(toast_close, toast_dismiss);
-
-    int info_close = get_element_by_id("info_close");
-    if (info_close != -1) set_on_click(info_close, info_close_click);
-
-    int dock_info = get_element_by_id("dock_icon_info");
-    if (dock_info != -1) set_on_click(dock_info, dock_toggle_info_click);
-    int dock_theme = get_element_by_id("dock_icon_theme");
-    if (dock_theme != -1) set_on_click(dock_theme, dock_toggle_theme_click);
-    int dock_notify = get_element_by_id("dock_icon_notify");
-    if (dock_notify != -1) set_on_click(dock_notify, dock_toggle_notify_click);
-    int dock_toast = get_element_by_id("dock_icon_toast");
-    if (dock_toast != -1) set_on_click(dock_toast, dock_reopen_toast_click);
-
-    int modal_cancel = get_element_by_id("modal_cancel");
-    if (modal_cancel != -1) set_on_click(modal_cancel, modal_cancel_click);
-
-    int modal_confirm = get_element_by_id("modal_confirm");
-    if (modal_confirm != -1) set_on_click(modal_confirm, modal_confirm_click);
-
-    g_progress_fill_idx  = get_element_by_id("progress_fill");
-    g_progress_track_idx = get_element_by_id("progress_track");
+    // Register JS-compatible onclick handlers (wired from HTML onclick="...")
     g_toast_idx          = get_element_by_id("toast");
     g_modal_overlay_idx  = get_element_by_id("modal_overlay");
     g_info_win_idx       = get_element_by_id("info_win");
@@ -6181,9 +7079,6 @@ int main(int argc, char** argv) {
     g_brightness_fill_idx   = get_element_by_id("slider_fill");
     g_brightness_value_idx  = get_element_by_id("slider_label");
     if (g_clock_idx == -1) g_clock_idx = get_element_by_id("clock");
-
-    int launcher = get_element_by_id("launcher");
-    if (launcher != -1) set_on_click(launcher, launcher_click);
 
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetKeyCallback(window, key_callback);
@@ -6213,17 +7108,20 @@ int main(int argc, char** argv) {
         glClearColor(0.06f, 0.06f, 0.10f, 1.0f);  // dark fallback; body CSS drives actual bg
         glClear(GL_COLOR_BUFFER_BIT);
 
+        if (window_width != g_last_window_w || window_height != g_last_window_h) {
+            g_layout_dirty = 1;
+            g_last_window_w = window_width;
+            g_last_window_h = window_height;
+        }
+
         tick_smooth_scroll(dt);
-        update_layout_pass();
+        if (g_layout_dirty) {
+            update_layout_pass();
+            g_layout_dirty = 0;
+        }
+        update_css_keyframe_animations(now);
         update_animations(dt);
         update_clock(now);
-
-        // Animate progress bar
-        if (g_progress_fill_idx != -1) {
-            float progress = fmodf((float)now * 0.09f, 1.0f);
-            float track_w = (g_progress_track_idx != -1) ? elements[g_progress_track_idx].w : 400.0f;
-            elements[g_progress_fill_idx].w = track_w * progress;
-        }
 
         if (g_brightness_thumb_idx != -1 && g_brightness_track_idx != -1) {
             Element* thumb = &elements[g_brightness_thumb_idx];
@@ -6234,6 +7132,7 @@ int main(int argc, char** argv) {
             if (ratio > 1.0f) ratio = 1.0f;
             if (g_brightness_fill_idx != -1)
                 elements[g_brightness_fill_idx].w = thumb->rel_x + thumb->w * 0.5f;
+            g_layout_dirty = 1;
             if (g_brightness_value_idx != -1) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "Brightness: %d%%", (int)(ratio * 100.0f + 0.5f));
@@ -6308,11 +7207,20 @@ int main(int argc, char** argv) {
                              e->justify_self    == FLEX_ALIGN_END)
                         text_align = 2;
                 }
+                int v_align = 1;
+                if (e->display_mode == DISPLAY_FLEX) {
+                    if (e->align_items == FLEX_ALIGN_START)
+                        v_align = 0;
+                    else if (e->align_items == FLEX_ALIGN_END)
+                        v_align = 2;
+                }
                 render_text(e->text,
                             dx + pad, dy + pad,
-                            box_w, box_h, text_align,
+                            box_w, box_h, text_align, v_align,
                             e->t_r, e->t_g, e->t_b, e->t_a * eff_op,
-                            e->font_size, e->font_bold);
+                            e->font_size, e->font_bold,
+                            e->line_height, e->white_space,
+                            e->text_overflow, e->overflow_wrap);
             }
             glDisable(GL_SCISSOR_TEST);
         }
@@ -6322,6 +7230,10 @@ int main(int argc, char** argv) {
         draw_a11y_live_region();
 
         glfwSwapBuffers(window);
+        if (g_screenshot_pending && g_screenshot_path[0]) {
+            take_screenshot(g_screenshot_path);
+            g_screenshot_pending = 0;
+        }
         glfwPollEvents();
     }
 
