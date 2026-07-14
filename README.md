@@ -4,6 +4,8 @@ A **pure Rust** Wayland compositor + custom `libwayland-client` implementation +
 
 [![Sponsor](https://img.shields.io/badge/Sponsor%20this%20project-%E2%9D%A4%EF%B8%8F-white?logo=githubsponsors&logoColor=EA4AAA&labelColor=EA4AAA)](https://github.com/sponsors/yui0)
 
+![Screenshot](ui/sample_01.png)
+![Screenshot](ui/sample_02.png)
 ![Screenshot](screenshot.png)
 
 ---

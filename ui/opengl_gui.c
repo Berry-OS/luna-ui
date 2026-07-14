@@ -375,6 +375,7 @@ static void on_mouse(GLFWwindow* w, int btn, int act, int mods) {
 }
 static void on_scroll(GLFWwindow* w, double xo, double yo) { (void)w; luna_scroll(xo, yo); }
 static void on_key(GLFWwindow* w, int key, int sc, int act, int mods) { (void)w; luna_key(key, sc, act, mods); }
+static void on_char(GLFWwindow* w, unsigned int cp) { (void)w; luna_char(cp); }
 
 int main(int argc, char** argv) {
     parse_args(argc, argv);
@@ -439,6 +440,7 @@ int main(int argc, char** argv) {
     glfwSetMouseButtonCallback(g_window, on_mouse);
     glfwSetScrollCallback(g_window, on_scroll);
     glfwSetKeyCallback(g_window, on_key);
+    glfwSetCharCallback(g_window, on_char);
 
     double last = glfwGetTime();
     while (!glfwWindowShouldClose(g_window)) {

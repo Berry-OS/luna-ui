@@ -1,6 +1,11 @@
 /*
  * luna-ui.h — Luna UI: CSS/HTML layout + OpenGL renderer (single-file library)
  *
+ * Paint path is CSS-driven (boxes, gradients, shadows, text, caret-color).
+ * Text controls: <input type="text|password"> / <textarea>
+ *   Host must forward IME commits via luna_char() (GLFW: glfwSetCharCallback).
+ * Japanese (and other Unicode) glyphs use a dynamic atlas over a CJK-capable font.
+ *
  *   #define LUNA_UI_IMPLEMENTATION
  *   #include "luna-ui.h"
  *
@@ -78,6 +83,9 @@ void luna_mouse_move(double x, double y);
 void luna_mouse_button(int button, int action, int mods, double x, double y);
 void luna_scroll(double xoff, double yoff);
 void luna_key(int key, int scancode, int action, int mods);
+void luna_char(unsigned int codepoint);
+const char* luna_get_value(int idx);
+void luna_set_value(int idx, const char* value);
 void luna_framebuffer_resized(void);
 void luna_take_screenshot(const char* path);
 void luna_request_screenshot(const char* path);
@@ -435,8 +443,17 @@ struct LunaElement {
     int parent_idx;
     float rel_x, rel_y;
     float x, y, w, h;
-    char text[256], type[32], class_name[96], id[64];
+    char text[512], type[32], class_name[96], id[64];
     int is_hovered, is_active, is_draggable;
+    /* Text controls (<input>/<textarea>) — value lives in text[] */
+    int is_input;
+    int input_multiline;   /* textarea */
+    int input_password;
+    char placeholder[160];
+    int caret;             /* UTF-8 byte offset into text */
+    float input_scroll_x;
+    float caret_r, caret_g, caret_b, caret_a;
+    int has_caret_color;
     int drag_mode; // 0=none, 1=move parent window, 2=drag self (slider thumb)
 
     int pct_w, pct_h, pct_left, pct_top, pct_bottom, pct_right;
@@ -500,6 +517,9 @@ struct LunaElement {
     int white_space;    /* 0=normal 1=nowrap */
     int text_overflow;  /* 0=clip 1=ellipsis */
     int overflow_wrap;  /* 0=normal 1=break-word */
+    float letter_spacing;
+    int text_transform; /* 0=none 1=uppercase 2=lowercase 3=capitalize */
+    int generated_pseudo; /* 0=dom 1=::before 2=::after */
 
     int has_shadow;
     float sh_dx, sh_dy, sh_blur;
@@ -647,6 +667,7 @@ typedef struct {
 
     int has_bg;     float bg_r, bg_g, bg_b, bg_a;
     int has_color;  float c_r,  c_g,  c_b,  c_a;
+    int has_caret_color; float caret_r, caret_g, caret_b, caret_a;
     int has_border; float bd_r, bd_g, bd_b, bd_a; float border_width;
     int has_outline; float outline_width, outline_offset;
     float ol_r, ol_g, ol_b, ol_a;
@@ -736,6 +757,10 @@ typedef struct {
     int has_white_space; int white_space;
     int has_text_overflow; int text_overflow;
     int has_overflow_wrap; int overflow_wrap;
+    int has_letter_spacing; float letter_spacing;
+    int has_text_transform; int text_transform;
+    int has_content; char content[128];
+    int pseudo_elem; /* 0=none 1=before 2=after */
     int has_shadow; float sh_dx, sh_dy, sh_blur, sh_r, sh_g, sh_b, sh_a;
 
     // Gradient
@@ -878,6 +903,196 @@ GLuint text_vao, text_vbo;
 int font_loaded      = 0;
 int bold_font_loaded = 0;
 
+/* ---- UTF-8 + dynamic CJK glyph atlas (CSS text paint path) ---- */
+static stbtt_fontinfo g_font_info;
+static unsigned char* g_font_ttf = NULL;
+static long           g_font_ttf_sz = 0;
+static int            g_font_info_ok = 0;
+
+#define LUNA_DYN_ATLAS_W 1024
+#define LUNA_DYN_ATLAS_H 1024
+#define LUNA_MAX_DYN_GLYPHS 4096
+#define LUNA_GLYPH_HASH 1024
+
+typedef struct {
+    int   codepoint;
+    int   px;          /* pixel size bucket */
+    float x0, y0, x1, y1;
+    float xoff, yoff, xadvance;
+    int   next;
+} LunaDynGlyph;
+
+static unsigned char g_dyn_pixels[LUNA_DYN_ATLAS_W * LUNA_DYN_ATLAS_H];
+static GLuint g_dyn_tex = 0;
+static int    g_dyn_dirty = 0;
+static int    g_dyn_pack_x = 1, g_dyn_pack_y = 1, g_dyn_pack_row_h = 0;
+static LunaDynGlyph g_dyn_glyphs[LUNA_MAX_DYN_GLYPHS];
+static int g_dyn_glyph_count = 0;
+static int g_dyn_hash[LUNA_GLYPH_HASH];
+
+static int utf8_decode(const char** pp) {
+    const unsigned char* s = (const unsigned char*)*pp;
+    if (!s || !*s) return 0;
+    unsigned char c = s[0];
+    if (c < 0x80) { *pp = (const char*)(s + 1); return (int)c; }
+    if ((c & 0xE0) == 0xC0 && s[1]) {
+        int cp = ((c & 0x1F) << 6) | (s[1] & 0x3F);
+        *pp = (const char*)(s + 2); return cp;
+    }
+    if ((c & 0xF0) == 0xE0 && s[1] && s[2]) {
+        int cp = ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        *pp = (const char*)(s + 3); return cp;
+    }
+    if ((c & 0xF8) == 0xF0 && s[1] && s[2] && s[3]) {
+        int cp = ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        *pp = (const char*)(s + 4); return cp;
+    }
+    *pp = (const char*)(s + 1);
+    return 0xFFFD;
+}
+
+static int utf8_prev_boundary(const char* s, int pos) {
+    if (pos <= 0) return 0;
+    pos--;
+    while (pos > 0 && ((unsigned char)s[pos] & 0xC0) == 0x80) pos--;
+    return pos;
+}
+
+static int utf8_next_boundary(const char* s, int pos) {
+    int n = (int)strlen(s);
+    if (pos >= n) return n;
+    pos++;
+    while (pos < n && ((unsigned char)s[pos] & 0xC0) == 0x80) pos++;
+    return pos;
+}
+
+static int utf8_encode(int cp, char* out) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+static int font_path_score(const char* path) {
+    char lower[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+    for (size_t i = 0; i < n; i++) lower[i] = (char)tolower((unsigned char)path[i]);
+    lower[n] = '\0';
+    int score = 0;
+    if (strstr(lower, "notosanscjk")) score += 200;
+    if (strstr(lower, "notosansjp"))  score += 180;
+    if (strstr(lower, "cjk"))         score += 120;
+    if (strstr(lower, "/ja/") || strstr(lower, "japanese")) score += 100;
+    if (strstr(lower, "noto"))        score += 40;
+    if (strstr(lower, "mplus") || strstr(lower, "sourcehansans")) score += 60;
+    if (strstr(lower, "dejavu") || strstr(lower, "liberation")) score += 10;
+    if (strstr(lower, "emoji") || strstr(lower, "icon")) score -= 100;
+    return score;
+}
+
+static void dyn_atlas_reset(void) {
+    memset(g_dyn_pixels, 0, sizeof(g_dyn_pixels));
+    g_dyn_pack_x = 1; g_dyn_pack_y = 1; g_dyn_pack_row_h = 0;
+    g_dyn_glyph_count = 0;
+    for (int i = 0; i < LUNA_GLYPH_HASH; i++) g_dyn_hash[i] = -1;
+    g_dyn_dirty = 1;
+}
+
+static LunaDynGlyph* dyn_find_glyph(int cp, int px) {
+    unsigned h = (unsigned)((cp * 2654435761u) ^ (unsigned)(px * 97)) % LUNA_GLYPH_HASH;
+    for (int i = g_dyn_hash[h]; i >= 0; i = g_dyn_glyphs[i].next) {
+        if (g_dyn_glyphs[i].codepoint == cp && g_dyn_glyphs[i].px == px)
+            return &g_dyn_glyphs[i];
+    }
+    return NULL;
+}
+
+static LunaDynGlyph* dyn_bake_glyph(int cp, int px) {
+    if (!g_font_info_ok || px < 8) return NULL;
+    LunaDynGlyph* hit = dyn_find_glyph(cp, px);
+    if (hit) return hit;
+    if (g_dyn_glyph_count >= LUNA_MAX_DYN_GLYPHS) return NULL;
+
+    float scale = stbtt_ScaleForPixelHeight(&g_font_info, (float)px);
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(&g_font_info, &ascent, &descent, &lineGap);
+    int advance, lsb;
+    stbtt_GetCodepointHMetrics(&g_font_info, cp, &advance, &lsb);
+    int x0, y0, x1, y1;
+    stbtt_GetCodepointBitmapBox(&g_font_info, cp, scale, scale, &x0, &y0, &x1, &y1);
+    int gw = x1 - x0;
+    int gh = y1 - y0;
+    if (gw < 1) gw = 1;
+    if (gh < 1) gh = 1;
+    int pad = 1;
+    int need_w = gw + pad * 2;
+    int need_h = gh + pad * 2;
+    if (g_dyn_pack_x + need_w >= LUNA_DYN_ATLAS_W) {
+        g_dyn_pack_x = 1;
+        g_dyn_pack_y += g_dyn_pack_row_h + 1;
+        g_dyn_pack_row_h = 0;
+    }
+    if (g_dyn_pack_y + need_h >= LUNA_DYN_ATLAS_H) {
+        /* Atlas full — reset (LRU-less; rare for typical UIs) */
+        dyn_atlas_reset();
+    }
+    if (g_dyn_pack_y + need_h >= LUNA_DYN_ATLAS_H) return NULL;
+    if (need_h > g_dyn_pack_row_h) g_dyn_pack_row_h = need_h;
+
+    int ax = g_dyn_pack_x + pad;
+    int ay = g_dyn_pack_y + pad;
+    stbtt_MakeCodepointBitmap(&g_font_info, &g_dyn_pixels[ay * LUNA_DYN_ATLAS_W + ax],
+                              gw, gh, LUNA_DYN_ATLAS_W, scale, scale, cp);
+
+    LunaDynGlyph* g = &g_dyn_glyphs[g_dyn_glyph_count];
+    g->codepoint = cp;
+    g->px = px;
+    g->x0 = (float)ax; g->y0 = (float)ay;
+    g->x1 = (float)(ax + gw); g->y1 = (float)(ay + gh);
+    g->xoff = (float)x0;
+    g->yoff = (float)y0;
+    g->xadvance = (float)advance * scale;
+    unsigned h = (unsigned)((cp * 2654435761u) ^ (unsigned)(px * 97)) % LUNA_GLYPH_HASH;
+    g->next = g_dyn_hash[h];
+    g_dyn_hash[h] = g_dyn_glyph_count;
+    g_dyn_glyph_count++;
+    g_dyn_pack_x += need_w + 1;
+    g_dyn_dirty = 1;
+    return g;
+}
+
+static void dyn_flush_atlas(void) {
+    if (!g_dyn_tex) {
+        glGenTextures(1, &g_dyn_tex);
+        glBindTexture(GL_TEXTURE_2D, g_dyn_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, LUNA_DYN_ATLAS_W, LUNA_DYN_ATLAS_H, 0,
+                     GL_RED, GL_UNSIGNED_BYTE, g_dyn_pixels);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        g_dyn_dirty = 0;
+        return;
+    }
+    if (!g_dyn_dirty) return;
+    glBindTexture(GL_TEXTURE_2D, g_dyn_tex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, LUNA_DYN_ATLAS_W, LUNA_DYN_ATLAS_H,
+                    GL_RED, GL_UNSIGNED_BYTE, g_dyn_pixels);
+    g_dyn_dirty = 0;
+}
+
 // Shared VAO/VBO for rectangle drawing — created once, reused every frame.
 static GLuint g_rect_vao = 0, g_rect_vbo = 0;
 
@@ -893,10 +1108,18 @@ typedef struct {
 FontAtlas font_regular[NUM_FONT_SIZES];
 FontAtlas font_bold_atlas[NUM_FONT_SIZES];
 
+static float glyph_advance(FontAtlas* atlas, int cp, int px) {
+    if (cp >= 32 && cp < 128)
+        return atlas->cdata[cp - 32].xadvance;
+    LunaDynGlyph* g = dyn_bake_glyph(cp, px);
+    return g ? g->xadvance : (float)px * 0.5f;
+}
+
 static char g_screenshot_path[512] = {0};
 static int g_screenshot_pending = 0;
 static int g_layout_dirty = 1;
-static float g_last_window_w = 0.0f, g_last_window_h = 0.0f;
+static int g_render_order_dirty = 1;
+static int g_cached_eff_z[MAX_ELEMENTS];
 
 // ============================================================
 // Utilities
@@ -1900,8 +2123,12 @@ int get_element_by_id(const char* id) {
 
 void set_text(int idx, const char* new_text) {
     if (idx >= 0 && idx < elem_count) {
-        strncpy(elements[idx].text, new_text, 255);
-        elements[idx].text[255] = '\0';
+        strncpy(elements[idx].text, new_text, sizeof(elements[idx].text) - 1);
+        elements[idx].text[sizeof(elements[idx].text) - 1] = '\0';
+        if (elements[idx].is_input) {
+            int n = (int)strlen(elements[idx].text);
+            if (elements[idx].caret > n) elements[idx].caret = n;
+        }
         elements[idx].has_custom_text = 1;
         if (elements[idx].aria_live == 1 || elements[idx].aria_live == 2) {
             snprintf(g_a11y_live_msg, sizeof(g_a11y_live_msg), "%s", new_text);
@@ -1963,13 +2190,13 @@ static int extract_html_attr(const char* tag_buf, const char* attr, char* out, i
     if (!tag_buf || !attr || !out || out_len <= 0) return 0;
     char needle[64];
     snprintf(needle, sizeof(needle), "%s=\"", attr);
-    char* p = strstr(tag_buf, needle);
+    const char* p = strstr(tag_buf, needle);
     if (!p) {
         snprintf(needle, sizeof(needle), "%s='", attr);
         p = strstr(tag_buf, needle);
         if (!p) return 0;
         p += strlen(attr) + 2;
-        char* end = strchr(p, '\'');
+        const char* end = strchr(p, '\'');
         if (!end) return 0;
         int n = (int)(end - p);
         if (n >= out_len) n = out_len - 1;
@@ -1978,7 +2205,7 @@ static int extract_html_attr(const char* tag_buf, const char* attr, char* out, i
         return 1;
     }
     p += strlen(attr) + 2;
-    char* end = strchr(p, '"');
+    const char* end = strchr(p, '"');
     if (!end) return 0;
     int n = (int)(end - p);
     if (n >= out_len) n = out_len - 1;
@@ -2084,7 +2311,7 @@ static void apply_element_inline_style(LunaElement* e) {
     if (rule.has_white_space) e->white_space = rule.white_space;
     if (rule.has_text_overflow) e->text_overflow = rule.text_overflow;
     if (rule.has_overflow_wrap) e->overflow_wrap = rule.overflow_wrap;
-    g_layout_dirty = 1;
+    g_layout_dirty = 1; g_render_order_dirty = 1;
 }
 
 int element_has_class(LunaElement* e, const char* cls) {
@@ -2222,6 +2449,8 @@ int simple_selector_matches(SimpleSelector* s, LunaElement* e) {
 }
 
 int selector_matches(StyleRule* r, LunaElement* e) {
+    /* Pseudo-element rules are filtered at ingest; never match DOM nodes. */
+    if (r->pseudo_elem) return 0;
     if (!simple_selector_matches(&r->target, e)) return 0;
     int search_from = e->parent_idx;
     for (int a = 0; a < r->ancestor_count; a++) {
@@ -2286,6 +2515,7 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 }
             }
             else if (strcmp(key, "color") == 0)            { rule->has_color = 1; parse_color(val, &rule->c_r, &rule->c_g, &rule->c_b, &rule->c_a); }
+            else if (strcmp(key, "caret-color") == 0)      { rule->has_caret_color = 1; parse_color(val, &rule->caret_r, &rule->caret_g, &rule->caret_b, &rule->caret_a); }
             else if (strcmp(key, "border-radius") == 0)    { rule->has_radius = 1; rule->border_radius = parse_float_val(val); }
             else if (strcmp(key, "border-width") == 0)     { rule->has_border = 1; rule->border_width = parse_float_val(val); }
             else if (strcmp(key, "outline-width") == 0)  { rule->has_outline = 1; rule->outline_width = parse_float_val(val); }
@@ -2442,8 +2672,8 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                     *sp = '\0';
                     rule->has_align_self = 1;
                     rule->has_justify_self = 1;
-                    rule->align_self = parse_align_self(sp + 1);
-                    rule->justify_self = parse_align_self(psbuf);
+                    rule->align_self = parse_align_self(psbuf);
+                    rule->justify_self = parse_align_self(sp + 1);
                 } else {
                     int v = parse_align_self(psbuf);
                     rule->has_align_self = 1;
@@ -2451,6 +2681,10 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                     rule->align_self = v;
                     rule->justify_self = v;
                 }
+            }
+            else if (strcmp(key, "align-self") == 0) {
+                rule->has_align_self = 1;
+                rule->align_self = parse_align_self(val);
             }
             else if (strcmp(key, "box-sizing") == 0) {
                 rule->has_box_sizing = 1;
@@ -2767,6 +3001,45 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                     (strstr(val, "break") != NULL || strstr(val, "anywhere") != NULL) ? 1 : 0;
             }
             else if (strcmp(key, "box-shadow") == 0)  { parse_box_shadow(val, rule); }
+            else if (strcmp(key, "letter-spacing") == 0) {
+                rule->has_letter_spacing = 1;
+                rule->letter_spacing = (strcmp(val, "normal") == 0) ? 0.0f : parse_float_val(val);
+            }
+            else if (strcmp(key, "text-transform") == 0) {
+                rule->has_text_transform = 1;
+                if (strstr(val, "upper")) rule->text_transform = 1;
+                else if (strstr(val, "lower")) rule->text_transform = 2;
+                else if (strstr(val, "capital")) rule->text_transform = 3;
+                else rule->text_transform = 0;
+            }
+            else if (strcmp(key, "border-top-color") == 0 || strcmp(key, "border-right-color") == 0 ||
+                     strcmp(key, "border-bottom-color") == 0 || strcmp(key, "border-left-color") == 0) {
+                rule->has_border = 1;
+                parse_color(val, &rule->bd_r, &rule->bd_g, &rule->bd_b, &rule->bd_a);
+            }
+            else if (strcmp(key, "content") == 0) {
+                rule->has_content = 1;
+                rule->content[0] = '\0';
+                if (val[0] == '"' || val[0] == '\'') {
+                    char q = val[0];
+                    const char* s = val + 1;
+                    const char* e = strrchr(s, q);
+                    if (e && e > s) {
+                        int n = (int)(e - s);
+                        if (n > (int)sizeof(rule->content) - 1) n = (int)sizeof(rule->content) - 1;
+                        strncpy(rule->content, s, (size_t)n);
+                        rule->content[n] = '\0';
+                    }
+                } else if (strcmp(val, "none") != 0 && strcmp(val, "normal") != 0) {
+                    strncpy(rule->content, val, sizeof(rule->content) - 1);
+                }
+            }
+            else if (strcmp(key, "font-family") == 0 || strcmp(key, "user-select") == 0 ||
+                     strcmp(key, "filter") == 0 || strcmp(key, "backdrop-filter") == 0 ||
+                     strcmp(key, "-webkit-backdrop-filter") == 0 ||
+                     strcmp(key, "-webkit-font-smoothing") == 0) {
+                /* Accepted for CSS parity; drawing stays CSS-box based. */
+            }
             else if (strcmp(key, "inset") == 0) {
                 float v = parse_float_val(val);
                 rule->has_top = 1;    rule->top = v;
@@ -2842,20 +3115,17 @@ static void ingest_parsed_rule(const CSSRule *pr) {
         const CSSSelector *cs = &pr->selectors[si];
         if (cs->compound_count == 0) continue;
 
-        /* Pseudo-element targets (::before, ::after, ::-webkit-scrollbar,
-           ::selection, ...) do not match real DOM elements. This engine does
-           not render generated content, so drop such rules entirely; otherwise
-           their declarations (e.g. `width:4px`) would leak onto the element the
-           compound is attached to (e.g. `.tab_panel::-webkit-scrollbar`). */
+        /* Drop ::before/::after/::-webkit-scrollbar/... — `*, *::before, *::after`
+           reset rules must not spawn real nodes or they break flex/hit-testing. */
         {
             const CSSCompound *tgt = &cs->compounds[cs->compound_count - 1];
-            int has_pseudo_elem = 0;
             for (int pi = 0; pi < tgt->part_count; pi++)
-                if (tgt->parts[pi].type == CSS_SEL_PSEUDO_ELEM) { has_pseudo_elem = 1; break; }
-            if (has_pseudo_elem) continue;
+                if (tgt->parts[pi].type == CSS_SEL_PSEUDO_ELEM) { tgt = NULL; break; }
+            if (!tgt) continue;
         }
 
         StyleRule rule = tmpl;
+        rule.pseudo_elem = 0;
         int is_hover = 0, is_active = 0, is_focus = 0, is_fvis = 0, is_fwithin = 0;
 
         /* Target = last compound */
@@ -3038,6 +3308,7 @@ static void update_focus_within_styles(int idx) {
 void update_element_style(LunaElement* e) {
     if (!e->has_custom_bg)     { e->r = 0.0f; e->g = 0.0f; e->b = 0.0f; e->a = 0.0f; e->has_gradient = 0; e->has_bg_image = 0; e->bg_image_path[0] = '\0'; e->bg_image_tex = 0; }
     if (!e->has_custom_color)  { e->t_r = 0.1f; e->t_g = 0.1f; e->t_b = 0.1f; e->t_a = 1.0f; }
+    e->has_caret_color = 0;
     if (!e->has_custom_border) { e->border_width = 0; e->bd_r = 0; e->bd_g = 0; e->bd_b = 0; e->bd_a = 0; }
     e->outline_width = 0.0f;
     e->outline_offset = 0.0f;
@@ -3111,6 +3382,7 @@ void update_element_style(LunaElement* e) {
     e->has_top = 0; e->has_left = 0;
     e->text_align = 0; e->font_size = 16; e->font_bold = 0;
     e->line_height = 0.0f; e->white_space = 0; e->text_overflow = 0; e->overflow_wrap = 1;
+    e->letter_spacing = 0.0f; e->text_transform = 0;
     e->has_shadow = 0; e->z_index = 0;
     e->transform_scale = 1.0f; e->transform_tx = 0.0f; e->transform_ty = 0.0f;
     e->transform_tx_pct = 0; e->transform_ty_pct = 0;
@@ -3169,6 +3441,11 @@ void update_element_style(LunaElement* e) {
             }
         }
         if (r->has_color && !e->has_custom_color)  { e->t_r = r->c_r; e->t_g = r->c_g; e->t_b = r->c_b; e->t_a = r->c_a; }
+        if (r->has_caret_color) {
+            e->has_caret_color = 1;
+            e->caret_r = r->caret_r; e->caret_g = r->caret_g;
+            e->caret_b = r->caret_b; e->caret_a = r->caret_a;
+        }
         if (r->has_border && !e->has_custom_border) { e->bd_r = r->bd_r; e->bd_g = r->bd_g; e->bd_b = r->bd_b; e->bd_a = r->bd_a; e->border_width = r->border_width; }
         if (r->has_outline) {
             e->has_outline = 1;
@@ -3371,6 +3648,8 @@ void update_element_style(LunaElement* e) {
         if (r->has_white_space) e->white_space = r->white_space;
         if (r->has_text_overflow) e->text_overflow = r->text_overflow;
         if (r->has_overflow_wrap) e->overflow_wrap = r->overflow_wrap;
+        if (r->has_letter_spacing) e->letter_spacing = r->letter_spacing;
+        if (r->has_text_transform) e->text_transform = r->text_transform;
         if (r->has_shadow) {
             e->has_shadow = 1;
             e->sh_dx = r->sh_dx; e->sh_dy = r->sh_dy; e->sh_blur = r->sh_blur;
@@ -3410,6 +3689,8 @@ void update_element_style(LunaElement* e) {
         e->anim_base_left_pct = e->pct_left;
         e->anim_base_captured = 1;
     }
+    if (e->is_input && e->cursor_type == 0) e->cursor_type = 2;
+    if (e->is_input && !e->input_multiline) e->white_space = 1;
 }
 
 // ============================================================
@@ -3443,7 +3724,7 @@ static void resolve_resource_path(const char* href, char* out, size_t outsz) {
 static int tag_attr_equals(const char* tag_buf, const char* key, const char* val) {
     char pattern[64];
     snprintf(pattern, sizeof(pattern), "%s=\"", key);
-    char* a = strstr(tag_buf, pattern);
+    const char* a = strstr(tag_buf, pattern);
     if (!a) return 0;
     char got[64] = {0};
     sscanf(a + (int)strlen(pattern), "%63[^\"]", got);
@@ -3452,7 +3733,7 @@ static int tag_attr_equals(const char* tag_buf, const char* key, const char* val
 
 static int tag_is_stylesheet_link(const char* tag_buf) {
     if (!tag_attr_equals(tag_buf, "rel", "stylesheet")) {
-        char* rel = strstr(tag_buf, "rel=\"");
+        const char* rel = strstr(tag_buf, "rel=\"");
         if (!rel) return 0;
         char rval[32] = {0};
         sscanf(rel + 5, "%31[^\"]", rval);
@@ -3670,12 +3951,13 @@ void parse_html(const char* html) {
             else aria_expanded = 0;
         }
 
-        char text[256] = {0};
+        char text[512] = {0};
         const char* next_tag = strchr(tag_end, '<');
         if (next_tag) {
             int text_len = (int)(next_tag - tag_end - 1);
-            if (text_len > 0 && text_len < 255) {
+            if (text_len > 0 && text_len < (int)sizeof(text) - 1) {
                 strncpy(text, tag_end + 1, text_len);
+                text[text_len] = '\0';
                 trim_whitespace(text);
             }
         }
@@ -3697,7 +3979,8 @@ void parse_html(const char* html) {
         strncpy(e.type, type, 31);
         strncpy(e.class_name, class_name, 95);
         strncpy(e.id, id, 63);
-        strncpy(e.text, text, 255);
+        strncpy(e.text, text, sizeof(e.text) - 1);
+        e.text[sizeof(e.text) - 1] = '\0';
         if (onclick_expr[0]) parse_onclick_expr(onclick_expr, e.onclick, (int)sizeof(e.onclick));
         if (data_tab[0]) strncpy(e.data_tab, data_tab, sizeof(e.data_tab) - 1);
         if (style_attr[0]) {
@@ -3721,7 +4004,33 @@ void parse_html(const char* html) {
             char alt[256] = {0};
             char* attr_alt = strstr(tag_buf, "alt=\"");
             if (attr_alt) sscanf(attr_alt + 5, "%255[^\"]", alt);
-            if (alt[0]) strncpy(e.text, alt, 255);
+            if (alt[0]) strncpy(e.text, alt, sizeof(e.text) - 1);
+        }
+
+        /* <input> / <textarea> — editable CSS-painted controls */
+        if (strcasecmp(type, "input") == 0 || strcasecmp(type, "textarea") == 0) {
+            e.is_input = 1;
+            e.input_multiline = (strcasecmp(type, "textarea") == 0) ? 1 : 0;
+            e.caret = 0;
+            e.cursor_type = 2; /* text */
+            if (e.tabindex == -2) e.tabindex = 0;
+            char itype[32] = {0};
+            extract_html_attr(tag_buf, "type", itype, sizeof(itype));
+            if (itype[0] && strcasecmp(itype, "password") == 0) e.input_password = 1;
+            if (itype[0] && (strcasecmp(itype, "submit") == 0 || strcasecmp(itype, "button") == 0 ||
+                             strcasecmp(itype, "checkbox") == 0 || strcasecmp(itype, "radio") == 0 ||
+                             strcasecmp(itype, "file") == 0 || strcasecmp(itype, "hidden") == 0 ||
+                             strcasecmp(itype, "image") == 0 || strcasecmp(itype, "reset") == 0)) {
+                e.is_input = 0; /* non-text inputs are not text editors */
+            }
+            char val[512] = {0};
+            if (extract_html_attr(tag_buf, "value", val, sizeof(val))) {
+                strncpy(e.text, val, sizeof(e.text) - 1);
+                e.text[sizeof(e.text) - 1] = '\0';
+                e.caret = (int)strlen(e.text);
+            }
+            extract_html_attr(tag_buf, "placeholder", e.placeholder, sizeof(e.placeholder));
+            if (e.is_input && !e.input_multiline) e.white_space = 1; /* nowrap */
         }
 
         elements[elem_count] = e;
@@ -4807,10 +5116,9 @@ static void place_overlay_rect(int idx, float x, float y, float w, float h, int 
     if (idx < 0) return;
     LunaElement* e = &elements[idx];
     if (!visible) {
-        if (!e->display_none) {
-            e->display_none = 1;
-            update_element_style(e);
-        }
+        e->display_none = 1;
+        e->pointer_events_none = 1;
+        e->w = e->h = 0.0f;
         return;
     }
     e->display_none = 0;
@@ -4823,6 +5131,14 @@ static void place_overlay_rect(int idx, float x, float y, float w, float h, int 
     e->pos_overridden_x = 1;
     e->pos_overridden_y = 1;
     update_element_style(e);
+    /* Preserve overlay behavior after style reset. */
+    e->display_none = 0;
+    e->pointer_events_none = 1;
+    e->luna_internal = 1;
+    e->position_mode = POS_ABSOLUTE;
+    e->x = x; e->y = y; e->w = w; e->h = h;
+    e->pos_overridden_x = 1;
+    e->pos_overridden_y = 1;
 }
 
 static int element_aria_hidden(int idx);
@@ -4895,7 +5211,7 @@ static void sync_css_overlay_elements(void) {
             if (fe->aria_label[0])
                 snprintf(buf, sizeof(buf), "%s", fe->aria_label);
             else if (fe->role[0] && fe->text[0])
-                snprintf(buf, sizeof(buf), "%s: %s", fe->role, fe->text);
+                snprintf(buf, sizeof(buf), "%.64s: %.180s", fe->role, fe->text);
             else if (fe->text[0])
                 snprintf(buf, sizeof(buf), "%s", fe->text);
             if (buf[0]) show = 1;
@@ -5114,6 +5430,7 @@ static void scroll_track_click_x(int idx, double mx, double my) {
 static int hit_test_at(double xpos, double ypos);
 
 void scroll_callback(void* window, double xoffset, double yoffset) {
+    (void)window; /* used via Luna mouse API / GLFW host */
     double mx = g_luna_mx, my = g_luna_my;
     int hit = hit_test_at(mx, my);
     int shift = g_luna_shift;
@@ -5453,7 +5770,9 @@ static int take_screenshot(const char* path) {
 
 // Effective z-index = max of self and all ancestors.
 // Starts from element's own z_index so negative values (e.g. body=-9999) sort first.
-static int effective_z_index(int idx) {
+static int __attribute__((unused)) effective_z_index(int idx) {
+    if (idx >= 0 && idx < elem_count && !g_render_order_dirty)
+        return g_cached_eff_z[idx];
     int z = elements[idx].z_index;
     int p = elements[idx].parent_idx;
     while (p != -1) {
@@ -5465,14 +5784,25 @@ static int effective_z_index(int idx) {
 
 static int cmp_render_order(const void* a, const void* b) {
     int ia = *(const int*)a, ib = *(const int*)b;
-    int za = effective_z_index(ia), zb = effective_z_index(ib);
+    int za = g_cached_eff_z[ia], zb = g_cached_eff_z[ib];
     if (za != zb) return za - zb;
     return ia - ib; // preserve DOM order for same effective z-index
 }
 
 static void build_render_order() {
-    for (int i = 0; i < elem_count; i++) render_order[i] = i;
+    if (!g_render_order_dirty) return;
+    for (int i = 0; i < elem_count; i++) {
+        int z = elements[i].z_index;
+        int p = elements[i].parent_idx;
+        while (p != -1) {
+            if (elements[p].z_index > z) z = elements[p].z_index;
+            p = elements[p].parent_idx;
+        }
+        g_cached_eff_z[i] = z;
+        render_order[i] = i;
+    }
     qsort(render_order, elem_count, sizeof(int), cmp_render_order);
+    g_render_order_dirty = 0;
 }
 
 // ============================================================
@@ -5567,8 +5897,21 @@ static void scan_fonts_dir(const char* dir, FontPathList* reg, FontPathList* bol
 
 // Try each path in the list; return first successfully loaded buffer.
 static unsigned char* try_load_font_list(FontPathList* fpl) {
+    /* Prefer CJK-capable faces so Japanese text paints correctly. */
+    int best = -1, best_score = -999999;
     for (int i = 0; i < fpl->count; i++) {
-        unsigned char* buf = read_file_bytes(fpl->paths[i], NULL);
+        int sc = font_path_score(fpl->paths[i]);
+        if (sc > best_score) { best_score = sc; best = i; }
+    }
+    if (best >= 0) {
+        unsigned char* buf = read_file_bytes(fpl->paths[best], &g_font_ttf_sz);
+        if (buf) {
+            fprintf(stderr, "[vespera] Font loaded: %s (score=%d)\n", fpl->paths[best], best_score);
+            return buf;
+        }
+    }
+    for (int i = 0; i < fpl->count; i++) {
+        unsigned char* buf = read_file_bytes(fpl->paths[i], &g_font_ttf_sz);
         if (buf) {
             fprintf(stderr, "[vespera] Font loaded: %s\n", fpl->paths[i]);
             return buf;
@@ -5589,7 +5932,11 @@ void init_font() {
     if (!reg_buf) { fprintf(stderr, "[vespera] Warning: no regular font found under /usr/share/fonts\n"); }
     else {
         bake_font_set(reg_buf, font_regular);
-        free(reg_buf);
+        g_font_ttf = reg_buf; /* keep for CJK / dynamic glyphs */
+        int off = stbtt_GetFontOffsetForIndex(g_font_ttf, 0);
+        if (off < 0) off = 0;
+        g_font_info_ok = stbtt_InitFont(&g_font_info, g_font_ttf, off) ? 1 : 0;
+        dyn_atlas_reset();
     }
 
     unsigned char* bold_buf = try_load_font_list(&bold_list);
@@ -5626,36 +5973,67 @@ FontAtlas* get_atlas(int size, int bold, int* out_is_fake_bold) {
 
 float measure_text_width(FontAtlas* atlas, const char* text) {
     float w = 0.0f;
-    for (const char* t = text; *t; t++) {
-        unsigned char c = (unsigned char)*t;
-        if (c >= 32 && c < 128) w += atlas->cdata[c - 32].xadvance;
+    int px = 16;
+    /* Infer pixel size from atlas pointer into font_regular/bold arrays */
+    for (int i = 0; i < NUM_FONT_SIZES; i++) {
+        if (atlas == &font_regular[i] || atlas == &font_bold_atlas[i]) {
+            px = (int)font_sizes[i];
+            break;
+        }
+    }
+    const char* p = text;
+    while (*p) {
+        int cp = utf8_decode(&p);
+        if (cp == '\n' || cp == '\r') continue;
+        w += glyph_advance(atlas, cp, px);
     }
     return w;
 }
 
 static float measure_text_range(FontAtlas* atlas, const char* start, int len) {
     float w = 0.0f;
-    for (int i = 0; i < len && start[i]; i++) {
-        unsigned char c = (unsigned char)start[i];
-        if (c >= 32 && c < 128) w += atlas->cdata[c - 32].xadvance;
+    int px = 16;
+    for (int i = 0; i < NUM_FONT_SIZES; i++) {
+        if (atlas == &font_regular[i] || atlas == &font_bold_atlas[i]) {
+            px = (int)font_sizes[i];
+            break;
+        }
+    }
+    const char* p = start;
+    const char* end = start + len;
+    while (p < end && *p) {
+        int cp = utf8_decode(&p);
+        if (cp == '\n' || cp == '\r') continue;
+        w += glyph_advance(atlas, cp, px);
     }
     return w;
 }
 
 static int fit_text_chars(FontAtlas* atlas, const char* text, int len, float max_w) {
-    if (max_w <= 0.0f) return 0;
     float w = 0.0f;
-    int last_fit = 0;
-    for (int i = 0; i < len && text[i]; i++) {
-        unsigned char c = (unsigned char)text[i];
-        float adv = (c >= 32 && c < 128) ? atlas->cdata[c - 32].xadvance : 0.0f;
-        if (w + adv > max_w && last_fit > 0) break;
-        if (w + adv > max_w) return 0;
-        w += adv;
-        last_fit = i + 1;
+    int px = 16;
+    for (int i = 0; i < NUM_FONT_SIZES; i++) {
+        if (atlas == &font_regular[i] || atlas == &font_bold_atlas[i]) {
+            px = (int)font_sizes[i];
+            break;
+        }
     }
-    return last_fit;
+    const char* p = text;
+    const char* end = text + len;
+    const char* last = text;
+    while (p < end && *p) {
+        const char* before = p;
+        int cp = utf8_decode(&p);
+        if (cp == '\n' || cp == '\r') break;
+        float adv = glyph_advance(atlas, cp, px);
+        if (w + adv > max_w && last != text) return (int)(last - text);
+        w += adv;
+        last = p;
+        (void)before;
+    }
+    return (int)(p - text);
 }
+
 
 // ============================================================
 // Drawing
@@ -5673,7 +6051,7 @@ void init_rect_geometry() {
 }
 
 // Load (or retrieve cached) texture from file path.
-static GLuint load_or_get_texture(const char* path) {
+static GLuint __attribute__((unused)) load_or_get_texture(const char* path) {
     if (!path || !path[0]) return 0;
     for (int i = 0; i < g_tex_count; i++)
         if (strcmp(g_tex_cache[i].path, path) == 0) return g_tex_cache[i].tex;
@@ -5838,19 +6216,38 @@ static void draw_shadow(float ex, float ey, float ew, float eh,
 void render_text_pass(FontAtlas* atlas, const char* text,
                       float start_x, float baseline_y,
                       float r, float g, float b, float a) {
+    int px = 16;
+    for (int i = 0; i < NUM_FONT_SIZES; i++) {
+        if (atlas == &font_regular[i] || atlas == &font_bold_atlas[i]) {
+            px = (int)font_sizes[i];
+            break;
+        }
+    }
+    /* Pre-bake CJK glyphs so the atlas uploads once per string */
+    {
+        const char* q = text;
+        while (*q) {
+            int cp = utf8_decode(&q);
+            if (cp >= 128) (void)dyn_bake_glyph(cp, px);
+        }
+    }
+    dyn_flush_atlas();
     glUseProgram(text_program);
     glUniform2f(tx_loc.uResolution, window_width, window_height);
     glUniform4f(tx_loc.textColor,   r, g, b, a);
     if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, atlas->tex);
     glBindVertexArray(text_vao);
 
     float draw_x = start_x, draw_y = baseline_y;
-    while (*text) {
-        unsigned char tc = (unsigned char)*text;
-        if (tc >= 32 && tc < 128) {
+    const char* p = text;
+    GLuint bound = 0;
+    while (*p) {
+        int cp = utf8_decode(&p);
+        if (cp < 32) continue;
+        if (cp < 128) {
+            if (bound != atlas->tex) { glBindTexture(GL_TEXTURE_2D, atlas->tex); bound = atlas->tex; }
             stbtt_aligned_quad q;
-            stbtt_GetBakedQuad(atlas->cdata, 512, 512, (int)(tc - 32), &draw_x, &draw_y, &q, 1);
+            stbtt_GetBakedQuad(atlas->cdata, 512, 512, cp - 32, &draw_x, &draw_y, &q, 1);
             float verts[4][4] = {
                 { q.x0, q.y0, q.s0, q.t0 }, { q.x1, q.y0, q.s1, q.t0 },
                 { q.x1, q.y1, q.s1, q.t1 }, { q.x0, q.y1, q.s0, q.t1 }
@@ -5858,15 +6255,36 @@ void render_text_pass(FontAtlas* atlas, const char* text,
             glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
             glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
             glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        } else {
+            LunaDynGlyph* g = dyn_bake_glyph(cp, px);
+            if (!g) continue;
+            if (bound != g_dyn_tex) { glBindTexture(GL_TEXTURE_2D, g_dyn_tex); bound = g_dyn_tex; }
+            float x0 = draw_x + g->xoff;
+            float y0 = draw_y + g->yoff;
+            float x1 = x0 + (g->x1 - g->x0);
+            float y1 = y0 + (g->y1 - g->y0);
+            float s0 = g->x0 / (float)LUNA_DYN_ATLAS_W;
+            float t0 = g->y0 / (float)LUNA_DYN_ATLAS_H;
+            float s1 = g->x1 / (float)LUNA_DYN_ATLAS_W;
+            float t1 = g->y1 / (float)LUNA_DYN_ATLAS_H;
+            float verts[4][4] = {
+                { x0, y0, s0, t0 }, { x1, y0, s1, t0 },
+                { x1, y1, s1, t1 }, { x0, y1, s0, t1 }
+            };
+            glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+            draw_x += g->xadvance;
         }
-        text++;
     }
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+
 static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
                             float line_h, int max_lines,
                             int white_space, int text_overflow, int overflow_wrap) {
+    (void)line_h;
     const char* p = text;
     int line_no = 0;
     while (*p && line_no < max_lines) {
@@ -5920,6 +6338,21 @@ static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
         if (hard_break >= 0 && take >= hard_break) p++;
     }
     return line_no;
+}
+
+static void apply_text_transform_buf(char* buf, int transform) {
+    if (!buf || !transform) return;
+    int cap_next = 1;
+    for (char* p = buf; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (transform == 1) { if (c >= 'a' && c <= 'z') *p = (char)(c - 32); }
+        else if (transform == 2) { if (c >= 'A' && c <= 'Z') *p = (char)(c + 32); }
+        else if (transform == 3) {
+            if (cap_next && c >= 'a' && c <= 'z') *p = (char)(c - 32);
+            else if (!cap_next && c >= 'A' && c <= 'Z') *p = (char)(c + 32);
+            cap_next = (c == ' ' || c == '\t' || c == '\n' || c == '-');
+        }
+    }
 }
 
 void render_text(const char* text, float x, float y, float box_w, float box_h, int align,
@@ -6055,6 +6488,10 @@ static void focus_element(int idx);
 static void focus_element_ex(int idx, int via_keyboard);
 static int element_is_inert(int idx);
 static int element_aria_hidden(int idx);
+static void input_set_caret_from_x(LunaElement* e, float local_x);
+static void char_callback_impl(unsigned int codepoint);
+static float measure_prefix_width(LunaElement* e, int byte_len);
+static void input_update_scroll(LunaElement* e, float inner_w);
 
 static int element_aria_hidden(int idx) {
     while (idx != -1) {
@@ -6369,6 +6806,12 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
                 update_element_style(&elements[g_focused_element_idx]);
             focus_element(hit);
             bring_window_ptr_to_front(hit);
+            if (e->is_input) {
+                float bx, by, bw, bh;
+                get_element_draw_bounds(e, &bx, &by, &bw, &bh);
+                float pad = e->padding > 0 ? e->padding : e->pad_l;
+                input_set_caret_from_x(e, (float)mx - bx - pad);
+            }
             e->is_active = 1;
             update_element_style(e);
             if (e->is_draggable) {
@@ -6424,15 +6867,15 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
     }
 }
 
-static void glfw_error_callback(int error, const char* description) {
+static void __attribute__((unused)) glfw_error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
-static void framebuffer_size_callback(void* window, int width, int height) {
+static void __attribute__((unused)) framebuffer_size_callback(void* window, int width, int height) {
     (void)window;
     (void)width;
     (void)height;
-    g_layout_dirty = 1;
+    g_layout_dirty = 1; g_render_order_dirty = 1;
 }
 
 static int element_is_inert(int idx) {
@@ -6472,10 +6915,12 @@ static int element_is_focusable(int idx) {
     LunaElement* e = &elements[idx];
     if (!is_visible(idx) || e->display_none || e->pointer_events_none) return 0;
     if (e->tabindex == -1) return 0;
+    if (e->is_input) return 1;
     if (e->tabindex >= 0) return 1;
     if (e->role[0] && strcmp(e->role, "button") == 0) return 1;
     if (e->role[0] && strcmp(e->role, "combobox") == 0) return 1;
     if (strcasecmp(e->type, "button") == 0) return 1;
+    if (strcasecmp(e->type, "input") == 0 || strcasecmp(e->type, "textarea") == 0) return 1;
     return e->on_click || e->cursor_pointer;
 }
 
@@ -6535,8 +6980,122 @@ static void focus_select_option_step(int backward) {
     focus_element_ex(options[next], 1);
 }
 
+
+// ============================================================
+// Text input editing (IME commits arrive via luna_char)
+// ============================================================
+
+static int focused_is_input(void) {
+    return g_focused_element_idx >= 0 &&
+           g_focused_element_idx < elem_count &&
+           elements[g_focused_element_idx].is_input;
+}
+
+static void input_ensure_caret(LunaElement* e) {
+    int n = (int)strlen(e->text);
+    if (e->caret < 0) e->caret = 0;
+    if (e->caret > n) e->caret = n;
+    /* Snap to UTF-8 boundary */
+    while (e->caret > 0 && ((unsigned char)e->text[e->caret] & 0xC0) == 0x80)
+        e->caret--;
+}
+
+static void input_insert_utf8(LunaElement* e, const char* bytes, int blen) {
+    if (!e || !bytes || blen <= 0) return;
+    input_ensure_caret(e);
+    int n = (int)strlen(e->text);
+    int cap = (int)sizeof(e->text) - 1;
+    if (n + blen > cap) blen = cap - n;
+    if (blen <= 0) return;
+    memmove(e->text + e->caret + blen, e->text + e->caret, (size_t)(n - e->caret) + 1);
+    memcpy(e->text + e->caret, bytes, (size_t)blen);
+    e->caret += blen;
+}
+
+static void input_backspace(LunaElement* e) {
+    input_ensure_caret(e);
+    if (e->caret <= 0) return;
+    int prev = utf8_prev_boundary(e->text, e->caret);
+    int n = (int)strlen(e->text);
+    memmove(e->text + prev, e->text + e->caret, (size_t)(n - e->caret) + 1);
+    e->caret = prev;
+}
+
+static void input_delete_forward(LunaElement* e) {
+    input_ensure_caret(e);
+    int n = (int)strlen(e->text);
+    if (e->caret >= n) return;
+    int next = utf8_next_boundary(e->text, e->caret);
+    memmove(e->text + e->caret, e->text + next, (size_t)(n - next) + 1);
+}
+
+static float measure_prefix_width(LunaElement* e, int byte_len) {
+    if (!font_loaded || byte_len <= 0) return 0.0f;
+    FontAtlas* atlas = get_atlas(e->font_size, e->font_bold, NULL);
+    if (e->input_password) {
+        int n = 0;
+        const char* p = e->text;
+        const char* end = e->text + byte_len;
+        while (p < end && *p) { (void)utf8_decode(&p); n++; }
+        float w = 0.0f;
+        int px = e->font_size > 0 ? e->font_size : 16;
+        float adv = glyph_advance(atlas, (int)'*', px);
+        return adv * (float)n;
+    }
+    char tmp[512];
+    if (byte_len >= (int)sizeof(tmp)) byte_len = (int)sizeof(tmp) - 1;
+    memcpy(tmp, e->text, (size_t)byte_len);
+    tmp[byte_len] = '\0';
+    return measure_text_width(atlas, tmp);
+}
+
+static void input_set_caret_from_x(LunaElement* e, float local_x) {
+    if (!font_loaded) { e->caret = (int)strlen(e->text); return; }
+    FontAtlas* atlas = get_atlas(e->font_size, e->font_bold, NULL);
+    float x = local_x + e->input_scroll_x;
+    const char* p = e->text;
+    int best = 0;
+    float best_d = 1e9f;
+    float cx = 0.0f;
+    int off = 0;
+    while (*p) {
+        float d = fabsf(cx - x);
+        if (d < best_d) { best_d = d; best = off; }
+        const char* before = p;
+        int cp = utf8_decode(&p);
+        int px = e->font_size > 0 ? e->font_size : 16;
+        float adv = e->input_password ? glyph_advance(atlas, (int)'*', px) : glyph_advance(atlas, cp, px);
+        cx += adv;
+        off = (int)(p - e->text);
+        (void)before;
+    }
+    if (fabsf(cx - x) < best_d) best = off;
+    e->caret = best;
+}
+
+static void input_update_scroll(LunaElement* e, float inner_w) {
+    if (e->input_multiline) { e->input_scroll_x = 0.0f; return; }
+    float caret_x = measure_prefix_width(e, e->caret);
+    float pad = 2.0f;
+    if (caret_x - e->input_scroll_x > inner_w - pad)
+        e->input_scroll_x = caret_x - inner_w + pad;
+    if (caret_x - e->input_scroll_x < pad)
+        e->input_scroll_x = caret_x - pad;
+    if (e->input_scroll_x < 0.0f) e->input_scroll_x = 0.0f;
+}
+
+static void char_callback_impl(unsigned int codepoint) {
+    if (!focused_is_input()) return;
+    if (codepoint < 32 && codepoint != '\n' && codepoint != '\t') return;
+    LunaElement* e = &elements[g_focused_element_idx];
+    if (!e->input_multiline && (codepoint == '\n' || codepoint == '\r')) return;
+    char buf[8];
+    int n = utf8_encode((int)codepoint, buf);
+    input_insert_utf8(e, buf, n);
+}
+
 static void key_callback(void* window, int key, int scancode, int action, int mods) {
-    (void)scancode;
+    (void)window; (void)scancode;
     if (action == GLFW_PRESS && key == GLFW_KEY_F12) {
         char path[512];
         time_t t = time(NULL);
@@ -6582,10 +7141,35 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
         }
     }
 
+    /* Text field editing — consume keys so scroll/button shortcuts don't fight IME */
+    if (focused_is_input() && (action == GLFW_PRESS || action == GLFW_REPEAT)) {
+        LunaElement* fe = &elements[g_focused_element_idx];
+        if (key == GLFW_KEY_BACKSPACE) { input_backspace(fe); return; }
+        if (key == GLFW_KEY_DELETE) { input_delete_forward(fe); return; }
+        if (key == GLFW_KEY_LEFT) {
+            fe->caret = utf8_prev_boundary(fe->text, fe->caret);
+            input_ensure_caret(fe); return;
+        }
+        if (key == GLFW_KEY_RIGHT) {
+            fe->caret = utf8_next_boundary(fe->text, fe->caret);
+            input_ensure_caret(fe); return;
+        }
+        if (key == GLFW_KEY_HOME) { fe->caret = 0; return; }
+        if (key == GLFW_KEY_END) { fe->caret = (int)strlen(fe->text); return; }
+        if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+            if (fe->input_multiline) { char_callback_impl('\n'); return; }
+            if (fe->on_click) fe->on_click(fe);
+            return;
+        }
+        if (key == GLFW_KEY_SPACE) return; /* composition / char callback handles space */
+        /* Let other keys fall through only for non-editable combos */
+    }
+
     if (action == GLFW_PRESS &&
         (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER || key == GLFW_KEY_SPACE)) {
         if (g_focused_element_idx != -1) {
             LunaElement* fe = &elements[g_focused_element_idx];
+            if (fe->is_input) return;
             if (fe->on_click) {
                 fe->is_active = 1;
                 update_element_style(fe);
@@ -6728,9 +7312,9 @@ void luna_pop_focus_trap(int idx) {
 }
 
 void luna_set_mouse_release_hook(LunaMouseReleaseHook fn) { g_mouse_release_hook = fn; }
-void luna_resize(float w, float h) { luna_window_width = w; luna_window_height = h; g_layout_dirty = 1; }
-void luna_mark_layout_dirty(void) { g_layout_dirty = 1; }
-void luna_framebuffer_resized(void) { g_layout_dirty = 1; }
+void luna_resize(float w, float h) { luna_window_width = w; luna_window_height = h; g_layout_dirty = 1; g_render_order_dirty = 1; }
+void luna_mark_layout_dirty(void) { g_layout_dirty = 1; g_render_order_dirty = 1; }
+void luna_framebuffer_resized(void) { g_layout_dirty = 1; g_render_order_dirty = 1; }
 void luna_take_screenshot(const char* path) { take_screenshot(path); }
 void luna_flush_pending_screenshot(void) {
     if (g_screenshot_pending && g_screenshot_path[0]) {
@@ -6755,13 +7339,18 @@ void luna_inject_body_background(void) {
     body_e.transform_scale = 1.0f;
     body_e.cur_scale = 1.0f;
     body_e.anim_speed = 14.0f;
+    body_e.pointer_events_none = 1;
     elements[elem_count] = body_e;
     update_element_style(&elements[elem_count]);
+    /* update_element_style resets engine fields — restore backdrop role. */
     elements[elem_count].pct_w = 1; elements[elem_count].raw_w = 1.0f;
     elements[elem_count].pct_h = 1; elements[elem_count].raw_h = 1.0f;
+    elements[elem_count].z_index = -9999;
+    elements[elem_count].pointer_events_none = 1;
     LunaElement* ne = &elements[elem_count];
     ne->cur_r = ne->r; ne->cur_g = ne->g; ne->cur_b = ne->b; ne->cur_a = ne->a;
     elem_count++;
+    g_render_order_dirty = 1;
 }
 
 void luna_update(double now, double dt) {
@@ -6782,8 +7371,10 @@ void luna_render(int fbw, int fbh) {
         LunaElement* e = &elements[i];
         if (!is_rendered(i)) continue;
         float eff_op = element_effective_opacity(i);
+        if (eff_op <= 0.004f) continue;
         float dx, dy, dw, dh;
         get_element_draw_bounds(e, &dx, &dy, &dw, &dh);
+        if (dw <= 0.0f || dh <= 0.0f) continue;
         float scale = e->cur_scale;
         if (e->has_shadow && e->sh_a > 0.0f) {
             set_element_scissor(i, fbw, fbh);
@@ -6799,11 +7390,75 @@ void luna_render(int fbw, int fbh) {
             float bw = draw_e.border_width;
             draw_image(dx+bw, dy+bw, dw-2*bw, dh-2*bw, draw_e.border_radius*scale, e->bg_image_tex, eff_op);
         }
-        if (e->text[0]) {
-            float pad = e->padding * scale;
-            render_text(e->text, dx+pad, dy+pad, dw-pad*2, dh-pad*2, e->text_align?e->text_align:1, 1,
-                        e->t_r, e->t_g, e->t_b, e->t_a*eff_op, e->font_size, e->font_bold,
-                        e->line_height, e->white_space, e->text_overflow, e->overflow_wrap);
+        {
+            float pad = (e->padding > 0.0f ? e->padding : e->pad_l) * scale;
+            float pad_t = (e->padding > 0.0f ? e->padding : e->pad_t) * scale;
+            float inner_w = dw - pad * 2.0f;
+            float inner_h = dh - pad_t * 2.0f;
+            int show_ph = e->is_input && !e->text[0] && e->placeholder[0];
+            const char* src = show_ph ? e->placeholder : e->text;
+            if (src[0] || e->is_input) {
+                char tbuf[512];
+                if (e->is_input && e->input_password && e->text[0] && !show_ph) {
+                    /* Mask password with '*' per codepoint */
+                    int ti = 0;
+                    const char* pp = e->text;
+                    while (*pp && ti < (int)sizeof(tbuf) - 1) {
+                        (void)utf8_decode(&pp);
+                        tbuf[ti++] = '*';
+                    }
+                    tbuf[ti] = '\0';
+                } else {
+                    strncpy(tbuf, src, sizeof(tbuf) - 1);
+                    tbuf[sizeof(tbuf) - 1] = '\0';
+                    if (!show_ph) apply_text_transform_buf(tbuf, e->text_transform);
+                    if (!e->is_input && e->letter_spacing > 0.05f) {
+                        char spaced[768]; int si = 0;
+                        for (const char* p = tbuf; *p && si < (int)sizeof(spaced) - 2; ) {
+                            const char* b = p;
+                            int cp = utf8_decode(&p);
+                            int bl = (int)(p - b);
+                            if (si + bl >= (int)sizeof(spaced) - 2) break;
+                            memcpy(spaced + si, b, (size_t)bl); si += bl;
+                            if (*p && cp != ' ' && cp != '\n') {
+                                int gaps = (int)(e->letter_spacing / 3.0f);
+                                if (gaps < 1) gaps = 1;
+                                if (gaps > 3) gaps = 3;
+                                while (gaps-- > 0 && si < (int)sizeof(spaced) - 2) spaced[si++] = ' ';
+                            }
+                        }
+                        spaced[si] = '\0';
+                        strncpy(tbuf, spaced, sizeof(tbuf) - 1);
+                    }
+                }
+                float tr = e->t_r, tg = e->t_g, tb = e->t_b, ta = e->t_a * eff_op;
+                if (show_ph) ta *= 0.45f;
+                int align = e->text_align ? e->text_align : (e->is_input ? 0 : 1);
+                int ws = e->is_input && !e->input_multiline ? 1 : e->white_space;
+                if (e->is_input && !e->input_multiline)
+                    input_update_scroll(e, inner_w);
+                float tx = dx + pad - (e->is_input && !e->input_multiline ? e->input_scroll_x : 0.0f);
+                if (tbuf[0])
+                    render_text(tbuf, tx, dy + pad_t, inner_w + (e->is_input ? e->input_scroll_x : 0.0f),
+                                inner_h, align, 1, tr, tg, tb, ta, e->font_size, e->font_bold,
+                                e->line_height, ws, e->text_overflow, e->overflow_wrap);
+                /* Caret — CSS caret-color (falls back to text color) */
+                if (e->is_input && g_focused_element_idx == i) {
+                    double blink = luna_now();
+                    if (fmod(blink, 1.0) < 0.55) {
+                        float cx = measure_prefix_width(e, e->caret) - e->input_scroll_x;
+                        float cr = e->has_caret_color ? e->caret_r : e->t_r;
+                        float cg = e->has_caret_color ? e->caret_g : e->t_g;
+                        float cb = e->has_caret_color ? e->caret_b : e->t_b;
+                        float ca = e->has_caret_color ? e->caret_a : e->t_a;
+                        float cw = 1.5f;
+                        float ch = (e->font_size > 0 ? (float)e->font_size : 16.0f) * 1.15f;
+                        if (ch > inner_h) ch = inner_h;
+                        float cy = dy + pad_t + (inner_h - ch) * 0.5f;
+                        draw_rect(dx + pad + cx, cy, cw, ch, cr, cg, cb, ca * eff_op, 0, 0, 0,0,0,0);
+                    }
+                }
+            }
         }
         if (g_focus_via_keyboard && g_focused_element_idx == i && e->has_outline && e->outline_width > 0) {
             float ow = e->outline_width, off = e->outline_offset, p = off + ow;
@@ -6827,6 +7482,12 @@ void luna_key(int k, int sc, int a, int m) {
     g_luna_shift = (m & 1) ? 1 : 0; /* GLFW_MOD_SHIFT = 1 */
     key_callback(NULL, k, sc, a, m);
 }
+void luna_char(unsigned int codepoint) { char_callback_impl(codepoint); }
+const char* luna_get_value(int idx) {
+    if (idx < 0 || idx >= elem_count) return "";
+    return elements[idx].text;
+}
+void luna_set_value(int idx, const char* value) { set_text(idx, value ? value : ""); }
 
 static void cache_uniform_locations(void) {
     bg_loc.uResolution  = glGetUniformLocation(bg_program, "uResolution");

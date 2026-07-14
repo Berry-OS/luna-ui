@@ -17,7 +17,7 @@ GLFW_LIBS   := $(shell pkg-config --libs glfw3 2>/dev/null)
 
 .PHONY: all build build-dri build-webgl build-desktop build-shell symlinks \
         run server demo webgl run-gtk desktop lu-session install stop clean \
-        opengl_gui luna-ui
+        opengl_gui luna-ui sample
 
 all: build symlinks
 
@@ -58,6 +58,10 @@ opengl_gui: $(UI_DIR)/opengl_gui.c $(UI_DIR)/luna-ui.h $(UI_DIR)/stb_truetype.h 
 luna-ui: $(UI_DIR)/luna-ui.c $(UI_DIR)/luna-ui.h $(UI_DIR)/stb_truetype.h $(UI_DIR)/stb_image_write.h $(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h
 	@echo "→ Building Aurora Noir demo (luna-ui)"
 	gcc -O2 -Wall -Wextra $(GLFW_CFLAGS) -I$(UI_DIR) $(UI_DIR)/luna-ui.c -o luna-ui -lm -lGL $(GLFW_LIBS)
+
+sample: $(UI_DIR)/sample_02.c $(UI_DIR)/luna-ui.h $(UI_DIR)/stb_truetype.h $(UI_DIR)/stb_image_write.h
+	@echo "→ Building Luna UI sample"
+	gcc -O2 -Wall -Wextra $(GLFW_CFLAGS) -I$(UI_DIR) $(UI_DIR)/sample_02.c -o $(UI_DIR)/sample -lm -lGL $(GLFW_LIBS)
 
 # Run app with Rust libwayland-client preloaded
 run: build symlinks
@@ -148,4 +152,4 @@ stop:
 
 clean:
 	cargo clean
-	rm -f opengl_gui luna-ui $(UI_DIR)/demo.css.h $(UI_DIR)/demo.html.h $(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h
+	rm -f opengl_gui luna-ui $(UI_DIR)/sample $(UI_DIR)/demo.css.h $(UI_DIR)/demo.html.h $(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h
