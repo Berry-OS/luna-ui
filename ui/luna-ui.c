@@ -456,7 +456,8 @@ int main(int argc, char** argv) {
         update_progress(now);
         luna_render(fbw, fbh);
         glfwSwapBuffers(g_window);
-        luna_flush_pending_screenshot();
+        if (now > 1.0) /* let entrance transitions settle before capturing */
+            luna_flush_pending_screenshot();
         glfwPollEvents();
     }
     luna_shutdown();

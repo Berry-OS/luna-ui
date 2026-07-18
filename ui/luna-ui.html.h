@@ -407,6 +407,7 @@
     "    <div id=\"info_icon\"></div>\n"
     "    <p id=\"info_title\">Vespera GUI Engine</p>\n"
     "    <p id=\"info_msg\">OpenGL window manager with CSS styling, gradients, and smooth transitions.</p>\n"
+    "    <p id=\"info_link\">vespera.dev/docs</p>\n"
     "  </div>\n"
     "\n"
     "  <!-- ── Dock ── -->\n"
