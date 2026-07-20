@@ -24,10 +24,17 @@
 #include <sys/utsname.h>
 #include <dirent.h>
 #include <math.h>
+#include <stdint.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <GLFW/glfw3.h>
 #include "luna-ui.h"
 
-#define LUNA_SHELL_VERSION "1.1"
+#define LUNA_SHELL_VERSION "1.2"
+#define MAX_WIN_SLOTS  12
+#define MAX_TRAY_SLOTS 8
 
 static GLFWwindow* g_window = NULL;
 static int g_desktop_mode = 0;
@@ -177,10 +184,276 @@ static int g_mb_logo_idx  = -1;
 static int g_mb_cc_idx    = -1;
 static int g_mb_wifi_idx  = -1;
 
-static double g_toast_deadline = 0.0;
+static double g_last_shell_poll = -10.0;
+
+/* ── Compositor window list + system tray (via luna-shell/state.json) ── */
+
+typedef struct {
+    uint32_t id;
+    char     title[96];
+    char     app_id[64];
+    int      focused;
+    int      minimized;
+} LunaWinEntry;
+
+typedef struct {
+    char id[64];
+    char label[48];
+    char icon[24];
+    char tooltip[96];
+    uint32_t surface_id; /* parsed from id when applicable */
+} LunaTrayEntry;
+
+static LunaWinEntry  g_wins[MAX_WIN_SLOTS];
+static int           g_win_count = 0;
+static LunaTrayEntry g_tray[MAX_TRAY_SLOTS];
+static int           g_tray_count = 0;
+static char          g_shell_state_path[512];
+static char          g_shell_sock_path[512];
+static int           g_win_slot_idx[MAX_WIN_SLOTS];  /* element index for win_0.. */
+static int           g_tray_slot_idx[MAX_TRAY_SLOTS];  /* element index for tray_0.. */
+static uint32_t      g_win_slot_id[MAX_WIN_SLOTS];    /* compositor surface id shown in slot */
+static char          g_tray_slot_key[MAX_TRAY_SLOTS][64];
+
+static int read_battery_percent(void);
+static const char* read_net_status(void);
+static void set_hidden(int idx, int hidden);
+static int elem_idx_of(LunaElement* e);
+static void toast_show(const char* title, const char* msg, double secs);
+static void on_control_center(LunaElement* e);
+
+static void shell_paths_init(void) {
+    const char* xdg = getenv("XDG_RUNTIME_DIR");
+    if (!xdg || !*xdg) xdg = "/tmp";
+    snprintf(g_shell_state_path, sizeof(g_shell_state_path),
+             "%s/luna-shell/state.json", xdg);
+    snprintf(g_shell_sock_path, sizeof(g_shell_sock_path),
+             "%s/luna-shell/luna-shell.sock", xdg);
+}
+
+static void shell_send_cmd(const char* cmd) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(g_shell_sock_path) >= sizeof(addr.sun_path)) {
+        close(fd);
+        return;
+    }
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", g_shell_sock_path);
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return;
+    }
+    size_t n = strlen(cmd);
+    if (n > 0) {
+        send(fd, cmd, n, 0);
+        send(fd, "\n", 1, 0);
+    }
+    close(fd);
+}
+
+static const char* tray_glyph(const char* icon) {
+    if (!icon || !*icon) return "●";
+    if (!strcmp(icon, "terminal")) return ">_";
+    if (!strcmp(icon, "browser"))  return "◎";
+    if (!strcmp(icon, "files"))    return "■";
+    if (!strcmp(icon, "editor"))   return "¶";
+    if (!strcmp(icon, "music"))    return "♫";
+    if (!strcmp(icon, "settings")) return "⚙";
+    if (!strcmp(icon, "gtk"))      return "G";
+    if (!strcmp(icon, "wifi"))     return "⌁";
+    if (!strcmp(icon, "bat"))      return "▮";
+    if (!strncmp(icon, "app_active", 10) || !strncmp(icon, "terminal_active", 15)) {
+        if (strstr(icon, "terminal")) return ">_";
+        return "●";
+    }
+    return "●";
+}
+
+static void parse_tray_surface_id(LunaTrayEntry* t) {
+    t->surface_id = 0;
+    if (!strncmp(t->id, "win:", 4)) {
+        t->surface_id = (uint32_t)strtoul(t->id + 4, NULL, 10);
+    } else if (!strncmp(t->id, "app:", 4)) {
+        for (int i = 0; i < g_win_count; i++) {
+            if (!strcmp(g_wins[i].app_id, t->id + 4)) {
+                t->surface_id = g_wins[i].id;
+                return;
+            }
+        }
+    }
+}
+
+static void load_shell_state(void) {
+    FILE* f = fopen(g_shell_state_path, "r");
+    if (!f) return;
+    LunaWinEntry wins[MAX_WIN_SLOTS];
+    LunaTrayEntry tray[MAX_TRAY_SLOTS];
+    int wc = 0, tc = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[0] == 'W' && line[1] == '\t') {
+            if (wc >= MAX_WIN_SLOTS) continue;
+            unsigned id = 0; int focused = 0, minimized = 0;
+            char title[96] = "", app_id[64] = "";
+            if (sscanf(line + 2, "%u\t%95[^\t]\t%63[^\t]\t%d\t%d",
+                       &id, title, app_id, &focused, &minimized) >= 3) {
+                wins[wc].id = (uint32_t)id;
+                snprintf(wins[wc].title, sizeof(wins[wc].title), "%s", title);
+                snprintf(wins[wc].app_id, sizeof(wins[wc].app_id), "%s", app_id);
+                wins[wc].focused = focused;
+                wins[wc].minimized = minimized;
+                wc++;
+            }
+        } else if (line[0] == 'T' && line[1] == '\t') {
+            if (tc >= MAX_TRAY_SLOTS) continue;
+            char id[64] = "", label[48] = "", icon[24] = "", tooltip[96] = "";
+            if (sscanf(line + 2, "%63[^\t]\t%47[^\t]\t%23[^\t]\t%95[^\t]",
+                       id, label, icon, tooltip) >= 2) {
+                snprintf(tray[tc].id, sizeof(tray[tc].id), "%s", id);
+                snprintf(tray[tc].label, sizeof(tray[tc].label), "%s", label);
+                snprintf(tray[tc].icon, sizeof(tray[tc].icon), "%s", icon);
+                snprintf(tray[tc].tooltip, sizeof(tray[tc].tooltip), "%s",
+                         tooltip[0] ? tooltip : label);
+                tray[tc].surface_id = 0;
+                tc++;
+            }
+        }
+    }
+    fclose(f);
+
+    g_win_count = wc;
+    memcpy(g_wins, wins, (size_t)wc * sizeof(LunaWinEntry));
+    for (int i = 0; i < tc; i++) parse_tray_surface_id(&tray[i]);
+    g_tray_count = tc;
+    memcpy(g_tray, tray, (size_t)tc * sizeof(LunaTrayEntry));
+}
+
+static void win_slot_style(int slot, LunaWinEntry* w) {
+    if (slot < 0) return;
+    luna_remove_class(slot, "active");
+    luna_remove_class(slot, "minimized");
+    if (w->focused) luna_add_class(slot, "active");
+    if (w->minimized) luna_add_class(slot, "minimized");
+    luna_update_element_style(slot);
+}
+
+static void tray_slot_style(int slot, LunaTrayEntry* t) {
+    if (slot < 0) return;
+    const char* icons[] = {"icon_terminal","icon_browser","icon_files","icon_editor",
+                           "icon_music","icon_settings","icon_gtk","icon_wifi","icon_bat","icon_app"};
+    for (size_t i = 0; i < sizeof(icons)/sizeof(icons[0]); i++)
+        luna_remove_class(slot, icons[i]);
+    char cls[32];
+    snprintf(cls, sizeof(cls), "icon_%s", t->icon);
+    /* strip _active suffix for CSS class */
+    char* suf = strstr(cls, "_active");
+    if (suf) *suf = 0;
+    luna_add_class(slot, cls);
+    if (strstr(t->icon, "_active"))
+        luna_add_class(slot, "active");
+    else
+        luna_remove_class(slot, "active");
+    luna_update_element_style(slot);
+}
+
+static void update_window_list_ui(void) {
+    for (int s = 0; s < MAX_WIN_SLOTS; s++) {
+        int idx = g_win_slot_idx[s];
+        if (idx < 0) continue;
+        if (s >= g_win_count) {
+            set_hidden(idx, 1);
+            g_win_slot_id[s] = 0;
+            continue;
+        }
+        LunaWinEntry* w = &g_wins[s];
+        g_win_slot_id[s] = w->id;
+        set_hidden(idx, 0);
+        char label_id[32];
+        snprintf(label_id, sizeof(label_id), "win_%d", s);
+        /* label is child span — find by walking or use set_text on parent */
+        for (int i = 0; i < luna_element_count(); i++) {
+            LunaElement* e = luna_element_at(i);
+            if (e->parent_idx == idx && strstr(e->class_name, "win_label")) {
+                luna_set_text(i, w->title);
+                break;
+            }
+        }
+        win_slot_style(idx, w);
+    }
+    luna_mark_layout_dirty();
+}
+
+static void update_tray_ui(void) {
+    /* Reserve 2 slots for built-in network/battery indicators at the end. */
+    int builtin = 2;
+    int app_slots = MAX_TRAY_SLOTS - builtin;
+    if (app_slots < 1) app_slots = 1;
+
+    for (int s = 0; s < app_slots; s++) {
+        int idx = g_tray_slot_idx[s];
+        if (idx < 0) continue;
+        if (s >= g_tray_count) {
+            set_hidden(idx, 1);
+            g_tray_slot_key[s][0] = 0;
+            continue;
+        }
+        LunaTrayEntry* t = &g_tray[s];
+        snprintf(g_tray_slot_key[s], sizeof(g_tray_slot_key[s]), "%s", t->id);
+        set_hidden(idx, 0);
+        for (int i = 0; i < luna_element_count(); i++) {
+            LunaElement* e = luna_element_at(i);
+            if (e->parent_idx == idx && strstr(e->class_name, "tray_glyph")) {
+                luna_set_text(i, tray_glyph(t->icon));
+                break;
+            }
+        }
+        tray_slot_style(idx, t);
+    }
+
+    /* Built-in tray: Wi-Fi + battery */
+    char buf[32];
+    int bat = read_battery_percent();
+    int wifi_idx = g_tray_slot_idx[app_slots];
+    int bat_idx  = g_tray_slot_idx[app_slots + 1];
+    if (wifi_idx >= 0) {
+        set_hidden(wifi_idx, 0);
+        LunaTrayEntry tw = { .id = "builtin:wifi", .icon = "wifi" };
+        snprintf(tw.tooltip, sizeof(tw.tooltip), "%s", read_net_status());
+        tray_slot_style(wifi_idx, &tw);
+        for (int i = 0; i < luna_element_count(); i++) {
+            LunaElement* e = luna_element_at(i);
+            if (e->parent_idx == wifi_idx && strstr(e->class_name, "tray_glyph")) {
+                luna_set_text(i, tray_glyph("wifi"));
+                break;
+            }
+        }
+    }
+    if (bat_idx >= 0) {
+        set_hidden(bat_idx, 0);
+        LunaTrayEntry tb = { .id = "builtin:bat", .icon = "bat" };
+        if (bat >= 0) snprintf(tb.tooltip, sizeof(tb.tooltip), "Battery %d%%", bat);
+        else snprintf(tb.tooltip, sizeof(tb.tooltip), "AC Power");
+        tray_slot_style(bat_idx, &tb);
+        for (int i = 0; i < luna_element_count(); i++) {
+            LunaElement* e = luna_element_at(i);
+            if (e->parent_idx == bat_idx && strstr(e->class_name, "tray_glyph")) {
+                luna_set_text(i, tray_glyph("bat"));
+                break;
+            }
+        }
+        (void)buf;
+    }
+    luna_mark_layout_dirty();
+}
+
 static double g_last_clock = -10.0;
 static double g_last_stats = -10.0;
 static double g_now = 0.0;
+static double g_toast_deadline = 0.0;
 static char   g_lp_query[160] = "";
 
 /* Pending confirmation action */
@@ -491,7 +764,6 @@ static void on_settings_open(LunaElement* e) {
     (void)e;
     dismiss_luna_menu(g_luna_menu_idx);
     settings_populate_ui();
-    center_element(g_settings_idx);
     set_hidden(g_settings_idx, 0);
 }
 
@@ -576,6 +848,12 @@ static void confirm_open(int action) {
     int t  = luna_get_element_by_id("confirm_title");
     int m  = luna_get_element_by_id("confirm_msg");
     int ok = luna_get_element_by_id("confirm_ok");
+    int danger = (action == ACT_SHUTDOWN || action == ACT_RESTART);
+    if (ok >= 0) {
+        if (danger) { luna_add_class(ok, "danger"); luna_remove_class(ok, "primary"); }
+        else         { luna_remove_class(ok, "danger"); luna_add_class(ok, "primary"); }
+        luna_update_element_style(ok);
+    }
     switch (action) {
     case ACT_SHUTDOWN:
         if (t)  luna_set_text(t,  "Shut Down");
@@ -593,7 +871,6 @@ static void confirm_open(int action) {
         if (ok) luna_set_text(ok, "Log Out");
         break;
     }
-    center_element(luna_get_element_by_id("confirm_box"));
     set_hidden(g_confirm_idx, 0);
 }
 
@@ -740,6 +1017,62 @@ static const char* read_net_status(void) {
     return "Offline";
 }
 
+static void poll_shell_state(void) {
+    if (g_now - g_last_shell_poll < 0.4) return;
+    g_last_shell_poll = g_now;
+    load_shell_state();
+    update_window_list_ui();
+    update_tray_ui();
+}
+
+static uint32_t win_id_from_element(LunaElement* e) {
+    for (int idx = elem_idx_of(e); idx != -1; idx = luna_element_at(idx)->parent_idx) {
+        const char* id = luna_element_at(idx)->id;
+        if (id[0] == 'w' && id[1] == 'i' && id[2] == 'n' && id[3] == '_') {
+            int slot = atoi(id + 4);
+            if (slot >= 0 && slot < MAX_WIN_SLOTS)
+                return g_win_slot_id[slot];
+        }
+    }
+    return 0;
+}
+
+static void on_win_click(LunaElement* e) {
+    uint32_t wid = win_id_from_element(e);
+    if (!wid) return;
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "activate %u", wid);
+    shell_send_cmd(cmd);
+}
+
+static void on_tray_click(LunaElement* e) {
+    for (int idx = elem_idx_of(e); idx != -1; idx = luna_element_at(idx)->parent_idx) {
+        const char* id = luna_element_at(idx)->id;
+        if (id[0] == 't' && id[1] == 'r' && id[2] == 'a' && id[3] == 'y' && id[4] == '_') {
+            int slot = atoi(id + 5);
+            int app_slots = MAX_TRAY_SLOTS - 2;
+            if (slot == app_slots) {
+                on_control_center(e);
+                return;
+            }
+            if (slot == app_slots + 1) {
+                toast_show("Power", read_battery_percent() >= 0 ? "On battery" : "AC connected", 2.5);
+                return;
+            }
+            if (slot >= 0 && slot < app_slots && g_tray[slot].surface_id) {
+                char cmd[64];
+                snprintf(cmd, sizeof(cmd), "activate %u", g_tray[slot].surface_id);
+                shell_send_cmd(cmd);
+                return;
+            }
+            if (slot >= 0 && slot < g_tray_count && g_tray[slot].tooltip[0]) {
+                toast_show(g_tray[slot].label, g_tray[slot].tooltip, 3.0);
+            }
+            return;
+        }
+    }
+}
+
 static void set_bar_fill(const char* fill_id, float pct) {
     int fi = luna_get_element_by_id(fill_id);
     if (fi == -1) return;
@@ -870,6 +1203,8 @@ static void register_handlers(void) {
     luna_register_js_handler("onTrash",         on_trash);
     luna_register_js_handler("onToastClose",    on_toast_close);
     luna_register_js_handler("onCcToggle",      on_cc_toggle);
+    luna_register_js_handler("onWinClick",      on_win_click);
+    luna_register_js_handler("onTrayClick",     on_tray_click);
 }
 
 static void bind_indices(void) {
@@ -910,6 +1245,20 @@ static void bind_indices(void) {
     const char* wp_ids[] = {"wp_night","wp_ocean","wp_forest","wp_sunset"};
     for (int i = 0; i < 4; i++)
         wire_subtree(luna_get_element_by_id(wp_ids[i]), on_wallpaper_select);
+
+    /* Window list + system tray slots */
+    for (int i = 0; i < MAX_WIN_SLOTS; i++) {
+        char id[16];
+        snprintf(id, sizeof(id), "win_%d", i);
+        g_win_slot_idx[i] = luna_get_element_by_id(id);
+        wire_subtree(g_win_slot_idx[i], on_win_click);
+    }
+    for (int i = 0; i < MAX_TRAY_SLOTS; i++) {
+        char id[16];
+        snprintf(id, sizeof(id), "tray_%d", i);
+        g_tray_slot_idx[i] = luna_get_element_by_id(id);
+        wire_subtree(g_tray_slot_idx[i], on_tray_click);
+    }
 
     /* Wire settings tab buttons */
     wire_subtree(g_stab_apps_idx, on_settings_tab);
@@ -1022,6 +1371,7 @@ int main(int argc, char** argv) {
     luna_window_height = 900.0f;
     parse_args(argc, argv);
     settings_load();
+    shell_paths_init();
 
 #if defined(GLFW_PLATFORM_WAYLAND)
     if (getenv("WAYLAND_DISPLAY"))
@@ -1125,6 +1475,7 @@ int main(int argc, char** argv) {
         update_clock();
         update_stats();
         update_launchpad_filter();
+        poll_shell_state();
         center_dock();
         slider_tick("bright_thumb", "bright_fill", "bright_track");
         slider_tick("vol_thumb", "vol_fill", "vol_track");

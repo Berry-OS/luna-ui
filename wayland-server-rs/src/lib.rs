@@ -12,6 +12,7 @@ pub mod object;
 pub mod protocol;
 pub mod render;
 pub mod server;
+pub mod shell_ipc;
 pub mod shm;
 pub mod socket;
 pub mod types;

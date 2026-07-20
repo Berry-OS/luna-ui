@@ -9,6 +9,7 @@
 use crate::object::{DmabufParams, DmabufPlane, Object, Role, Surface};
 use crate::protocol::{self, Interface};
 use crate::render::{Backend, Framebuffer, InputEvent};
+use crate::shell_ipc::ShellIpc;
 use crate::shm::{ShmBuffer, ShmPool, FORMAT_ARGB8888, FORMAT_XRGB8888};
 use crate::socket::{Conn, Listener};
 use crate::types::Arg;
@@ -102,6 +103,10 @@ pub struct Server {
     kbd_client_fd: RawFd,
     kbd_surface_id: u32,
     kbd_mods: u32,
+
+    shell_ipc: Option<ShellIpc>,
+    focused_surface_id: u32,
+    shell_state_dirty: bool,
 }
 
 impl Server {
@@ -139,7 +144,15 @@ impl Server {
             kbd_client_fd: -1,
             kbd_surface_id: 0,
             kbd_mods: 0,
+
+            shell_ipc: ShellIpc::open(),
+            focused_surface_id: 0,
+            shell_state_dirty: true,
         };
+
+        if let Some(ref ipc) = server.shell_ipc {
+            server.epoll_add(ipc.cmd_fd());
+        }
 
         if let Some((rx, wake_fd)) = server.backend.take_input_channel() {
             server.input_rx = Some(rx);
@@ -220,6 +233,8 @@ impl Server {
                 let fd = ev.u64 as RawFd;
                 if fd == self.listener.fd {
                     self.accept_clients();
+                } else if Some(fd) == self.shell_ipc.as_ref().map(|i| i.cmd_fd()) {
+                    self.handle_shell_commands();
                 } else if fd == self.input_wake_fd && self.input_wake_fd >= 0 {
                     let mut buf = [0u8; 8];
                     unsafe { libc::read(self.input_wake_fd, buf.as_mut_ptr() as *mut libc::c_void, 8) };
@@ -232,6 +247,10 @@ impl Server {
             if self.dirty {
                 self.composite_and_present();
                 self.dirty = false;
+            }
+
+            if self.shell_state_dirty {
+                self.export_shell_state(false);
             }
 
             for c in self.clients.values_mut() {
@@ -641,6 +660,159 @@ impl Server {
         }
 
         self.dirty = true;
+        self.shell_state_dirty = true;
+    }
+
+    fn surface_is_minimized(&self, client: &Client, surface_id: u32) -> bool {
+        let Some(Object { role: Role::Surface(s), .. }) = client.objects.get(&surface_id) else {
+            return false;
+        };
+        let Some(xdg_id) = s.xdg_surface_id else { return false };
+        for obj in client.objects.values() {
+            if let Role::XdgToplevel {
+                xdg_surface_id,
+                minimized,
+                ..
+            } = &obj.role
+            {
+                if *xdg_surface_id == xdg_id {
+                    return *minimized;
+                }
+            }
+        }
+        false
+    }
+
+    fn export_shell_state(&mut self, force: bool) {
+        if let Some(ref mut ipc) = self.shell_ipc {
+            ipc.export_state(&self.clients, self.focused_surface_id, force);
+        }
+        self.shell_state_dirty = false;
+    }
+
+    fn handle_shell_commands(&mut self) {
+        let cmds = match self.shell_ipc.as_mut() {
+            Some(ipc) => ipc.accept_commands(),
+            None => return,
+        };
+        for cmd in cmds {
+            if cmd.starts_with("tray_") {
+                if let Some(ref mut ipc) = self.shell_ipc {
+                    ipc.handle_tray_command(&cmd);
+                }
+                self.shell_state_dirty = true;
+                continue;
+            }
+            let mut parts = cmd.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("activate"), Some(id)) => {
+                    if let Ok(sid) = id.parse::<u32>() {
+                        self.activate_surface(sid);
+                    }
+                }
+                (Some("minimize"), Some(id)) => {
+                    if let Ok(sid) = id.parse::<u32>() {
+                        self.minimize_surface(sid);
+                    }
+                }
+                (Some("close"), Some(id)) => {
+                    if let Ok(sid) = id.parse::<u32>() {
+                        self.close_surface(sid);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn client_for_surface(&self, surface_id: u32) -> Option<(RawFd, &Client)> {
+        for (&fd, client) in &self.clients {
+            if client.objects.contains_key(&surface_id) {
+                return Some((fd, client));
+            }
+        }
+        None
+    }
+
+    fn activate_surface(&mut self, surface_id: u32) {
+        let Some((fd, client)) = self.client_for_surface(surface_id) else { return };
+        let xdg_id = match client.objects.get(&surface_id) {
+            Some(Object { role: Role::Surface(s), .. }) => s.xdg_surface_id,
+            _ => None,
+        };
+        if let Some(xdg_id) = xdg_id {
+            for obj in self.clients.get_mut(&fd).unwrap().objects.values_mut() {
+                if let Role::XdgToplevel {
+                    xdg_surface_id,
+                    minimized,
+                    ..
+                } = &mut obj.role
+                {
+                    if *xdg_surface_id == xdg_id {
+                        *minimized = false;
+                    }
+                }
+            }
+        }
+        self.focused_surface_id = surface_id;
+        self.ptr_entered = false;
+        self.kbd_entered = false;
+        self.dirty = true;
+        self.shell_state_dirty = true;
+    }
+
+    fn minimize_surface(&mut self, surface_id: u32) {
+        let Some((fd, _)) = self.client_for_surface(surface_id) else { return };
+        let xdg_id = match self.clients.get(&fd).unwrap().objects.get(&surface_id) {
+            Some(Object { role: Role::Surface(s), .. }) => s.xdg_surface_id,
+            _ => None,
+        };
+        if let Some(xdg_id) = xdg_id {
+            for obj in self.clients.get_mut(&fd).unwrap().objects.values_mut() {
+                if let Role::XdgToplevel {
+                    xdg_surface_id,
+                    minimized,
+                    ..
+                } = &mut obj.role
+                {
+                    if *xdg_surface_id == xdg_id {
+                        *minimized = true;
+                    }
+                }
+            }
+        }
+        if self.focused_surface_id == surface_id {
+            self.focused_surface_id = 0;
+            self.ptr_entered = false;
+            self.kbd_entered = false;
+        }
+        self.dirty = true;
+        self.shell_state_dirty = true;
+    }
+
+    fn close_surface(&mut self, surface_id: u32) {
+        let Some((fd, client)) = self.client_for_surface(surface_id) else { return };
+        let xdg_id = match client.objects.get(&surface_id) {
+            Some(Object { role: Role::Surface(s), .. }) => s.xdg_surface_id,
+            _ => None,
+        };
+        let toplevel_id = xdg_id.and_then(|xid| {
+            client.objects.iter().find_map(|(&oid, obj)| {
+                if let Role::XdgToplevel { xdg_surface_id, .. } = &obj.role {
+                    if *xdg_surface_id == xid {
+                        return Some(oid);
+                    }
+                }
+                None
+            })
+        });
+        if let Some(tid) = toplevel_id {
+            if let Some(client) = self.clients.get_mut(&fd) {
+                client.send(tid, 0, &[]); // xdg_toplevel.close
+                client.conn.flush();
+            }
+        }
+        self.shell_state_dirty = true;
     }
 
     fn req_seat(&mut self, client: &mut Client, opcode: u16, args: &[Arg]) {
@@ -786,6 +958,8 @@ impl Server {
                             Role::XdgToplevel {
                                 xdg_surface_id: id,
                                 title: String::new(),
+                                app_id: String::new(),
+                                minimized: false,
                             },
                         ),
                     );
@@ -887,9 +1061,9 @@ impl Server {
             0 => {
                 client.objects.remove(&id);
                 self.dirty = true;
+                self.shell_state_dirty = true;
             }
             2 => {
-
                 let title = args.get(0).and_then(|a| a.as_str()).unwrap_or("").to_string();
                 if let Some(Object {
                     role: Role::XdgToplevel { title: t, .. },
@@ -898,7 +1072,29 @@ impl Server {
                 {
                     *t = title.clone();
                 }
-                eprintln!("[vespera-server] toplevel title: {:?}", title);
+                self.shell_state_dirty = true;
+            }
+            3 => {
+                let app_id = args.get(0).and_then(|a| a.as_str()).unwrap_or("").to_string();
+                if let Some(Object {
+                    role: Role::XdgToplevel { app_id: a, .. },
+                    ..
+                }) = client.objects.get_mut(&id)
+                {
+                    *a = app_id.clone();
+                }
+                self.shell_state_dirty = true;
+            }
+            11 => {
+                if let Some(Object {
+                    role: Role::XdgToplevel { minimized, .. },
+                    ..
+                }) = client.objects.get_mut(&id)
+                {
+                    *minimized = true;
+                }
+                self.dirty = true;
+                self.shell_state_dirty = true;
             }
             _ => {}
         }
@@ -1156,13 +1352,15 @@ impl Server {
         }
         self.fb.clear(0xff10_1014);
 
-        // Draw toplevels then popups (HashMap iteration order is unstable).
-        let mut toplevels: Vec<(i32, i32, crate::shm::ShmBuffer)> = Vec::new();
-        let mut popups:    Vec<(i32, i32, crate::shm::ShmBuffer)> = Vec::new();
+        let mut toplevels: Vec<(u32, i32, i32, crate::shm::ShmBuffer)> = Vec::new();
+        let mut popups: Vec<(i32, i32, crate::shm::ShmBuffer)> = Vec::new();
         for client in self.clients.values() {
-            for obj in client.objects.values() {
+            for (&surface_id, obj) in &client.objects {
                 if let Role::Surface(s) = &obj.role {
                     if !s.mapped || s.xdg_surface_id.is_none() {
+                        continue;
+                    }
+                    if !s.popup && self.surface_is_minimized(client, surface_id) {
                         continue;
                     }
                     if let Some(buf) = &s.current_buffer {
@@ -1175,13 +1373,14 @@ impl Server {
                         if s.popup {
                             popups.push((dx, dy, buf.clone()));
                         } else {
-                            toplevels.push((dx, dy, buf.clone()));
+                            toplevels.push((surface_id, dx, dy, buf.clone()));
                         }
                     }
                 }
             }
         }
-        for (dx, dy, buf) in &toplevels {
+        toplevels.sort_by_key(|(sid, _, _, _)| if *sid == self.focused_surface_id { 1 } else { 0 });
+        for (_, dx, dy, buf) in &toplevels {
             self.fb.blit_shm(buf, *dx, *dy);
         }
         for (dx, dy, buf) in &popups {
@@ -1216,14 +1415,18 @@ impl Server {
 
     fn find_input_target(&self) -> Option<(RawFd, u32, u32, u32, i32, i32, i32, i32)> {
         let (bw, bh) = self.backend.size();
+        let mut best: Option<(RawFd, u32, u32, u32, i32, i32, i32, i32)> = None;
         for (&fd, client) in &self.clients {
-            let mut toplevel: Option<(u32, i32, i32, i32, i32)> = None; // (id, w, h, ox, oy)
+            let mut toplevel: Option<(u32, i32, i32, i32, i32)> = None;
             let mut popup: Option<(u32, i32, i32, i32, i32)> = None;
             let mut ptr_id = 0u32;
             let mut kbd_id = 0u32;
             for (&oid, obj) in &client.objects {
                 match &obj.role {
                     Role::Surface(s) if s.mapped && s.xdg_surface_id.is_some() => {
+                        if !s.popup && self.surface_is_minimized(client, oid) {
+                            continue;
+                        }
                         if let Some(buf) = &s.current_buffer {
                             if s.popup {
                                 popup = Some((oid, buf.width, buf.height, s.x, s.y));
@@ -1240,10 +1443,15 @@ impl Server {
                 }
             }
             if let Some((sid, sw, sh, ox, oy)) = popup.or(toplevel) {
-                return Some((fd, sid, ptr_id, kbd_id, sw, sh, ox, oy));
+                if sid == self.focused_surface_id {
+                    return Some((fd, sid, ptr_id, kbd_id, sw, sh, ox, oy));
+                }
+                if best.is_none() {
+                    best = Some((fd, sid, ptr_id, kbd_id, sw, sh, ox, oy));
+                }
             }
         }
-        None
+        best
     }
 
     fn to_surface_fixed(&self, nx: f32, ny: f32, origin_x: i32, origin_y: i32) -> (i32, i32) {
@@ -1281,6 +1489,10 @@ impl Server {
     fn inject_ptr_button(&mut self, button: u32, pressed: bool) {
         let Some((fd, surf_id, ptr_id, _, _sw, _sh, ox, oy)) = self.find_input_target() else { return };
         if ptr_id == 0 { return; }
+        if pressed {
+            self.focused_surface_id = surf_id;
+            self.shell_state_dirty = true;
+        }
         if !self.ptr_entered || self.ptr_client_fd != fd || self.ptr_surface_id != surf_id {
             let (fx, fy) = self.to_surface_fixed(0.5, 0.5, ox, oy);
             let serial = self.next_serial();

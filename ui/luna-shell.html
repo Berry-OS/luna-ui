@@ -28,7 +28,33 @@
   <div id="mb_left">
     <div id="mb_logo" class="mb_item" onclick="onLunaMenu()"><div id="logo_disc"></div><div id="logo_bite"></div></div>
   </div>
+  <div id="mb_center">
+    <div id="win_list">
+      <div id="win_0"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_1"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_2"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_3"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_4"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_5"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_6"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_7"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_8"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_9"  class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_10" class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+      <div id="win_11" class="win_item hidden" onclick="onWinClick()"><span class="win_label">App</span></div>
+    </div>
+  </div>
   <div id="mb_right">
+    <div id="tray_area">
+      <div id="tray_0" class="tray_item hidden" onclick="onTrayClick()"><span class="tray_glyph">●</span></div>
+      <div id="tray_1" class="tray_item hidden" onclick="onTrayClick()"><span class="tray_glyph">●</span></div>
+      <div id="tray_2" class="tray_item hidden" onclick="onTrayClick()"><span class="tray_glyph">●</span></div>
+      <div id="tray_3" class="tray_item hidden" onclick="onTrayClick()"><span class="tray_glyph">●</span></div>
+      <div id="tray_4" class="tray_item hidden" onclick="onTrayClick()"><span class="tray_glyph">●</span></div>
+      <div id="tray_5" class="tray_item hidden" onclick="onTrayClick()"><span class="tray_glyph">●</span></div>
+      <div id="tray_6" class="tray_item hidden" onclick="onTrayClick()"><span class="tray_glyph">●</span></div>
+      <div id="tray_7" class="tray_item hidden" onclick="onTrayClick()"><span class="tray_glyph">●</span></div>
+    </div>
     <div id="mb_bat"  class="mb_item mb_status">100%</div>
     <div id="mb_wifi" class="mb_item mb_status" onclick="onControlCenter()">Wi-Fi</div>
     <div id="mb_cc"   class="mb_item" onclick="onControlCenter()">≡</div>
@@ -132,54 +158,57 @@
 </div>
 
 <!-- ── Settings window ── -->
-<div id="settings_win" class="hidden">
-  <div id="settings_drag" draggable="1"></div>
-  <div id="stl_close"  class="tl tl_red"    onclick="onSettingsClose()"></div>
-  <div id="stl_min"    class="tl tl_yellow"></div>
-  <div id="stl_max"    class="tl tl_green"></div>
-  <p id="settings_title">Luna Settings</p>
+<div id="settings_win" class="modal_sheet hidden">
+  <div id="settings_backdrop" class="modal_backdrop" onclick="onSettingsClose()"></div>
+  <div id="settings_sheet" class="sheet_box">
+    <div id="settings_drag" draggable="1"></div>
+    <div id="stl_close"  class="tl tl_red"    onclick="onSettingsClose()"></div>
+    <div id="stl_min"    class="tl tl_yellow"></div>
+    <div id="stl_max"    class="tl tl_green"></div>
+    <p id="settings_title">Luna Settings</p>
 
-  <!-- Tab bar -->
-  <div id="settings_tabs">
-    <div id="stab_apps" class="stab active" onclick="onSettingsTab()">Apps</div>
-    <div id="stab_disp" class="stab"        onclick="onSettingsTab()">Display</div>
-  </div>
-
-  <!-- Apps panel -->
-  <div id="settings_panel_apps">
-    <div class="pref_row"><p class="pref_label">Files</p><input    id="pref_files"    class="pref_input" type="text"></div>
-    <div class="pref_row"><p class="pref_label">Terminal</p><input id="pref_terminal" class="pref_input" type="text"></div>
-    <div class="pref_row"><p class="pref_label">Browser</p><input  id="pref_browser"  class="pref_input" type="text"></div>
-    <div class="pref_row"><p class="pref_label">Editor</p><input   id="pref_editor"   class="pref_input" type="text"></div>
-    <div class="pref_row"><p class="pref_label">Music</p><input    id="pref_music"    class="pref_input" type="text"></div>
-    <div class="pref_row"><p class="pref_label">Settings</p><input id="pref_settings" class="pref_input" type="text"></div>
-    <div class="pref_row"><p class="pref_label">GTK Demo</p><input id="pref_demo"     class="pref_input" type="text"></div>
-    <div class="pref_row"><p class="pref_label">Hello GTK</p><input id="pref_hello"   class="pref_input" type="text"></div>
-  </div>
-
-  <!-- Display panel -->
-  <div id="settings_panel_disp" class="hidden">
-    <p class="pref_section">Wallpaper Theme</p>
-    <div id="wp_thumbs_row">
-      <div id="wp_night"  class="wp_thumb wp_t_night  selected" onclick="onWpSelect()"></div>
-      <div id="wp_ocean"  class="wp_thumb wp_t_ocean"           onclick="onWpSelect()"></div>
-      <div id="wp_forest" class="wp_thumb wp_t_forest"          onclick="onWpSelect()"></div>
-      <div id="wp_sunset" class="wp_thumb wp_t_sunset"          onclick="onWpSelect()"></div>
+    <div id="settings_body">
+      <div id="settings_sidebar">
+        <div id="stab_apps" class="stab active" onclick="onSettingsTab()"><span class="stab_icon">◫</span> Apps</div>
+        <div id="stab_disp" class="stab"        onclick="onSettingsTab()"><span class="stab_icon">◑</span> Display</div>
+      </div>
+      <div id="settings_content">
+        <div id="settings_panel_apps">
+          <p class="panel_heading">Launch Commands</p>
+          <div class="pref_row"><p class="pref_label">Files</p><input    id="pref_files"    class="pref_input" type="text"></div>
+          <div class="pref_row"><p class="pref_label">Terminal</p><input id="pref_terminal" class="pref_input" type="text"></div>
+          <div class="pref_row"><p class="pref_label">Browser</p><input  id="pref_browser"  class="pref_input" type="text"></div>
+          <div class="pref_row"><p class="pref_label">Editor</p><input   id="pref_editor"   class="pref_input" type="text"></div>
+          <div class="pref_row"><p class="pref_label">Music</p><input    id="pref_music"    class="pref_input" type="text"></div>
+          <div class="pref_row"><p class="pref_label">Settings</p><input id="pref_settings" class="pref_input" type="text"></div>
+          <div class="pref_row"><p class="pref_label">GTK Demo</p><input id="pref_demo"     class="pref_input" type="text"></div>
+          <div class="pref_row"><p class="pref_label">Hello GTK</p><input id="pref_hello"   class="pref_input" type="text"></div>
+        </div>
+        <div id="settings_panel_disp" class="hidden">
+          <p class="panel_heading">Appearance</p>
+          <p class="pref_section">Wallpaper Theme</p>
+          <div id="wp_thumbs_row">
+            <div id="wp_night"  class="wp_thumb wp_t_night  selected" onclick="onWpSelect()"></div>
+            <div id="wp_ocean"  class="wp_thumb wp_t_ocean"           onclick="onWpSelect()"></div>
+            <div id="wp_forest" class="wp_thumb wp_t_forest"          onclick="onWpSelect()"></div>
+            <div id="wp_sunset" class="wp_thumb wp_t_sunset"          onclick="onWpSelect()"></div>
+          </div>
+          <div class="wp_label_row">
+            <p class="wp_lbl">Night</p>
+            <p class="wp_lbl">Ocean</p>
+            <p class="wp_lbl">Forest</p>
+            <p class="wp_lbl">Sunset</p>
+          </div>
+          <p class="pref_section">Hostname</p>
+          <div class="pref_row_full"><input id="pref_hostname" class="pref_input_full" type="text"></div>
+        </div>
+      </div>
     </div>
-    <div class="wp_label_row">
-      <p class="wp_lbl">Night</p>
-      <p class="wp_lbl">Ocean</p>
-      <p class="wp_lbl">Forest</p>
-      <p class="wp_lbl">Sunset</p>
-    </div>
-    <p class="pref_section">Hostname</p>
-    <div class="pref_row_full"><input id="pref_hostname" class="pref_input_full" type="text"></div>
-  </div>
 
-  <!-- Buttons -->
-  <div id="settings_btns">
-    <div class="dlg_btn"         onclick="onSettingsClose()">Cancel</div>
-    <div class="dlg_btn primary" onclick="onSettingsSave()">Save</div>
+    <div id="settings_btns">
+      <div class="dlg_btn"         onclick="onSettingsClose()">Cancel</div>
+      <div class="dlg_btn primary" onclick="onSettingsSave()">Save Changes</div>
+    </div>
   </div>
 </div>
 
@@ -210,18 +239,18 @@
 </div>
 
 <!-- ── Shutdown / restart confirmation ── -->
-<div id="confirm_overlay" class="hidden">
-  <div id="confirm_box">
+<div id="confirm_overlay" class="modal_sheet hidden">
+  <div id="confirm_backdrop" class="modal_backdrop" onclick="onConfirmCancel()"></div>
+  <div id="confirm_box" class="alert_box">
     <div id="confirm_icon">
       <div id="confirm_moon_disc"></div>
       <div id="confirm_moon_bite"></div>
     </div>
     <p id="confirm_title">Shut Down</p>
     <p id="confirm_msg">Are you sure you want to shut down your computer now?</p>
-    <div id="confirm_sep"></div>
     <div id="confirm_btns">
       <div id="confirm_cancel" class="dlg_btn"         onclick="onConfirmCancel()">Cancel</div>
-      <div id="confirm_ok"     class="dlg_btn primary" onclick="onConfirmOk()">Shut Down</div>
+      <div id="confirm_ok"     class="dlg_btn danger"  onclick="onConfirmOk()">Shut Down</div>
     </div>
   </div>
 </div>

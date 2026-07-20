@@ -83,7 +83,12 @@ pub enum Role {
     Buffer(ShmBuffer),
     Surface(Surface),
     XdgSurface { surface_id: u32, configured: bool },
-    XdgToplevel { xdg_surface_id: u32, title: String },
+    XdgToplevel {
+        xdg_surface_id: u32,
+        title: String,
+        app_id: String,
+        minimized: bool,
+    },
     XdgPopup { xdg_surface_id: u32 },
 }
 
