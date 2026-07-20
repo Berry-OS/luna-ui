@@ -186,6 +186,19 @@ typedef void (*PFNGLUNIFORM2FPROC)(GLint location, GLfloat v0, GLfloat v1);
 typedef void (*PFNGLUNIFORM1FPROC)(GLint location, GLfloat v0);
 typedef void (*PFNGLUNIFORM1IPROC)(GLint location, GLint v0);
 typedef void (*PFNGLACTIVETEXTUREPROC)(GLenum texture);
+typedef void (*PFNGLGENFRAMEBUFFERSPROC)(GLsizei n, GLuint* framebuffers);
+typedef void (*PFNGLBINDFRAMEBUFFERPROC)(GLenum target, GLuint framebuffer);
+typedef void (*PFNGLFRAMEBUFFERTEXTURE2DPROC)(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+typedef void (*PFNGLDELETEFRAMEBUFFERSPROC)(GLsizei n, const GLuint* framebuffers);
+typedef GLenum (*PFNGLCHECKFRAMEBUFFERSTATUSPROC)(GLenum target);
+
+#ifndef GL_FRAMEBUFFER
+#define GL_FRAMEBUFFER          0x8D40
+#define GL_DRAW_FRAMEBUFFER     0x8CA9
+#define GL_READ_FRAMEBUFFER     0x8CA8
+#define GL_COLOR_ATTACHMENT0    0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#endif
 
 PFNGLCREATEVERTEXARRAYSPROC glCreateVertexArrays;
 PFNGLDELETEVERTEXARRAYSPROC glDeleteVertexArrays;
@@ -210,6 +223,11 @@ PFNGLUNIFORM2FPROC glUniform2f;
 PFNGLUNIFORM1FPROC glUniform1f;
 PFNGLUNIFORM1IPROC glUniform1i_;
 PFNGLACTIVETEXTUREPROC glActiveTexture_;
+PFNGLGENFRAMEBUFFERSPROC glGenFramebuffers_;
+PFNGLBINDFRAMEBUFFERPROC glBindFramebuffer_;
+PFNGLFRAMEBUFFERTEXTURE2DPROC glFramebufferTexture2D_;
+PFNGLDELETEFRAMEBUFFERSPROC glDeleteFramebuffers_;
+PFNGLCHECKFRAMEBUFFERSTATUSPROC glCheckFramebufferStatus_;
 
 // --- Shaders ---
 
@@ -227,8 +245,8 @@ const char* bg_vs =
     "    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);\n"
     "}\0";
 
-// uGradient: 0=solid, 1=linear, 2=radial
-// Up to 4 color stops via uGradStopCount, uGradColors[], uGradStops[]
+// uGradient: 0=solid, 1=linear, 2=radial, 3=conic, 4=ellipse
+// Up to 8 color stops via uGradStopCount, uGradColors[], uGradStops[]
 // uRadius4: per-corner radius (tl, tr, br, bl in screen orientation).
 // FragPos.y is flipped (0=bottom), so p.y > 0 means the screen-top half.
 const char* bg_fs =
@@ -242,21 +260,42 @@ const char* bg_fs =
     "uniform vec4 uRadius4;\n"
     "uniform int uGradient;\n"
     "uniform int uGradStopCount;\n"
-    "uniform vec4 uGradColors[4];\n"
-    "uniform float uGradStops[4];\n"
+    "uniform vec4 uGradColors[8];\n"
+    "uniform float uGradStops[8];\n"
     "uniform float uGradAngle;\n"
     "uniform vec2 uGradCenter;\n"
     "uniform float uGradRadius;\n"
+    "uniform float uGradRadRx;\n"
+    "uniform float uGradRadRy;\n"
+    "uniform float uFilterBrightness;\n"
+    "uniform float uFilterContrast;\n"
+    "uniform float uFilterSaturate;\n"
+    "uniform float uFilterHue;\n"
+    "uniform int   uFilterMode;\n"
+    "uniform vec2  uPos;\n"
+    "uniform int   uClipEnabled;\n"
+    "uniform vec2  uClipPos;\n"
+    "uniform vec2  uClipSize;\n"
+    "uniform vec4  uClipRadius4;\n"
+    "#define M_PI 3.14159265358979323846\n"
     "float rr_sdf4(vec2 p, vec2 hs, vec4 r) {\n"
     "    float rc = (p.x < 0.0) ? ((p.y > 0.0) ? r.x : r.w) : ((p.y > 0.0) ? r.y : r.z);\n"
     "    vec2 q = abs(p) - hs + vec2(rc);\n"
     "    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rc;\n"
     "}\n"
+    "vec3 hue_rotate(vec3 col, float angle) {\n"
+    "    float c = cos(angle); float s = sin(angle);\n"
+    "    mat3 m = mat3(\n"
+    "        0.213+c*0.787-s*0.213, 0.715-c*0.715-s*0.715, 0.072-c*0.072+s*0.928,\n"
+    "        0.213-c*0.213+s*0.143, 0.715+c*0.285+s*0.140, 0.072-c*0.072-s*0.283,\n"
+    "        0.213-c*0.213-s*0.787, 0.715-c*0.715+s*0.715, 0.072+c*0.928+s*0.072);\n"
+    "    return clamp(m * col, 0.0, 1.0);\n"
+    "}\n"
     "vec4 sampleGradient(float t) {\n"
     "    t = clamp(t, 0.0, 1.0);\n"
     "    if(uGradStopCount <= 1) return uGradColors[0];\n"
     "    if(t <= uGradStops[0]) return uGradColors[0];\n"
-    "    for(int i = 0; i < 3; i++) {\n"
+    "    for(int i = 0; i < 7; i++) {\n"
     "        if(i + 1 >= uGradStopCount) break;\n"
     "        float a = uGradStops[i];\n"
     "        float b = uGradStops[i + 1];\n"
@@ -272,16 +311,37 @@ const char* bg_fs =
     "    float sdf = rr_sdf4(FragPos - halfSize, halfSize, uRadius4);\n"
     "    float alpha = 1.0 - smoothstep(-1.0, 0.5, sdf);\n"
     "    if(alpha <= 0.0) discard;\n"
+    "    if(uClipEnabled != 0) {\n"
+    "        vec2 s = vec2(uPos.x + FragPos.x, uPos.y + uSize.y - FragPos.y);\n"
+    "        vec2 cf = vec2(s.x - uClipPos.x, uClipPos.y + uClipSize.y - s.y);\n"
+    "        vec2 ch = uClipSize * 0.5;\n"
+    "        float csdf = rr_sdf4(cf - ch, ch, uClipRadius4);\n"
+    "        alpha *= 1.0 - smoothstep(-1.0, 0.5, csdf);\n"
+    "        if(alpha <= 0.0) discard;\n"
+    "    }\n"
     "    vec4 baseColor;\n"
     "    if(uGradient == 1) {\n"
     "        float ca = cos(uGradAngle); float sa = sin(uGradAngle);\n"
     "        vec2 uv = FragPos / uSize;\n"
-    "        float t = dot(uv - 0.5, vec2(sa, -ca)) + 0.5;\n"
+    "        float t = dot(vec2(uv.x, 1.0-uv.y) - 0.5, vec2(sa, -ca)) + 0.5;\n"
     "        baseColor = sampleGradient(t);\n"
     "    } else if(uGradient == 2) {\n"
-    "        vec2 c = uGradCenter * uSize;\n"
+    "        vec2 c = vec2(uGradCenter.x, 1.0-uGradCenter.y) * uSize;\n"
     "        float radius = max(uGradRadius * max(uSize.x, uSize.y), 0.001);\n"
     "        float t = distance(FragPos, c) / radius;\n"
+    "        baseColor = sampleGradient(t);\n"
+    "    } else if(uGradient == 3) {\n"
+    "        vec2 c = vec2(uGradCenter.x, 1.0-uGradCenter.y) * uSize;\n"
+    "        vec2 d = FragPos - c;\n"
+    "        float angle = atan(d.y, d.x);\n"
+    "        float t = mod((angle - uGradAngle) / (2.0 * M_PI) + 1.0, 1.0);\n"
+    "        baseColor = sampleGradient(t);\n"
+    "    } else if(uGradient == 4) {\n"
+    "        vec2 c = vec2(uGradCenter.x, 1.0-uGradCenter.y) * uSize;\n"
+    "        vec2 d = FragPos - c;\n"
+    "        float rx = max(uGradRadRx > 0.0 ? uGradRadRx : uSize.x * 0.5, 0.001);\n"
+    "        float ry = max(uGradRadRy > 0.0 ? uGradRadRy : uSize.y * 0.5, 0.001);\n"
+    "        float t = sqrt((d.x * d.x) / (rx * rx) + (d.y * d.y) / (ry * ry));\n"
     "        baseColor = sampleGradient(t);\n"
     "    } else {\n"
     "        baseColor = uColor;\n"
@@ -289,6 +349,15 @@ const char* bg_fs =
     "    float bw = uBorderWidth;\n"
     "    float borderMix = (bw > 0.01) ? smoothstep(-bw - 1.0, -bw + 0.5, sdf) : 0.0;\n"
     "    vec4 finalColor = mix(baseColor, uBorderColor, borderMix);\n"
+    "    if(uFilterMode != 0) {\n"
+    "        vec3 fc = finalColor.rgb;\n"
+    "        fc *= uFilterBrightness;\n"
+    "        fc = (fc - 0.5) * uFilterContrast + 0.5;\n"
+    "        float gray = dot(fc, vec3(0.299, 0.587, 0.114));\n"
+    "        fc = mix(vec3(gray), fc, uFilterSaturate);\n"
+    "        if(uFilterHue != 0.0) fc = hue_rotate(fc, uFilterHue);\n"
+    "        finalColor.rgb = clamp(fc, 0.0, 1.0);\n"
+    "    }\n"
     "    FragColor = vec4(finalColor.rgb, finalColor.a * alpha);\n"
     "}\0";
 
@@ -407,10 +476,78 @@ const char* img_fs =
     "    FragColor = vec4(tc.rgb, tc.a * alpha * uAlpha);\n"
     "}\0";
 
-#define MAX_GRAD_STOPS 4
-#define GRAD_NONE   0
-#define GRAD_LINEAR 1
-#define GRAD_RADIAL 2
+// Backdrop blur: separable 9-tap Gaussian, applied once per axis.
+// bg_vs is reused as vertex shader with uPos=(elem_x,elem_y), uSize=(w,h).
+// FragPos goes from (0,0) to (w,h) with y-flip (0=bottom).
+// uBlurDir = (1/fbw, 0) horizontal or (0, 1/fbh) vertical.
+// uBlurRadius = blur radius in pixels; uBlurTexSize = (fbw, fbh).
+// uBlurOrigin = (elem_x, elem_y) — where the element sits in screen coords
+//               so we can compute correct UV into the full-window capture texture.
+const char* blur_fs =
+    "#version 330 core\n"
+    "in vec2 FragPos;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D uSrc;\n"
+    "uniform vec2 uBlurDir;\n"
+    "uniform float uBlurRadius;\n"
+    "uniform vec2 uBlurTexSize;\n"
+    "uniform vec2 uBlurOrigin;\n"
+    "void main() {\n"
+    "    vec2 screenPos = uBlurOrigin + vec2(FragPos.x, uBlurTexSize.y - FragPos.y - (uBlurTexSize.y - uBlurOrigin.y - uBlurTexSize.y));\n"
+    /* Simpler: FragPos is in element-local coords (0..w, 0..h y-flipped).
+       Screen position: x = origin.x + FragPos.x; y = origin.y + (h - FragPos.y)
+       UV into full window texture: uv = screenPos / texSize */
+    "    float h = textureSize(uSrc, 0).y;\n"
+    "    vec2 sp = vec2(uBlurOrigin.x + FragPos.x, uBlurOrigin.y + h - FragPos.y);\n"
+    "    vec2 uv = sp / uBlurTexSize;\n"
+    "    float r = max(uBlurRadius, 0.5);\n"
+    "    float sigma = r * 0.35 + 0.5;\n"
+    "    vec4 col = vec4(0.0);\n"
+    "    float wsum = 0.0;\n"
+    "    for(int i = -4; i <= 4; i++) {\n"
+    "        float fi = float(i) * (r / 4.0);\n"
+    "        float w = exp(-(fi * fi) / (2.0 * sigma * sigma));\n"
+    "        vec2 suv = clamp(uv + uBlurDir * fi, vec2(0.0), vec2(1.0));\n"
+    "        col += texture(uSrc, suv) * w;\n"
+    "        wsum += w;\n"
+    "    }\n"
+    "    FragColor = col / max(wsum, 0.001);\n"
+    "}\0";
+
+// Backdrop composite: draws a blurred texture clipped to a rounded rect.
+// Uses bg_vs. FragPos local coord.
+const char* backdrop_fs =
+    "#version 330 core\n"
+    "in vec2 FragPos;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D uSrc;\n"
+    "uniform vec2 uSize;\n"
+    "uniform vec4 uRadius4;\n"
+    "uniform vec2 uBlurTexSize;\n"
+    "uniform vec2 uBlurOrigin;\n"
+    "float rr_sdf4(vec2 p, vec2 hs, vec4 r) {\n"
+    "    float rc = (p.x < 0.0) ? ((p.y > 0.0) ? r.x : r.w) : ((p.y > 0.0) ? r.y : r.z);\n"
+    "    vec2 q = abs(p) - hs + vec2(rc);\n"
+    "    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rc;\n"
+    "}\n"
+    "void main() {\n"
+    "    vec2 halfSize = uSize / 2.0;\n"
+    "    float sdf = rr_sdf4(FragPos - halfSize, halfSize, uRadius4);\n"
+    "    float alpha = 1.0 - smoothstep(-1.0, 0.5, sdf);\n"
+    "    if(alpha <= 0.0) discard;\n"
+    "    float th = uBlurTexSize.y;\n"
+    "    vec2 sp = vec2(uBlurOrigin.x + FragPos.x, uBlurOrigin.y + th - FragPos.y);\n"
+    "    vec2 uv = sp / uBlurTexSize;\n"
+    "    vec4 tc = texture(uSrc, clamp(uv, vec2(0.0), vec2(1.0)));\n"
+    "    FragColor = vec4(tc.rgb, alpha);\n"
+    "}\0";
+
+#define MAX_GRAD_STOPS 8
+#define GRAD_NONE    0
+#define GRAD_LINEAR  1
+#define GRAD_RADIAL  2
+#define GRAD_CONIC   3
+#define GRAD_ELLIPSE 4
 
 #define FLEX_DIR_ROW    0
 #define FLEX_DIR_COLUMN 1
@@ -460,6 +597,21 @@ typedef struct {
     char name[32];
     int col, row, col_span, row_span;
 } GridAreaRect;
+
+/* One CSS background layer (background: grad1, grad2, ...) */
+#define LUNA_MAX_BG_LAYERS 4
+typedef struct {
+    int  has_gradient; int grad_type;
+    int  grad_stop_count;
+    float grad_stop_pos[MAX_GRAD_STOPS];
+    float grad_stop_r[MAX_GRAD_STOPS], grad_stop_g[MAX_GRAD_STOPS];
+    float grad_stop_b[MAX_GRAD_STOPS], grad_stop_a[MAX_GRAD_STOPS];
+    float grad_angle;
+    float grad_rad_cx, grad_rad_cy, grad_rad_r;
+    float grad_rad_rx, grad_rad_ry; /* ellipse radii */
+    int  has_color; float r, g, b, a;
+    int  has_bg_image; char image_path[256];
+} LunaBgLayer;
 
 /* One CSS box-shadow layer (multiple layers per element supported). */
 #define LUNA_MAX_SHADOWS 4
@@ -523,6 +675,13 @@ struct LunaElement {
     float r, g, b, a;
     float t_r, t_g, t_b, t_a;
     float bd_r, bd_g, bd_b, bd_a;
+    /* per-side borders (drawn as thin rects, independent of unified border_width) */
+    int has_border_top, has_border_right, has_border_bottom, has_border_left;
+    float border_top_w, border_right_w, border_bottom_w, border_left_w;
+    float border_top_r, border_top_g, border_top_b, border_top_a;
+    float border_right_r, border_right_g, border_right_b, border_right_a;
+    float border_bottom_r, border_bottom_g, border_bottom_b, border_bottom_a;
+    float border_left_r, border_left_g, border_left_b, border_left_a;
 
     float cur_r, cur_g, cur_b, cur_a;
     float cur_bd_r, cur_bd_g, cur_bd_b, cur_bd_a;
@@ -564,7 +723,7 @@ struct LunaElement {
     int shadow_count;
     LunaShadow shadows[LUNA_MAX_SHADOWS];
 
-    // Gradient: type 0=none 1=linear 2=radial
+    // Gradient: type 0=none 1=linear 2=radial 3=conic 4=ellipse
     int has_gradient;
     int grad_type;
     int grad_stop_count;
@@ -573,6 +732,15 @@ struct LunaElement {
     float grad_stop_b[MAX_GRAD_STOPS], grad_stop_a[MAX_GRAD_STOPS];
     float grad_angle;
     float grad_rad_cx, grad_rad_cy, grad_rad_r;
+    float grad_rad_rx, grad_rad_ry; /* ellipse radii in pixels; 0=use grad_rad_r */
+
+    /* Multiple background layers (background: grad1, grad2, ...) */
+    LunaBgLayer bg_layers[LUNA_MAX_BG_LAYERS];
+    int bg_layer_count;
+
+    /* backdrop-filter: blur() */
+    int has_backdrop_blur;
+    float backdrop_blur_radius;
 
     int display_mode; // 0 block 1 none 2 flex 3 grid
     int flex_direction;
@@ -658,6 +826,25 @@ struct LunaElement {
     char inline_style[256];
     int has_inline_style;
 
+    /* CSS filter */
+    int has_filter;
+    float filter_brightness; /* 1.0 = no change */
+    float filter_contrast;   /* 1.0 = no change */
+    float filter_saturate;   /* 1.0 = no change */
+    float filter_hue;        /* radians */
+
+    /* font-style */
+    int font_italic;
+
+    /* aspect-ratio */
+    int has_aspect_ratio;
+    float aspect_ratio; /* w/h */
+
+    /* background-size / background-position */
+    int bg_size_mode;   /* 0=auto 1=cover 2=contain 3=explicit */
+    float bg_size_w, bg_size_h;
+    float bg_pos_x, bg_pos_y;
+
     /* CSS @keyframes animation state */
     char anim_name[64];
     float anim_duration;
@@ -719,6 +906,12 @@ typedef struct {
     int has_color;  float c_r,  c_g,  c_b,  c_a;
     int has_caret_color; float caret_r, caret_g, caret_b, caret_a;
     int has_border; float bd_r, bd_g, bd_b, bd_a; float border_width;
+    int has_border_top, has_border_right, has_border_bottom, has_border_left;
+    float border_top_w, border_right_w, border_bottom_w, border_left_w;
+    float border_top_r, border_top_g, border_top_b, border_top_a;
+    float border_right_r, border_right_g, border_right_b, border_right_a;
+    float border_bottom_r, border_bottom_g, border_bottom_b, border_bottom_a;
+    float border_left_r, border_left_g, border_left_b, border_left_a;
     int has_outline; float outline_width, outline_offset;
     float ol_r, ol_g, ol_b, ol_a;
     int has_radius; float border_radius;
@@ -820,7 +1013,7 @@ typedef struct {
     int has_content; char content[128];
     int pseudo_elem; /* 0=none 1=before 2=after */
 
-    // Gradient
+    // Gradient: 0=none 1=linear 2=radial 3=conic 4=ellipse
     int has_gradient;
     int grad_type;
     int grad_stop_count;
@@ -829,6 +1022,15 @@ typedef struct {
     float grad_stop_b[MAX_GRAD_STOPS], grad_stop_a[MAX_GRAD_STOPS];
     float grad_angle;
     float grad_rad_cx, grad_rad_cy, grad_rad_r;
+    float grad_rad_rx, grad_rad_ry; /* ellipse radii */
+
+    /* Multiple background layers */
+    LunaBgLayer bg_layers[LUNA_MAX_BG_LAYERS];
+    int bg_layer_count;
+
+    /* backdrop-filter */
+    int has_backdrop_blur;
+    float backdrop_blur_radius;
 
     int has_z_index; int z_index;
 
@@ -856,6 +1058,21 @@ typedef struct {
 
     int has_bg_image;
     char bg_image_path[256];
+
+    /* CSS filter */
+    int has_filter;
+    float filter_brightness, filter_contrast, filter_saturate, filter_hue;
+
+    /* font-style */
+    int has_font_italic; int font_italic;
+
+    /* aspect-ratio */
+    int has_aspect_ratio; float aspect_ratio;
+
+    /* background-size / background-position */
+    int has_bg_size; int bg_size_mode;
+    float bg_size_w, bg_size_h;
+    int has_bg_pos; float bg_pos_x, bg_pos_y;
 } StyleRule;
 
 #define MAX_KF_ANIMS 48
@@ -894,13 +1111,35 @@ int g_js_handler_count = 0;
 static int render_order[MAX_ELEMENTS];
 
 GLuint bg_program, text_program, shadow_program, img_program;
+GLuint blur_program, backdrop_program;
+
+/* GL program tracking — avoids redundant glUseProgram calls */
+static GLuint g_current_program = 0;
+static void luna_use_program(GLuint prog) {
+    if (prog != g_current_program) { glUseProgram(prog); g_current_program = prog; }
+}
+
+/* FBO state for backdrop-filter: blur() */
+static GLuint g_blur_fbo[2]  = {0, 0};
+static GLuint g_blur_tex[2]  = {0, 0};
+static int    g_blur_tex_w   = 0;
+static int    g_blur_tex_h   = 0;
 
 // Cached uniform locations
 static struct {
     GLint uResolution, uPos, uSize, uColor, uBorderColor, uBorderWidth, uRadius4;
     GLint uGradient, uGradStopCount, uGradAngle, uGradCenter, uGradRadius;
+    GLint uGradRadRx, uGradRadRy;
     GLint uGradColors[MAX_GRAD_STOPS], uGradStops[MAX_GRAD_STOPS];
+    GLint uFilterMode, uFilterBrightness, uFilterContrast, uFilterSaturate, uFilterHue;
+    GLint uClipEnabled, uClipPos, uClipSize, uClipRadius4;
 } bg_loc;
+/* Global rounded-clip state for bg_fs: set before each draw_rect_full call */
+static int   g_bg_clip_enabled = 0;
+static float g_bg_clip_pos[2]  = {0, 0};
+static float g_bg_clip_size[2] = {0, 0};
+static float g_bg_clip_rad4[4] = {0, 0, 0, 0};
+
 static struct {
     GLint uResolution, uPos, uSize;
     GLint uShadowColor, uElemSize, uRadius4, uBlur, uSpread, uInsetMode, uShadowInset, uOffset;
@@ -911,6 +1150,14 @@ static struct {
 static struct {
     GLint uResolution, uPos, uSize, uRadius, uAlpha, uImage;
 } img_loc;
+static struct {
+    GLint uResolution, uPos, uSize;
+    GLint uSrc, uBlurDir, uBlurRadius, uBlurTexSize, uBlurOrigin;
+} blur_loc;
+static struct {
+    GLint uResolution, uPos, uSize, uRadius4;
+    GLint uSrc, uBlurTexSize, uBlurOrigin;
+} backdrop_loc;
 
 // Texture cache — path → GL texture ID (loaded once, reused)
 #define MAX_TEXTURES 64
@@ -1697,6 +1944,7 @@ static void parse_linear_gradient(const char* val, StyleRule* rule) {
 }
 
 // Parse radial-gradient(shape at cx cy, stops...)
+// Handles: circle at x% y%, ellipse at x% y%, ellipse Wpx Hpx at x% y%
 static void parse_radial_gradient(const char* val, StyleRule* rule) {
     const char* p = strchr(val, '(');
     if (!p) return;
@@ -1704,27 +1952,69 @@ static void parse_radial_gradient(const char* val, StyleRule* rule) {
     while (isspace((unsigned char)*p)) p++;
 
     float cx = 0.5f, cy = 0.5f, radius = 0.75f;
-    if (strncmp(p, "circle", 6) == 0 || strncmp(p, "ellipse", 7) == 0) {
-        while (*p && *p != ',' && *p != 'a') p++;
+    float rx = 0.0f, ry = 0.0f; /* ellipse explicit radii in pixels */
+    int is_ellipse = 0;
+
+    if (strncmp(p, "ellipse", 7) == 0) {
+        is_ellipse = 1;
+        p += 7;
+        while (isspace((unsigned char)*p)) p++;
+        /* Check for explicit size: ellipse Wpx Hpx at ... */
+        if (*p != 'a' && *p != ',') {
+            char* endp;
+            float v1 = strtof(p, &endp);
+            if (endp != p) {
+                /* skip unit */
+                while (*endp && !isspace((unsigned char)*endp) && *endp != ',') endp++;
+                p = endp;
+                while (isspace((unsigned char)*p)) p++;
+                float v2 = strtof(p, &endp);
+                if (endp != p) {
+                    while (*endp && !isspace((unsigned char)*endp) && *endp != ',') endp++;
+                    p = endp;
+                    rx = v1; ry = v2;
+                }
+            }
+        }
+        while (isspace((unsigned char)*p)) p++;
+    } else if (strncmp(p, "circle", 6) == 0) {
+        p += 6;
+        while (isspace((unsigned char)*p)) p++;
+        /* skip optional radius */
+        if (*p != 'a' && *p != ',') {
+            char* endp;
+            (void)strtof(p, &endp);
+            if (endp != p) {
+                while (*endp && !isspace((unsigned char)*endp) && *endp != ',') endp++;
+                p = endp;
+            }
+        }
+        while (isspace((unsigned char)*p)) p++;
     }
-    while (isspace((unsigned char)*p)) p++;
+
     if (strncmp(p, "at ", 3) == 0) {
         p += 3;
+        while (isspace((unsigned char)*p)) p++;
         if (strncmp(p, "center", 6) == 0) {
             cx = 0.5f; cy = 0.5f;
-            p = strchr(p, ',');
-            if (p) p++;
+            p += 6;
+            while (isspace((unsigned char)*p)) p++;
+            if (*p == ',') p++;
         } else {
             char* endp;
             float vx = strtof(p, &endp);
+            int pct_x = 0;
             p = endp;
-            if (*p == '%') p++;
+            if (*p == '%') { pct_x = 1; p++; }
+            else { /* px */ while (*p && *p != ' ' && *p != ',') p++; }
             while (isspace((unsigned char)*p)) p++;
             float vy = strtof(p, &endp);
+            int pct_y = 0;
             p = endp;
-            if (*p == '%') p++;
-            cx = vx / 100.0f;
-            cy = vy / 100.0f;
+            if (*p == '%') { pct_y = 1; p++; }
+            else { while (*p && *p != ',' ) p++; }
+            cx = pct_x ? vx / 100.0f : 0.5f;
+            cy = pct_y ? vy / 100.0f : 0.5f;
             while (isspace((unsigned char)*p)) p++;
             if (*p == ',') p++;
         }
@@ -1737,7 +2027,88 @@ static void parse_radial_gradient(const char* val, StyleRule* rule) {
     parse_gradient_stops(&p, rule);
     if (rule->grad_stop_count < 2) return;
 
-    apply_gradient_rule(rule, GRAD_RADIAL, 0.0f, cx, cy, radius);
+    if (is_ellipse && (rx > 0.0f || ry > 0.0f)) {
+        /* Explicit ellipse radii: use GRAD_ELLIPSE */
+        rule->has_gradient = 1;
+        rule->grad_type = GRAD_ELLIPSE;
+        rule->grad_angle = 0.0f;
+        rule->grad_rad_cx = cx;
+        rule->grad_rad_cy = cy;
+        rule->grad_rad_r  = 0.75f;
+        rule->grad_rad_rx = rx;
+        rule->grad_rad_ry = ry;
+    } else if (is_ellipse) {
+        /* Ellipse without explicit radii: use GRAD_ELLIPSE with rx=ry=0 (shader uses element size) */
+        rule->has_gradient = 1;
+        rule->grad_type = GRAD_ELLIPSE;
+        rule->grad_angle = 0.0f;
+        rule->grad_rad_cx = cx;
+        rule->grad_rad_cy = cy;
+        rule->grad_rad_r  = 0.75f;
+        rule->grad_rad_rx = 0.0f;
+        rule->grad_rad_ry = 0.0f;
+    } else {
+        apply_gradient_rule(rule, GRAD_RADIAL, 0.0f, cx, cy, radius);
+    }
+}
+
+// Parse conic-gradient(from Adeg at x% y%, stop1, stop2, ...)
+static void parse_conic_gradient(const char* val, StyleRule* rule) {
+    const char* p = strchr(val, '(');
+    if (!p) return;
+    p++;
+    while (isspace((unsigned char)*p)) p++;
+
+    float from_angle = 0.0f;
+    float cx = 0.5f, cy = 0.5f;
+
+    if (strncmp(p, "from ", 5) == 0) {
+        p += 5;
+        while (isspace((unsigned char)*p)) p++;
+        char* endp;
+        from_angle = strtof(p, &endp);
+        p = endp;
+        if (strncmp(p, "deg", 3) == 0) p += 3;
+        while (isspace((unsigned char)*p)) p++;
+        if (strncmp(p, "at ", 3) == 0) {
+            p += 3;
+            while (isspace((unsigned char)*p)) p++;
+            float vx = strtof(p, &endp); p = endp;
+            if (*p == '%') p++;
+            while (isspace((unsigned char)*p)) p++;
+            float vy = strtof(p, &endp); p = endp;
+            if (*p == '%') p++;
+            cx = vx / 100.0f; cy = vy / 100.0f;
+        }
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == ',') p++;
+    } else if (strncmp(p, "at ", 3) == 0) {
+        p += 3;
+        char* endp;
+        float vx = strtof(p, &endp); p = endp;
+        if (*p == '%') p++;
+        while (isspace((unsigned char)*p)) p++;
+        float vy = strtof(p, &endp); p = endp;
+        if (*p == '%') p++;
+        cx = vx / 100.0f; cy = vy / 100.0f;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == ',') p++;
+    }
+    while (isspace((unsigned char)*p)) p++;
+
+    memset(rule->grad_stop_pos, 0, sizeof(rule->grad_stop_pos));
+    parse_gradient_stops(&p, rule);
+    if (rule->grad_stop_count < 2) return;
+
+    float angle_rad = from_angle * (float)M_PI / 180.0f;
+    rule->has_gradient = 1;
+    rule->grad_type    = GRAD_CONIC;
+    rule->grad_angle   = angle_rad;
+    rule->grad_rad_cx  = cx;
+    rule->grad_rad_cy  = cy;
+    rule->grad_rad_r   = 0.75f;
+    rule->grad_rad_rx  = 0.0f;
+    rule->grad_rad_ry  = 0.0f;
 }
 
 // Parse url(...) helper: extracts the path into out_path (max len), returns 1 on success
@@ -1755,9 +2126,62 @@ static int parse_url(const char* val, char* out_path, int max_len) {
     return 1;
 }
 
+/* Copy gradient info from a StyleRule into a LunaBgLayer */
+static void rule_to_bg_layer(const StyleRule* rule, LunaBgLayer* layer) {
+    memset(layer, 0, sizeof(*layer));
+    layer->has_gradient = rule->has_gradient;
+    layer->grad_type    = rule->grad_type;
+    layer->grad_stop_count = rule->grad_stop_count;
+    layer->grad_angle   = rule->grad_angle;
+    layer->grad_rad_cx  = rule->grad_rad_cx;
+    layer->grad_rad_cy  = rule->grad_rad_cy;
+    layer->grad_rad_r   = rule->grad_rad_r;
+    layer->grad_rad_rx  = rule->grad_rad_rx;
+    layer->grad_rad_ry  = rule->grad_rad_ry;
+    for (int i = 0; i < rule->grad_stop_count && i < MAX_GRAD_STOPS; i++) {
+        layer->grad_stop_pos[i] = rule->grad_stop_pos[i];
+        layer->grad_stop_r[i]   = rule->grad_stop_r[i];
+        layer->grad_stop_g[i]   = rule->grad_stop_g[i];
+        layer->grad_stop_b[i]   = rule->grad_stop_b[i];
+        layer->grad_stop_a[i]   = rule->grad_stop_a[i];
+    }
+    layer->has_color = rule->has_bg;
+    layer->r = rule->bg_r; layer->g = rule->bg_g;
+    layer->b = rule->bg_b; layer->a = rule->bg_a;
+    layer->has_bg_image = rule->has_bg_image;
+    if (rule->has_bg_image)
+        strncpy(layer->image_path, rule->bg_image_path, sizeof(layer->image_path) - 1);
+}
+
+/* Split a CSS value string on top-level commas (commas inside () are not separators).
+   Returns number of pieces; fills pieces[] with null-terminated strings into buf. */
+static int split_top_level_commas(const char* val, char* buf, int bufsz,
+                                   char* pieces[], int max_pieces) {
+    strncpy(buf, val, (size_t)(bufsz - 1));
+    buf[bufsz - 1] = '\0';
+    int count = 0;
+    char* p = buf;
+    char* start = p;
+    int depth = 0;
+    while (*p && count < max_pieces - 1) {
+        if (*p == '(') depth++;
+        else if (*p == ')') { if (depth > 0) depth--; }
+        else if (*p == ',' && depth == 0) {
+            *p = '\0';
+            pieces[count++] = start;
+            start = p + 1;
+            while (*start == ' ') start++;
+        }
+        p++;
+    }
+    pieces[count++] = start;
+    return count;
+}
+
 // Parse background shorthand: color, gradient, or url(...)
+// Supports comma-separated multiple background layers.
 static void parse_background_shorthand(const char* val, StyleRule* rule) {
-    char buf[512];
+    char buf[1024];
     strncpy(buf, val, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     trim_whitespace(buf);
@@ -1765,22 +2189,89 @@ static void parse_background_shorthand(const char* val, StyleRule* rule) {
         rule->has_bg = 0;
         return;
     }
-    if (strncmp(buf, "url(", 4) == 0) {
-        char path[256];
-        if (parse_url(buf, path, sizeof(path))) {
-            rule->has_bg_image = 1;
-            strncpy(rule->bg_image_path, path, sizeof(rule->bg_image_path) - 1);
-            rule->bg_image_path[sizeof(rule->bg_image_path) - 1] = '\0';
+
+    /* Split into layers at top-level commas */
+    char layer_buf[1024];
+    char* pieces[LUNA_MAX_BG_LAYERS + 1];
+    int n = split_top_level_commas(buf, layer_buf, sizeof(layer_buf), pieces, LUNA_MAX_BG_LAYERS + 1);
+
+    if (n <= 1) {
+        /* Single layer — fast path, keep existing behaviour */
+        if (strncmp(buf, "url(", 4) == 0) {
+            char path[256];
+            if (parse_url(buf, path, sizeof(path))) {
+                rule->has_bg_image = 1;
+                strncpy(rule->bg_image_path, path, sizeof(rule->bg_image_path) - 1);
+                rule->bg_image_path[sizeof(rule->bg_image_path) - 1] = '\0';
+            }
+            return;
+        }
+        if (strncmp(buf, "linear-gradient", 15) == 0) {
+            parse_linear_gradient(buf, rule);
+        } else if (strncmp(buf, "radial-gradient", 15) == 0) {
+            parse_radial_gradient(buf, rule);
+        } else if (strncmp(buf, "conic-gradient", 14) == 0) {
+            parse_conic_gradient(buf, rule);
+        } else {
+            rule->has_bg = 1;
+            parse_color(buf, &rule->bg_r, &rule->bg_g, &rule->bg_b, &rule->bg_a);
         }
         return;
     }
-    if (strncmp(buf, "linear-gradient", 15) == 0) {
-        parse_linear_gradient(buf, rule);
-    } else if (strncmp(buf, "radial-gradient", 15) == 0) {
-        parse_radial_gradient(buf, rule);
-    } else {
-        rule->has_bg = 1;
-        parse_color(buf, &rule->bg_r, &rule->bg_g, &rule->bg_b, &rule->bg_a);
+
+    /* Multiple layers */
+    rule->bg_layer_count = 0;
+    for (int li = 0; li < n && li < LUNA_MAX_BG_LAYERS; li++) {
+        char* piece = pieces[li];
+        trim_whitespace(piece);
+        if (!piece[0]) continue;
+
+        /* Parse into a temporary rule to capture gradient info */
+        StyleRule tmp; memset(&tmp, 0, sizeof(tmp));
+        if (strncmp(piece, "linear-gradient", 15) == 0) {
+            parse_linear_gradient(piece, &tmp);
+        } else if (strncmp(piece, "radial-gradient", 15) == 0) {
+            parse_radial_gradient(piece, &tmp);
+        } else if (strncmp(piece, "conic-gradient", 14) == 0) {
+            parse_conic_gradient(piece, &tmp);
+        } else if (strncmp(piece, "url(", 4) == 0) {
+            char path[256];
+            if (parse_url(piece, path, sizeof(path))) {
+                tmp.has_bg_image = 1;
+                strncpy(tmp.bg_image_path, path, sizeof(tmp.bg_image_path) - 1);
+            }
+        } else {
+            tmp.has_bg = 1;
+            parse_color(piece, &tmp.bg_r, &tmp.bg_g, &tmp.bg_b, &tmp.bg_a);
+        }
+        rule_to_bg_layer(&tmp, &rule->bg_layers[rule->bg_layer_count++]);
+    }
+    /* For compatibility, also set the primary gradient from the LAST layer
+       (bottom-most, per CSS stacking order — layers are listed front-to-back). */
+    if (rule->bg_layer_count > 0) {
+        LunaBgLayer* last = &rule->bg_layers[rule->bg_layer_count - 1];
+        if (last->has_gradient) {
+            rule->has_gradient  = last->has_gradient;
+            rule->grad_type     = last->grad_type;
+            rule->grad_stop_count = last->grad_stop_count;
+            rule->grad_angle    = last->grad_angle;
+            rule->grad_rad_cx   = last->grad_rad_cx;
+            rule->grad_rad_cy   = last->grad_rad_cy;
+            rule->grad_rad_r    = last->grad_rad_r;
+            rule->grad_rad_rx   = last->grad_rad_rx;
+            rule->grad_rad_ry   = last->grad_rad_ry;
+            for (int s = 0; s < last->grad_stop_count && s < MAX_GRAD_STOPS; s++) {
+                rule->grad_stop_pos[s] = last->grad_stop_pos[s];
+                rule->grad_stop_r[s]   = last->grad_stop_r[s];
+                rule->grad_stop_g[s]   = last->grad_stop_g[s];
+                rule->grad_stop_b[s]   = last->grad_stop_b[s];
+                rule->grad_stop_a[s]   = last->grad_stop_a[s];
+            }
+        } else if (last->has_color) {
+            rule->has_bg = 1;
+            rule->bg_r = last->r; rule->bg_g = last->g;
+            rule->bg_b = last->b; rule->bg_a = last->a;
+        }
     }
 }
 
@@ -2624,8 +3115,14 @@ static int match_selector_chain(StyleRule* r, int a, int node) {
 }
 
 int selector_matches(StyleRule* r, LunaElement* e) {
-    /* Pseudo-element rules are filtered at ingest; never match DOM nodes. */
+    /* Pseudo-element rules never match regular DOM nodes. */
     if (r->pseudo_elem) return 0;
+    if (!simple_selector_matches(&r->target, e)) return 0;
+    return match_selector_chain(r, 0, (int)(e - elements));
+}
+
+/* Like selector_matches but for pseudo-element rules — ignores pseudo_elem guard */
+static int selector_matches_pseudo(StyleRule* r, LunaElement* e) {
     if (!simple_selector_matches(&r->target, e)) return 0;
     return match_selector_chain(r, 0, (int)(e - elements));
 }
@@ -2715,16 +3212,40 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             else if (strcmp(key, "border") == 0)           { parse_border_shorthand(val, rule); }
             else if (strcmp(key, "border-top") == 0 || strcmp(key, "border-right") == 0 ||
                      strcmp(key, "border-bottom") == 0 || strcmp(key, "border-left") == 0) {
-                /* Directional border: parse color only; do NOT set border_width
-                   (that would inflate element dimensions).  We only need the
-                   color for the divider effect rendered via the uniform border. */
-                float cr, cg, cb, ca = 1.0f;
-                const char* sp = val;
-                while (*sp && (*sp == ' ' || isdigit((unsigned char)*sp) || *sp == '.' || *sp == 'p' || *sp == 'x')) sp++;
-                if (*sp == ' ') sp++;
-                /* skip "solid"/"dashed"/"none" keyword */
-                while (*sp && !(*sp == 'r' || *sp == '#' || *sp == 'h' || *sp == 't')) sp++;
-                if (*sp) { parse_color(sp, &cr, &cg, &cb, &ca); rule->has_border = 1; rule->bd_r = cr; rule->bd_g = cg; rule->bd_b = cb; rule->bd_a = ca; }
+                float bw = 0.0f, cr = 0.0f, cg = 0.0f, cb = 0.0f, ca = 0.0f;
+                int is_none = (strcmp(val, "none") == 0 || strcmp(val, "0") == 0);
+                if (!is_none) {
+                    char buf2[256]; strncpy(buf2, val, 255); buf2[255] = 0;
+                    char* sp2 = buf2;
+                    char* ep2;
+                    bw = strtof(sp2, &ep2);
+                    if (ep2 != sp2) sp2 = ep2;
+                    while (*sp2 && !isspace((unsigned char)*sp2)) sp2++;
+                    while (isspace((unsigned char)*sp2)) sp2++;
+                    if (strncmp(sp2,"solid",5)==0||strncmp(sp2,"dashed",6)==0||strncmp(sp2,"dotted",6)==0) {
+                        while (*sp2 && !isspace((unsigned char)*sp2)) sp2++;
+                        while (isspace((unsigned char)*sp2)) sp2++;
+                    }
+                    ca = 1.0f;
+                    if (*sp2) parse_color(sp2, &cr, &cg, &cb, &ca);
+                }
+                if (strcmp(key, "border-top") == 0) {
+                    rule->has_border_top = 1; rule->border_top_w = bw;
+                    rule->border_top_r = cr; rule->border_top_g = cg;
+                    rule->border_top_b = cb; rule->border_top_a = ca;
+                } else if (strcmp(key, "border-right") == 0) {
+                    rule->has_border_right = 1; rule->border_right_w = bw;
+                    rule->border_right_r = cr; rule->border_right_g = cg;
+                    rule->border_right_b = cb; rule->border_right_a = ca;
+                } else if (strcmp(key, "border-bottom") == 0) {
+                    rule->has_border_bottom = 1; rule->border_bottom_w = bw;
+                    rule->border_bottom_r = cr; rule->border_bottom_g = cg;
+                    rule->border_bottom_b = cb; rule->border_bottom_a = ca;
+                } else {
+                    rule->has_border_left = 1; rule->border_left_w = bw;
+                    rule->border_left_r = cr; rule->border_left_g = cg;
+                    rule->border_left_b = cb; rule->border_left_a = ca;
+                }
             }
             else if (strcmp(key, "width") == 0) {
                 if (strcmp(val,"fit-content")==0 || strcmp(val,"max-content")==0 || strcmp(val,"min-content")==0) {
@@ -3223,8 +3744,33 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             }
             else if (strcmp(key, "border-top-color") == 0 || strcmp(key, "border-right-color") == 0 ||
                      strcmp(key, "border-bottom-color") == 0 || strcmp(key, "border-left-color") == 0) {
-                rule->has_border = 1;
-                parse_color(val, &rule->bd_r, &rule->bd_g, &rule->bd_b, &rule->bd_a);
+                float cr = 0, cg = 0, cb = 0, ca = 1.0f;
+                parse_color(val, &cr, &cg, &cb, &ca);
+                if (strcmp(key, "border-top-color") == 0) {
+                    rule->has_border_top = 1;
+                    rule->border_top_r = cr; rule->border_top_g = cg;
+                    rule->border_top_b = cb; rule->border_top_a = ca;
+                } else if (strcmp(key, "border-right-color") == 0) {
+                    rule->has_border_right = 1;
+                    rule->border_right_r = cr; rule->border_right_g = cg;
+                    rule->border_right_b = cb; rule->border_right_a = ca;
+                } else if (strcmp(key, "border-bottom-color") == 0) {
+                    rule->has_border_bottom = 1;
+                    rule->border_bottom_r = cr; rule->border_bottom_g = cg;
+                    rule->border_bottom_b = cb; rule->border_bottom_a = ca;
+                } else {
+                    rule->has_border_left = 1;
+                    rule->border_left_r = cr; rule->border_left_g = cg;
+                    rule->border_left_b = cb; rule->border_left_a = ca;
+                }
+            }
+            else if (strcmp(key, "border-top-width") == 0 || strcmp(key, "border-right-width") == 0 ||
+                     strcmp(key, "border-bottom-width") == 0 || strcmp(key, "border-left-width") == 0) {
+                float bw2 = parse_float_val(val);
+                if (strcmp(key, "border-top-width") == 0)    { rule->has_border_top = 1;    rule->border_top_w = bw2; }
+                else if (strcmp(key, "border-right-width") == 0)  { rule->has_border_right = 1;  rule->border_right_w = bw2; }
+                else if (strcmp(key, "border-bottom-width") == 0) { rule->has_border_bottom = 1; rule->border_bottom_w = bw2; }
+                else                                          { rule->has_border_left = 1;   rule->border_left_w = bw2; }
             }
             else if (strcmp(key, "content") == 0) {
                 rule->has_content = 1;
@@ -3243,9 +3789,96 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                     strncpy(rule->content, val, sizeof(rule->content) - 1);
                 }
             }
+            else if (strcmp(key, "filter") == 0) {
+                rule->has_filter = 1;
+                rule->filter_brightness = 1.0f;
+                rule->filter_contrast   = 1.0f;
+                rule->filter_saturate   = 1.0f;
+                rule->filter_hue        = 0.0f;
+                const char* fp = val;
+                while (*fp) {
+                    while (isspace((unsigned char)*fp)) fp++;
+                    if (strncmp(fp, "brightness(", 11) == 0) {
+                        fp += 11;
+                        rule->filter_brightness = strtof(fp, (char**)&fp);
+                        while (*fp && *fp != ')') fp++;
+                        if (*fp == ')') fp++;
+                    } else if (strncmp(fp, "contrast(", 9) == 0) {
+                        fp += 9;
+                        rule->filter_contrast = strtof(fp, (char**)&fp);
+                        if (rule->filter_contrast > 2.0f) rule->filter_contrast /= 100.0f; /* % form */
+                        while (*fp && *fp != ')') fp++;
+                        if (*fp == ')') fp++;
+                    } else if (strncmp(fp, "saturate(", 9) == 0) {
+                        fp += 9;
+                        rule->filter_saturate = strtof(fp, (char**)&fp);
+                        if (rule->filter_saturate > 5.0f) rule->filter_saturate /= 100.0f;
+                        while (*fp && *fp != ')') fp++;
+                        if (*fp == ')') fp++;
+                    } else if (strncmp(fp, "hue-rotate(", 11) == 0) {
+                        fp += 11;
+                        float deg = strtof(fp, (char**)&fp);
+                        rule->filter_hue = deg * (float)M_PI / 180.0f;
+                        while (*fp && *fp != ')') fp++;
+                        if (*fp == ')') fp++;
+                    } else if (strncmp(fp, "opacity(", 8) == 0) {
+                        fp += 8;
+                        float op = strtof(fp, (char**)&fp);
+                        rule->has_opacity = 1; rule->opacity = op;
+                        while (*fp && *fp != ')') fp++;
+                        if (*fp == ')') fp++;
+                    } else if (strcmp(val, "none") == 0) {
+                        rule->has_filter = 0; break;
+                    } else { break; }
+                }
+            }
+            else if (strcmp(key, "font-style") == 0) {
+                rule->has_font_italic = 1;
+                rule->font_italic = (strncmp(val, "italic", 6) == 0 || strncmp(val, "oblique", 7) == 0) ? 1 : 0;
+            }
+            else if (strcmp(key, "aspect-ratio") == 0) {
+                rule->has_aspect_ratio = 1;
+                float w = strtof(val, NULL);
+                const char* sl = strchr(val, '/');
+                float h = sl ? strtof(sl + 1, NULL) : 1.0f;
+                rule->aspect_ratio = (h > 0.0f) ? w / h : w;
+            }
+            else if (strcmp(key, "background-size") == 0) {
+                rule->has_bg_size = 1;
+                if (strcmp(val, "cover") == 0)   { rule->bg_size_mode = 1; }
+                else if (strcmp(val, "contain") == 0) { rule->bg_size_mode = 2; }
+                else if (strcmp(val, "auto") == 0)    { rule->bg_size_mode = 0; }
+                else {
+                    rule->bg_size_mode = 3;
+                    rule->bg_size_w = parse_float_val(val);
+                    const char* sp2 = strchr(val, ' ');
+                    rule->bg_size_h = sp2 ? parse_float_val(sp2 + 1) : rule->bg_size_w;
+                }
+            }
+            else if (strcmp(key, "background-position") == 0) {
+                rule->has_bg_pos = 1;
+                if (strstr(val, "center")) { rule->bg_pos_x = 0.5f; rule->bg_pos_y = 0.5f; }
+                else {
+                    rule->bg_pos_x = parse_float_val(val) / 100.0f;
+                    const char* sp2 = strchr(val, ' ');
+                    rule->bg_pos_y = sp2 ? parse_float_val(sp2 + 1) / 100.0f : 0.5f;
+                }
+            }
+            else if (strcmp(key, "backdrop-filter") == 0 ||
+                     strcmp(key, "-webkit-backdrop-filter") == 0) {
+                /* Parse blur(Npx) — other functions silently ignored */
+                const char* bp = strstr(val, "blur(");
+                if (bp) {
+                    bp += 5;
+                    char* endp;
+                    float radius = strtof(bp, &endp);
+                    if (endp != bp) {
+                        rule->has_backdrop_blur = 1;
+                        rule->backdrop_blur_radius = radius > 0.0f ? radius : 8.0f;
+                    }
+                }
+            }
             else if (strcmp(key, "font-family") == 0 || strcmp(key, "user-select") == 0 ||
-                     strcmp(key, "filter") == 0 || strcmp(key, "backdrop-filter") == 0 ||
-                     strcmp(key, "-webkit-backdrop-filter") == 0 ||
                      strcmp(key, "-webkit-font-smoothing") == 0) {
                 /* Accepted for CSS parity; drawing stays CSS-box based. */
             }
@@ -3399,17 +4032,28 @@ static void ingest_parsed_rule(const CSSRule *pr) {
         const CSSSelector *cs = &pr->selectors[si];
         if (cs->compound_count == 0) continue;
 
-        /* Drop ::before/::after/::-webkit-scrollbar/... — `*, *::before, *::after`
-           reset rules must not spawn real nodes or they break flex/hit-testing. */
+        /* Check for pseudo-elements (::before, ::after, etc.) in last compound.
+           ::before/::after are kept with pseudo_elem set; others (scrollbar etc.) dropped. */
+        int pseudo_elem_type = 0; /* 0=none 1=before 2=after */
         {
             const CSSCompound *tgt = &cs->compounds[cs->compound_count - 1];
-            for (int pi = 0; pi < tgt->part_count; pi++)
-                if (tgt->parts[pi].type == CSS_SEL_PSEUDO_ELEM) { tgt = NULL; break; }
-            if (!tgt) continue;
+            for (int pi = 0; pi < tgt->part_count; pi++) {
+                if (tgt->parts[pi].type == CSS_SEL_PSEUDO_ELEM) {
+                    const char* pname = tgt->parts[pi].name;
+                    if (strcmp(pname, "before") == 0 || strcmp(pname, "::before") == 0)
+                        pseudo_elem_type = 1;
+                    else if (strcmp(pname, "after") == 0 || strcmp(pname, "::after") == 0)
+                        pseudo_elem_type = 2;
+                    else
+                        pseudo_elem_type = -1; /* unsupported pseudo-elem — drop */
+                    break;
+                }
+            }
+            if (pseudo_elem_type == -1) continue; /* drop unsupported pseudo-elements */
         }
 
         StyleRule rule = tmpl;
-        rule.pseudo_elem = 0;
+        rule.pseudo_elem = pseudo_elem_type;
         int is_hover = 0, is_active = 0, is_focus = 0, is_fvis = 0, is_fwithin = 0;
 
         /* Target = last compound */
@@ -3596,6 +4240,9 @@ void update_element_style(LunaElement* e) {
     if (!e->has_custom_color)  { e->t_r = 0.1f; e->t_g = 0.1f; e->t_b = 0.1f; e->t_a = 1.0f; }
     e->has_caret_color = 0;
     if (!e->has_custom_border) { e->border_width = 0; e->bd_r = 0; e->bd_g = 0; e->bd_b = 0; e->bd_a = 0; }
+    e->has_border_top = e->has_border_right = e->has_border_bottom = e->has_border_left = 0;
+    e->border_top_w = e->border_right_w = e->border_bottom_w = e->border_left_w = 0.0f;
+    e->border_top_a = e->border_right_a = e->border_bottom_a = e->border_left_a = 0.0f;
     e->outline_width = 0.0f;
     e->outline_offset = 0.0f;
     e->has_outline = 0;
@@ -3692,6 +4339,23 @@ void update_element_style(LunaElement* e) {
     e->anim_infinite = 0;
     e->anim_alternate = 0;
     e->anim_easing = 0;
+    e->has_filter = 0;
+    e->filter_brightness = 1.0f;
+    e->filter_contrast   = 1.0f;
+    e->filter_saturate   = 1.0f;
+    e->filter_hue        = 0.0f;
+    e->font_italic = 0;
+    e->has_aspect_ratio = 0;
+    e->aspect_ratio = 0.0f;
+    e->bg_size_mode = 0;
+    e->bg_size_w = e->bg_size_h = 0.0f;
+    e->bg_pos_x = 0.5f;
+    e->bg_pos_y = 0.5f;
+    e->has_backdrop_blur = 0;
+    e->backdrop_blur_radius = 0.0f;
+    e->bg_layer_count = 0;
+    e->grad_rad_rx = 0.0f;
+    e->grad_rad_ry = 0.0f;
 
     for (int i = 0; i < rule_count; i++) {
         StyleRule* r = &css_rules[i];
@@ -3719,6 +4383,8 @@ void update_element_style(LunaElement* e) {
                 e->grad_rad_cx = r->grad_rad_cx;
                 e->grad_rad_cy = r->grad_rad_cy;
                 e->grad_rad_r = r->grad_rad_r;
+                e->grad_rad_rx = r->grad_rad_rx;
+                e->grad_rad_ry = r->grad_rad_ry;
                 for (int s = 0; s < r->grad_stop_count && s < MAX_GRAD_STOPS; s++) {
                     e->grad_stop_pos[s] = r->grad_stop_pos[s];
                     e->grad_stop_r[s] = r->grad_stop_r[s];
@@ -3729,7 +4395,19 @@ void update_element_style(LunaElement* e) {
             } else {
                 e->has_gradient = 0;
                 e->grad_type = GRAD_NONE;
+                e->grad_rad_rx = 0.0f;
+                e->grad_rad_ry = 0.0f;
             }
+            /* Copy multiple background layers */
+            if (r->bg_layer_count > 0) {
+                e->bg_layer_count = r->bg_layer_count;
+                for (int li = 0; li < r->bg_layer_count && li < LUNA_MAX_BG_LAYERS; li++)
+                    e->bg_layers[li] = r->bg_layers[li];
+            }
+        }
+        if (r->has_backdrop_blur) {
+            e->has_backdrop_blur = 1;
+            e->backdrop_blur_radius = r->backdrop_blur_radius;
         }
         if (r->has_color && !e->has_custom_color)  { e->t_r = r->c_r; e->t_g = r->c_g; e->t_b = r->c_b; e->t_a = r->c_a; }
         if (r->has_caret_color) {
@@ -3738,6 +4416,26 @@ void update_element_style(LunaElement* e) {
             e->caret_b = r->caret_b; e->caret_a = r->caret_a;
         }
         if (r->has_border && !e->has_custom_border) { e->bd_r = r->bd_r; e->bd_g = r->bd_g; e->bd_b = r->bd_b; e->bd_a = r->bd_a; e->border_width = r->border_width; }
+        if (r->has_border_top) {
+            e->has_border_top = 1; e->border_top_w = r->border_top_w;
+            e->border_top_r = r->border_top_r; e->border_top_g = r->border_top_g;
+            e->border_top_b = r->border_top_b; e->border_top_a = r->border_top_a;
+        }
+        if (r->has_border_right) {
+            e->has_border_right = 1; e->border_right_w = r->border_right_w;
+            e->border_right_r = r->border_right_r; e->border_right_g = r->border_right_g;
+            e->border_right_b = r->border_right_b; e->border_right_a = r->border_right_a;
+        }
+        if (r->has_border_bottom) {
+            e->has_border_bottom = 1; e->border_bottom_w = r->border_bottom_w;
+            e->border_bottom_r = r->border_bottom_r; e->border_bottom_g = r->border_bottom_g;
+            e->border_bottom_b = r->border_bottom_b; e->border_bottom_a = r->border_bottom_a;
+        }
+        if (r->has_border_left) {
+            e->has_border_left = 1; e->border_left_w = r->border_left_w;
+            e->border_left_r = r->border_left_r; e->border_left_g = r->border_left_g;
+            e->border_left_b = r->border_left_b; e->border_left_a = r->border_left_a;
+        }
         if (r->has_outline) {
             e->has_outline = 1;
             e->outline_width = r->outline_width;
@@ -3981,6 +4679,24 @@ void update_element_style(LunaElement* e) {
             e->anim_easing = r->anim_easing;
             if (e->anim_start_time < 0.0) e->anim_start_time = luna_now();
         }
+        if (r->has_filter) {
+            e->has_filter = 1;
+            e->filter_brightness = r->filter_brightness;
+            e->filter_contrast   = r->filter_contrast;
+            e->filter_saturate   = r->filter_saturate;
+            e->filter_hue        = r->filter_hue;
+        }
+        if (r->has_font_italic) e->font_italic = r->font_italic;
+        if (r->has_aspect_ratio) { e->has_aspect_ratio = 1; e->aspect_ratio = r->aspect_ratio; }
+        if (r->has_bg_size) {
+            e->bg_size_mode = r->bg_size_mode;
+            e->bg_size_w = r->bg_size_w;
+            e->bg_size_h = r->bg_size_h;
+        }
+        if (r->has_bg_pos) {
+            e->bg_pos_x = r->bg_pos_x;
+            e->bg_pos_y = r->bg_pos_y;
+        }
     }
 
     apply_element_inline_style(e);
@@ -3994,6 +4710,86 @@ void update_element_style(LunaElement* e) {
     }
     if (e->is_input && e->cursor_type == 0) e->cursor_type = 2;
     if (e->is_input && !e->input_multiline) e->white_space = 1;
+}
+
+// ============================================================
+// Pseudo-element generation (::before / ::after)
+// ============================================================
+
+/* Spawn synthetic LunaElement nodes for ::before and ::after pseudo-elements.
+   Called once at the end of parse_html after all real DOM nodes exist. */
+static void generate_pseudo_elements(void) {
+    /* Iterate DOM elements (fixed count — we will append new ones) */
+    int dom_count = elem_count;
+    for (int ei = 0; ei < dom_count && elem_count < MAX_ELEMENTS; ei++) {
+        LunaElement* host = &elements[ei];
+        if (host->luna_internal) continue;
+        if (host->generated_pseudo) continue;
+
+        /* Check every pseudo-element rule to see if it matches this host */
+        for (int ri = 0; ri < rule_count && elem_count < MAX_ELEMENTS; ri++) {
+            StyleRule* r = &css_rules[ri];
+            if (!r->pseudo_elem) continue; /* not a pseudo-element rule */
+            /* Skip hover/focus/active-only pseudo rules for now */
+            if (r->is_hover || r->is_active || r->is_focus) continue;
+
+            if (!selector_matches_pseudo(r, host)) continue;
+
+            /* Skip rules with no visible effect (e.g. CSS resets like
+               `*, *::before, *::after { box-sizing: border-box; }`) */
+            if (!r->has_content && !r->has_bg && !r->has_gradient &&
+                !r->has_bg_image && !r->has_shadow && !r->has_width &&
+                !r->has_height && !r->has_animation && !r->has_border &&
+                !(r->has_display && !r->display_none))
+                continue;
+
+            /* We found a match — look for an existing pseudo node */
+            int existing = -1;
+            for (int xi = dom_count; xi < elem_count; xi++) {
+                if (elements[xi].parent_idx == ei &&
+                    elements[xi].generated_pseudo == r->pseudo_elem)
+                    { existing = xi; break; }
+            }
+            if (existing >= 0) continue; /* already created */
+
+            /* Spawn a synthetic element */
+            int ni = elem_count++;
+            LunaElement* pe = &elements[ni];
+            memset(pe, 0, sizeof(*pe));
+            pe->id_idx = ni;
+            pe->parent_idx = ei;
+            pe->generated_pseudo = r->pseudo_elem;
+            pe->pointer_events_none = 1;
+            strncpy(pe->type, "div", sizeof(pe->type) - 1);
+            /* Set position to absolute so it doesn't affect host flow */
+            pe->position_mode = POS_ABSOLUTE;
+            pe->opacity = 1.0f;
+            pe->transform_scale = 1.0f;
+            pe->cur_scale = 1.0f;
+            pe->anim_speed = 14.0f;
+            pe->font_size = host->font_size > 0 ? host->font_size : 16;
+            /* Copy content if specified */
+            if (r->has_content) {
+                char content[128];
+                strncpy(content, r->content, sizeof(content) - 1);
+                content[sizeof(content) - 1] = '\0';
+                /* Strip quotes */
+                int clen = (int)strlen(content);
+                if (clen >= 2 && (content[0] == '"' || content[0] == '\'')) {
+                    memmove(content, content + 1, (size_t)(clen - 1));
+                    clen--;
+                    if (clen > 0 && (content[clen-1] == '"' || content[clen-1] == '\''))
+                        content[clen - 1] = '\0';
+                }
+                strncpy(pe->text, content, sizeof(pe->text) - 1);
+            }
+            update_element_style(pe);
+            pe->cur_r = pe->r; pe->cur_g = pe->g; pe->cur_b = pe->b; pe->cur_a = pe->a;
+            pe->cur_bd_r = pe->bd_r; pe->cur_bd_g = pe->bd_g;
+            pe->cur_bd_b = pe->bd_b; pe->cur_bd_a = pe->bd_a;
+        }
+    }
+    if (elem_count > dom_count) g_render_order_dirty = 1;
 }
 
 // ============================================================
@@ -4402,6 +5198,8 @@ void parse_html(const char* html) {
         e->cur_bd_r = e->bd_r; e->cur_bd_g = e->bd_g;
         e->cur_bd_b = e->bd_b; e->cur_bd_a = e->bd_a;
     }
+    /* Generate ::before / ::after pseudo-element nodes */
+    generate_pseudo_elements();
     g_layout_dirty = 1;
 }
 
@@ -4565,6 +5363,13 @@ void update_layout() {
         if (e->has_min_height && e->h < e->css_min_height) e->h = e->css_min_height;
         if (e->has_max_width && e->w > e->css_max_width) e->w = e->css_max_width;
         if (e->has_max_height && e->h > e->css_max_height) e->h = e->css_max_height;
+        /* aspect-ratio: if one dimension known, compute the other */
+        if (e->has_aspect_ratio && e->aspect_ratio > 0.0f) {
+            if (e->has_css_width && !e->has_css_height)
+                e->h = e->w / e->aspect_ratio;
+            else if (e->has_css_height && !e->has_css_width)
+                e->w = e->h * e->aspect_ratio;
+        }
 
         if (!e->pos_overridden_x) {
             /* Both left+right set (no explicit width): stretch to fill (CSS inset). */
@@ -5084,7 +5889,8 @@ static void layout_grid_container(int container_idx) {
     if (tmpl_cols < 1) tmpl_cols = cont->has_grid_auto_columns ? 0 : 1;
     if (tmpl_rows < 1) tmpl_rows = cont->has_grid_auto_rows ? 0 : 1;
 
-    float pad = cont->padding;
+    float pad_l = cont->pad_l, pad_t = cont->pad_t;
+    float pad_r = cont->pad_r, pad_b = cont->pad_b;
     float col_gap = cont->grid_col_gap > 0.0f ? cont->grid_col_gap : cont->flex_gap;
     float row_gap = cont->grid_row_gap > 0.0f ? cont->grid_row_gap : cont->flex_gap;
 
@@ -5187,8 +5993,8 @@ static void layout_grid_container(int container_idx) {
     if (cols > MAX_GRID_AREA_COLS) cols = MAX_GRID_AREA_COLS;
     if (rows > MAX_GRID_AREA_ROWS) rows = MAX_GRID_AREA_ROWS;
 
-    float inner_w = cont->w - pad * 2.0f;
-    float inner_h = cont->h - pad * 2.0f;
+    float inner_w = cont->w - pad_l - pad_r;
+    float inner_h = cont->h - pad_t - pad_b;
     if (inner_w < 0.0f) inner_w = 0.0f;
     if (inner_h < 0.0f) inner_h = 0.0f;
 
@@ -5240,7 +6046,7 @@ static void layout_grid_container(int container_idx) {
         if (gc < 0) gc = 0;
         if (gr < 0) gr = 0;
 
-        float cx = pad + col_off, cy = pad + row_off, cw = 0.0f, chh = 0.0f;
+        float cx = pad_l + col_off, cy = pad_t + row_off, cw = 0.0f, chh = 0.0f;
         for (int i = 0; i < gc; i++) cx += col_sz[i] + use_col_gap;
         for (int i = 0; i < gr; i++) cy += row_sz[i] + use_row_gap;
         for (int i = gc; i < gc + cspan && i < cols; i++) cw += col_sz[i];
@@ -5376,9 +6182,8 @@ static void apply_scroll_metrics(void) {
     for (int i = 0; i < elem_count; i++) {
         LunaElement* c = &elements[i];
         if (!overflow_scrollable(c->overflow_y) && !overflow_scrollable(c->overflow_x)) continue;
-        float pad = c->padding;
-        float inner_h = c->h - pad * 2.0f;
-        float inner_w = c->w - pad * 2.0f;
+        float inner_h = c->h - c->pad_t - c->pad_b;
+        float inner_w = c->w - c->pad_l - c->pad_r;
         if (inner_h < 0.0f) inner_h = 0.0f;
         if (inner_w < 0.0f) inner_w = 0.0f;
         float content_bottom = 0.0f, content_right = 0.0f;
@@ -5430,8 +6235,7 @@ static int find_scroll_target_x(int idx) {
 static void scrollbar_geom_y(LunaElement* c, float* tx, float* ty, float* tw, float* th,
                              float* ux, float* uy, float* uw, float* uh, int* visible) {
     *visible = 0;
-    float pad = c->padding;
-    float inner_h = c->h - pad * 2.0f;
+    float inner_h = c->h - c->pad_t - c->pad_b;
     if (!overflow_scrollable(c->overflow_y) || inner_h <= 0.0f) return;
     int needs_bar = (c->scroll_content_h > inner_h + 1.0f) || c->overflow_y == OVERFLOW_SCROLL;
     if (!needs_bar) return;
@@ -5440,8 +6244,8 @@ static void scrollbar_geom_y(LunaElement* c, float* tx, float* ty, float* tw, fl
     *visible = 1;
     *tw = sbw;
     *th = inner_h;
-    *tx = c->x + c->w - pad - *tw - 2.0f;
-    *ty = c->y + pad;
+    *tx = c->x + c->w - c->pad_r - *tw - 2.0f;
+    *ty = c->y + c->pad_t;
     float ratio = inner_h / c->scroll_content_h;
     *uh = *th * ratio;
     if (*uh < 14.0f) *uh = 14.0f;
@@ -5457,8 +6261,7 @@ static void scrollbar_geom_y(LunaElement* c, float* tx, float* ty, float* tw, fl
 static void scrollbar_geom_x(LunaElement* c, float* tx, float* ty, float* tw, float* th,
                              float* ux, float* uy, float* uw, float* uh, int* visible) {
     *visible = 0;
-    float pad = c->padding;
-    float inner_w = c->w - pad * 2.0f;
+    float inner_w = c->w - c->pad_l - c->pad_r;
     if (!overflow_scrollable(c->overflow_x) || inner_w <= 0.0f) return;
     int needs_bar = (c->scroll_content_w > inner_w + 1.0f) || c->overflow_x == OVERFLOW_SCROLL;
     if (!needs_bar) return;
@@ -5467,8 +6270,8 @@ static void scrollbar_geom_x(LunaElement* c, float* tx, float* ty, float* tw, fl
     *visible = 1;
     *th = sbw;
     *tw = inner_w;
-    *tx = c->x + pad;
-    *ty = c->y + c->h - pad - *th - 2.0f;
+    *tx = c->x + c->pad_l;
+    *ty = c->y + c->h - c->pad_b - *th - 2.0f;
     float ratio = inner_w / c->scroll_content_w;
     *uw = *tw * ratio;
     if (*uw < 14.0f) *uw = 14.0f;
@@ -5912,6 +6715,19 @@ static int get_overflow_clip_rect(int idx, float* cx, float* cy, float* cw, floa
         p = par->parent_idx;
     }
     return has;
+}
+
+/* Returns nearest ancestor index with border_radius > 0 AND overflow clips, or -1. */
+static int find_rounded_clip_ancestor(int idx) {
+    int p = elements[idx].parent_idx;
+    while (p != -1) {
+        LunaElement* par = &elements[p];
+        if (par->border_radius > 0.0f &&
+            (overflow_clips(par->overflow_x) || overflow_clips(par->overflow_y)))
+            return p;
+        p = par->parent_idx;
+    }
+    return -1;
 }
 
 static void set_element_scissor(int idx, int fbw, int fbh) {
@@ -6383,7 +7199,7 @@ float measure_text_width(FontAtlas* atlas, const char* text) {
     while (*p) {
         int cp = utf8_decode(&p);
         if (cp == '\n' || cp == '\r') continue;
-        w += glyph_advance(atlas, cp, px);
+        w += glyph_advance(atlas, cp, px) + g_text_letter_spacing;
     }
     return w;
 }
@@ -6402,7 +7218,7 @@ static float measure_text_range(FontAtlas* atlas, const char* start, int len) {
     while (p < end && *p) {
         int cp = utf8_decode(&p);
         if (cp == '\n' || cp == '\r') continue;
-        w += glyph_advance(atlas, cp, px);
+        w += glyph_advance(atlas, cp, px) + g_text_letter_spacing;
     }
     return w;
 }
@@ -6423,7 +7239,7 @@ static int fit_text_chars(FontAtlas* atlas, const char* text, int len, float max
         const char* before = p;
         int cp = utf8_decode(&p);
         if (cp == '\n' || cp == '\r') break;
-        float adv = glyph_advance(atlas, cp, px);
+        float adv = glyph_advance(atlas, cp, px) + g_text_letter_spacing;
         if (w + adv > max_w && last != text) return (int)(last - text);
         w += adv;
         last = p;
@@ -6487,7 +7303,7 @@ static void draw_image(float x, float y, float w, float h, float radius, GLuint 
     if (!img_program || !tex || alpha <= 0.004f || w <= 0.0f || h <= 0.0f) return;
     float half_min = (w < h ? w : h) * 0.5f;
     if (radius > half_min) radius = half_min;
-    glUseProgram(img_program);
+    luna_use_program(img_program);
     glUniform2f(img_loc.uResolution, window_width, window_height);
     glUniform2f(img_loc.uPos,  x, y);
     glUniform2f(img_loc.uSize, w, h);
@@ -6501,7 +7317,77 @@ static void draw_image(float x, float y, float w, float h, float radius, GLuint 
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-// Full-featured rect draw: solid color or gradient (linear/radial, multi-stop).
+/* Draw one LunaBgLayer on top of the current framebuffer at (x,y,w,h).
+   Used by luna_render to render stacked background layers. */
+static void draw_bg_layer(float x, float y, float w, float h,
+                           const float* rad4, float eff_op,
+                           const LunaBgLayer* layer) {
+    if (!layer) return;
+    float c4[4] = {0,0,0,0};
+    float half_min = (w < h ? w : h) * 0.5f;
+    if (rad4) {
+        for (int i = 0; i < 4; i++) {
+            c4[i] = rad4[i];
+            if (c4[i] > half_min) c4[i] = half_min;
+            if (c4[i] < 0.0f) c4[i] = 0.0f;
+        }
+    }
+    int grad_mode = layer->has_gradient ? layer->grad_type : GRAD_NONE;
+    float lr = 0, lg = 0, lb = 0, la = 0;
+    if (layer->has_color) { lr=layer->r; lg=layer->g; lb=layer->b; la=layer->a * eff_op; }
+    if (la <= 0.0f && grad_mode == GRAD_NONE) return;
+
+    luna_use_program(bg_program);
+    glUniform2f(bg_loc.uResolution, window_width, window_height);
+    glUniform2f(bg_loc.uPos,  x, y);
+    glUniform2f(bg_loc.uSize, w, h);
+    glUniform4f(bg_loc.uColor, lr, lg, lb, la);
+    glUniform4f(bg_loc.uBorderColor, 0,0,0,0);
+    glUniform1f(bg_loc.uBorderWidth, 0.0f);
+    glUniform4f(bg_loc.uRadius4, c4[0], c4[1], c4[2], c4[3]);
+    glUniform1i_(bg_loc.uGradient, grad_mode);
+    if (layer->has_gradient) {
+        int sc = layer->grad_stop_count;
+        if (sc < 2) sc = 2;
+        if (sc > MAX_GRAD_STOPS) sc = MAX_GRAD_STOPS;
+        glUniform1i_(bg_loc.uGradStopCount, sc);
+        for (int i = 0; i < MAX_GRAD_STOPS; i++) {
+            float pr=0, pg=0, pb=0, pa=0, pp=(float)i/(float)(MAX_GRAD_STOPS-1);
+            if (i < layer->grad_stop_count) {
+                pr=layer->grad_stop_r[i]; pg=layer->grad_stop_g[i];
+                pb=layer->grad_stop_b[i]; pa=layer->grad_stop_a[i];
+                pp=layer->grad_stop_pos[i];
+                pa *= eff_op;
+            }
+            glUniform4f(bg_loc.uGradColors[i], pr, pg, pb, pa);
+            glUniform1f(bg_loc.uGradStops[i],  pp);
+        }
+        glUniform1f(bg_loc.uGradAngle,  layer->grad_angle);
+        glUniform2f(bg_loc.uGradCenter, layer->grad_rad_cx, layer->grad_rad_cy);
+        glUniform1f(bg_loc.uGradRadius, layer->grad_rad_r);
+        glUniform1f(bg_loc.uGradRadRx,  layer->grad_rad_rx);
+        glUniform1f(bg_loc.uGradRadRy,  layer->grad_rad_ry);
+    } else {
+        glUniform1f(bg_loc.uGradRadRx, 0.0f);
+        glUniform1f(bg_loc.uGradRadRy, 0.0f);
+    }
+    glUniform1i_(bg_loc.uFilterMode, 0);
+    glUniform1f(bg_loc.uFilterBrightness, 1.0f);
+    glUniform1f(bg_loc.uFilterContrast,   1.0f);
+    glUniform1f(bg_loc.uFilterSaturate,   1.0f);
+    glUniform1f(bg_loc.uFilterHue,        0.0f);
+    glUniform1i_(bg_loc.uClipEnabled, g_bg_clip_enabled);
+    if (g_bg_clip_enabled) {
+        glUniform2f(bg_loc.uClipPos,  g_bg_clip_pos[0],  g_bg_clip_pos[1]);
+        glUniform2f(bg_loc.uClipSize, g_bg_clip_size[0], g_bg_clip_size[1]);
+        glUniform4f(bg_loc.uClipRadius4, g_bg_clip_rad4[0], g_bg_clip_rad4[1],
+                    g_bg_clip_rad4[2], g_bg_clip_rad4[3]);
+    }
+    glBindVertexArray(g_rect_vao);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+}
+
+// Full-featured rect draw: solid color or gradient (linear/radial/conic/ellipse, multi-stop).
 // rad4: per-corner radius {tl, tr, br, bl}; NULL means square corners.
 void draw_rect_full(float x, float y, float w, float h,
                     float r, float g, float b, float a,
@@ -6523,7 +7409,7 @@ void draw_rect_full(float x, float y, float w, float h,
         }
     }
 
-    glUseProgram(bg_program);
+    luna_use_program(bg_program);
     glUniform2f(bg_loc.uResolution, window_width, window_height);
     glUniform2f(bg_loc.uPos,  x, y);
     glUniform2f(bg_loc.uSize, w, h);
@@ -6550,6 +7436,31 @@ void draw_rect_full(float x, float y, float w, float h,
         glUniform1f(bg_loc.uGradAngle,  ge->grad_angle);
         glUniform2f(bg_loc.uGradCenter, ge->grad_rad_cx, ge->grad_rad_cy);
         glUniform1f(bg_loc.uGradRadius, ge->grad_rad_r);
+        glUniform1f(bg_loc.uGradRadRx,  ge->grad_rad_rx);
+        glUniform1f(bg_loc.uGradRadRy,  ge->grad_rad_ry);
+    } else {
+        glUniform1f(bg_loc.uGradRadRx, 0.0f);
+        glUniform1f(bg_loc.uGradRadRy, 0.0f);
+    }
+    if (ge && ge->has_filter) {
+        glUniform1i_(bg_loc.uFilterMode,       1);
+        glUniform1f(bg_loc.uFilterBrightness,  ge->filter_brightness);
+        glUniform1f(bg_loc.uFilterContrast,    ge->filter_contrast);
+        glUniform1f(bg_loc.uFilterSaturate,    ge->filter_saturate);
+        glUniform1f(bg_loc.uFilterHue,         ge->filter_hue);
+    } else {
+        glUniform1i_(bg_loc.uFilterMode, 0);
+        glUniform1f(bg_loc.uFilterBrightness, 1.0f);
+        glUniform1f(bg_loc.uFilterContrast,   1.0f);
+        glUniform1f(bg_loc.uFilterSaturate,   1.0f);
+        glUniform1f(bg_loc.uFilterHue,        0.0f);
+    }
+    glUniform1i_(bg_loc.uClipEnabled, g_bg_clip_enabled);
+    if (g_bg_clip_enabled) {
+        glUniform2f(bg_loc.uClipPos,  g_bg_clip_pos[0],  g_bg_clip_pos[1]);
+        glUniform2f(bg_loc.uClipSize, g_bg_clip_size[0], g_bg_clip_size[1]);
+        glUniform4f(bg_loc.uClipRadius4, g_bg_clip_rad4[0], g_bg_clip_rad4[1],
+                    g_bg_clip_rad4[2], g_bg_clip_rad4[3]);
     }
 
     glBindVertexArray(g_rect_vao);
@@ -6605,7 +7516,7 @@ static void draw_shadow(float ex, float ey, float ew, float eh,
     float off_x = sh_dx;
     float off_y = 0.0f;
 
-    glUseProgram(shadow_program);
+    luna_use_program(shadow_program);
     glUniform2f(sh_loc.uResolution, window_width, window_height);
     glUniform2f(sh_loc.uPos,  sx, sy);
     glUniform2f(sh_loc.uSize, sw, sh_h);
@@ -6631,6 +7542,17 @@ static void draw_shadow(float ex, float ey, float ew, float eh,
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 }
 
+/* Flush accumulated glyph quads for the given texture. */
+static void flush_text_batch(GLuint tex, float* batch_buf, int* batch_count) {
+    if (*batch_count == 0) return;
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(sizeof(float) * 4 * 6 * (*batch_count)),
+                    batch_buf);
+    glDrawArrays(GL_TRIANGLES, 0, (*batch_count) * 6);
+    *batch_count = 0;
+}
+
 void render_text_pass(FontAtlas* atlas, const char* text,
                       float start_x, float baseline_y,
                       float r, float g, float b, float a) {
@@ -6650,51 +7572,69 @@ void render_text_pass(FontAtlas* atlas, const char* text,
         }
     }
     dyn_flush_atlas();
-    glUseProgram(text_program);
+    luna_use_program(text_program);
     glUniform2f(tx_loc.uResolution, window_width, window_height);
     glUniform4f(tx_loc.textColor,   r, g, b, a);
     if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
     glBindVertexArray(text_vao);
 
+    /* Batch buffer: 6 verts × 4 floats × LUNA_TEXT_BATCH_GLYPHS glyphs */
+    static float batch_buf[LUNA_TEXT_BATCH_GLYPHS * 6 * 4];
+    int batch_count = 0;
+    GLuint batch_tex = 0;
+
     float draw_x = start_x, draw_y = baseline_y;
     const char* p = text;
-    GLuint bound = 0;
     while (*p) {
         int cp = utf8_decode(&p);
         if (cp < 32) continue;
+
+        float x0, y0, x1, y1, s0, t0, s1, t1;
+        GLuint glyph_tex;
+
         if (cp < 128) {
-            if (bound != atlas->tex) { glBindTexture(GL_TEXTURE_2D, atlas->tex); bound = atlas->tex; }
+            glyph_tex = atlas->tex;
             stbtt_aligned_quad q;
-            stbtt_GetBakedQuad(atlas->cdata, 512, 512, cp - 32, &draw_x, &draw_y, &q, 1);
-            float verts[4][4] = {
-                { q.x0, q.y0, q.s0, q.t0 }, { q.x1, q.y0, q.s1, q.t0 },
-                { q.x1, q.y1, q.s1, q.t1 }, { q.x0, q.y1, q.s0, q.t1 }
-            };
-            glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
-            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+            float tmp_x = draw_x, tmp_y = draw_y;
+            stbtt_GetBakedQuad(atlas->cdata, 512, 512, cp - 32, &tmp_x, &tmp_y, &q, 1);
+            x0 = q.x0; y0 = q.y0; x1 = q.x1; y1 = q.y1;
+            s0 = q.s0; t0 = q.t0; s1 = q.s1; t1 = q.t1;
+            draw_x = tmp_x + g_text_letter_spacing; draw_y = tmp_y;
         } else {
-            LunaDynGlyph* g = dyn_bake_glyph(cp, px);
-            if (!g) continue;
-            if (bound != g_dyn_tex) { glBindTexture(GL_TEXTURE_2D, g_dyn_tex); bound = g_dyn_tex; }
-            float x0 = draw_x + g->xoff;
-            float y0 = draw_y + g->yoff;
-            float x1 = x0 + (g->x1 - g->x0);
-            float y1 = y0 + (g->y1 - g->y0);
-            float s0 = g->x0 / (float)LUNA_DYN_ATLAS_W;
-            float t0 = g->y0 / (float)LUNA_DYN_ATLAS_H;
-            float s1 = g->x1 / (float)LUNA_DYN_ATLAS_W;
-            float t1 = g->y1 / (float)LUNA_DYN_ATLAS_H;
-            float verts[4][4] = {
-                { x0, y0, s0, t0 }, { x1, y0, s1, t0 },
-                { x1, y1, s1, t1 }, { x0, y1, s0, t1 }
-            };
-            glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
-            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-            draw_x += g->xadvance;
+            LunaDynGlyph* gd = dyn_bake_glyph(cp, px);
+            if (!gd) continue;
+            glyph_tex = g_dyn_tex;
+            x0 = draw_x + gd->xoff;
+            y0 = draw_y + gd->yoff;
+            x1 = x0 + (gd->x1 - gd->x0);
+            y1 = y0 + (gd->y1 - gd->y0);
+            s0 = gd->x0 / (float)LUNA_DYN_ATLAS_W;
+            t0 = gd->y0 / (float)LUNA_DYN_ATLAS_H;
+            s1 = gd->x1 / (float)LUNA_DYN_ATLAS_W;
+            t1 = gd->y1 / (float)LUNA_DYN_ATLAS_H;
+            draw_x += gd->xadvance + g_text_letter_spacing;
         }
+
+        /* Flush on texture boundary or full buffer */
+        if (batch_tex != 0 && (glyph_tex != batch_tex || batch_count >= LUNA_TEXT_BATCH_GLYPHS)) {
+            flush_text_batch(batch_tex, batch_buf, &batch_count);
+        }
+        batch_tex = glyph_tex;
+
+        /* Append 6 verts (2 triangles) for this glyph */
+        float* v = batch_buf + batch_count * 6 * 4;
+        /* Triangle 1 */
+        v[ 0]=x0; v[ 1]=y0; v[ 2]=s0; v[ 3]=t0;
+        v[ 4]=x1; v[ 5]=y0; v[ 6]=s1; v[ 7]=t0;
+        v[ 8]=x1; v[ 9]=y1; v[10]=s1; v[11]=t1;
+        /* Triangle 2 */
+        v[12]=x0; v[13]=y0; v[14]=s0; v[15]=t0;
+        v[16]=x1; v[17]=y1; v[18]=s1; v[19]=t1;
+        v[20]=x0; v[21]=y1; v[22]=s0; v[23]=t1;
+        batch_count++;
     }
+    /* Flush remaining glyphs */
+    if (batch_count > 0) flush_text_batch(batch_tex, batch_buf, &batch_count);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -7282,8 +8222,7 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
             if (e->is_input) {
                 float bx, by, bw, bh;
                 get_element_draw_bounds(e, &bx, &by, &bw, &bh);
-                float pad = e->padding > 0 ? e->padding : e->pad_l;
-                input_set_caret_from_x(e, (float)mx - bx - pad);
+                input_set_caret_from_x(e, (float)mx - bx - e->pad_l);
             }
             e->is_active = 1;
             update_element_style(e);
@@ -7738,6 +8677,11 @@ static void load_gl_functions() {
     LOAD(PFNGLUNIFORM1FPROC,          glUniform1f);
     glUniform1i_ = (PFNGLUNIFORM1IPROC)g_luna_platform.get_proc("glUniform1i");
     glActiveTexture_ = (PFNGLACTIVETEXTUREPROC)g_luna_platform.get_proc("glActiveTexture");
+    glGenFramebuffers_       = (PFNGLGENFRAMEBUFFERSPROC)g_luna_platform.get_proc("glGenFramebuffers");
+    glBindFramebuffer_       = (PFNGLBINDFRAMEBUFFERPROC)g_luna_platform.get_proc("glBindFramebuffer");
+    glFramebufferTexture2D_  = (PFNGLFRAMEBUFFERTEXTURE2DPROC)g_luna_platform.get_proc("glFramebufferTexture2D");
+    glDeleteFramebuffers_    = (PFNGLDELETEFRAMEBUFFERSPROC)g_luna_platform.get_proc("glDeleteFramebuffers");
+    glCheckFramebufferStatus_ = (PFNGLCHECKFRAMEBUFFERSTATUSPROC)g_luna_platform.get_proc("glCheckFramebufferStatus");
 #undef LOAD
 }
 
@@ -7844,11 +8788,116 @@ void luna_update(double now, double dt) {
     update_animations(dt);
 }
 
+/* Ensure backdrop-blur FBOs/textures match the current framebuffer size. */
+static void ensure_blur_fbos(int w, int h) {
+    if (!glGenFramebuffers_ || !glBindFramebuffer_ || !glFramebufferTexture2D_) return;
+    if (g_blur_tex_w == w && g_blur_tex_h == h && g_blur_fbo[0]) return;
+    /* Clean up old resources */
+    if (g_blur_fbo[0] && glDeleteFramebuffers_) {
+        glDeleteFramebuffers_(2, g_blur_fbo);
+        g_blur_fbo[0] = g_blur_fbo[1] = 0;
+    }
+    if (g_blur_tex[0]) { glDeleteTextures(2, g_blur_tex); g_blur_tex[0] = g_blur_tex[1] = 0; }
+    g_blur_tex_w = w; g_blur_tex_h = h;
+    /* Create two ping-pong textures */
+    glGenTextures(2, g_blur_tex);
+    for (int i = 0; i < 2; i++) {
+        glBindTexture(GL_TEXTURE_2D, g_blur_tex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    /* Create two FBOs, each backed by one texture */
+    glGenFramebuffers_(2, g_blur_fbo);
+    for (int i = 0; i < 2; i++) {
+        glBindFramebuffer_(GL_FRAMEBUFFER, g_blur_fbo[i]);
+        glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_blur_tex[i], 0);
+    }
+    glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+    g_current_program = 0; /* state was disrupted */
+}
+
+/* Apply backdrop blur for one element: capture current FBO, blur it, draw result. */
+static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
+                                 float blur_radius, const float* rad4, int fbw, int fbh) {
+    if (!blur_program || !backdrop_program || !g_blur_fbo[0]) return;
+    if (!glActiveTexture_) return;
+
+    float tw = (float)fbw, th = (float)fbh;
+    /* Step 1: Copy current default framebuffer into g_blur_tex[0]. */
+    glBindTexture(GL_TEXTURE_2D, g_blur_tex[0]);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, fbw, fbh);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    /* Step 2: Horizontal blur: read g_blur_tex[0] → write g_blur_fbo[1]/g_blur_tex[1] */
+    glBindFramebuffer_(GL_FRAMEBUFFER, g_blur_fbo[1]);
+    glViewport(0, 0, fbw, fbh);
+    luna_use_program(blur_program);
+    glUniform2f(blur_loc.uResolution, tw, th);
+    glUniform2f(blur_loc.uPos,  ex, ey);
+    glUniform2f(blur_loc.uSize, ew, eh);
+    if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_blur_tex[0]);
+    glUniform1i_(blur_loc.uSrc, 0);
+    glUniform2f(blur_loc.uBlurDir, 1.0f / tw, 0.0f);
+    glUniform1f(blur_loc.uBlurRadius, blur_radius);
+    glUniform2f(blur_loc.uBlurTexSize, tw, th);
+    glUniform2f(blur_loc.uBlurOrigin, ex, ey);
+    glBindVertexArray(g_rect_vao);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+    /* Step 3: Vertical blur: read g_blur_tex[1] → write g_blur_fbo[0]/g_blur_tex[0] */
+    glBindFramebuffer_(GL_FRAMEBUFFER, g_blur_fbo[0]);
+    glBindTexture(GL_TEXTURE_2D, g_blur_tex[1]);
+    glUniform2f(blur_loc.uBlurDir, 0.0f, 1.0f / th);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    /* Step 4: Restore default FBO */
+    glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, fbw, fbh);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    g_current_program = 0; /* framebuffer switch may reset state */
+
+    /* Step 5: Draw the blurred texture clipped to the element's rounded rect */
+    float c4[4] = {0,0,0,0};
+    float half_min = (ew < eh ? ew : eh) * 0.5f;
+    if (rad4) {
+        for (int i = 0; i < 4; i++) {
+            c4[i] = rad4[i];
+            if (c4[i] > half_min) c4[i] = half_min;
+            if (c4[i] < 0.0f) c4[i] = 0.0f;
+        }
+    }
+    luna_use_program(backdrop_program);
+    glUniform2f(backdrop_loc.uResolution, window_width, window_height);
+    glUniform2f(backdrop_loc.uPos,  ex, ey);
+    glUniform2f(backdrop_loc.uSize, ew, eh);
+    glUniform4f(backdrop_loc.uRadius4, c4[0], c4[1], c4[2], c4[3]);
+    if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_blur_tex[0]);
+    glUniform1i_(backdrop_loc.uSrc, 0);
+    glUniform2f(backdrop_loc.uBlurTexSize, tw, th);
+    glUniform2f(backdrop_loc.uBlurOrigin, ex, ey);
+    glBindVertexArray(g_rect_vao);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 void luna_render(int fbw, int fbh) {
     g_luna_fbw = fbw;
     g_luna_fbh = fbh;
+    /* Ensure backdrop-blur FBOs are sized for the current framebuffer */
+    ensure_blur_fbos(fbw, fbh);
     build_render_order();
     glDisable(GL_SCISSOR_TEST);
+    g_bg_clip_enabled = 0;
     for (int ri = 0; ri < elem_count; ri++) {
         int i = render_order[ri];
         LunaElement* e = &elements[i];
@@ -7875,6 +8924,23 @@ void luna_render(int fbw, int fbh) {
                 dx + dw + pad < 0.0f || dy + dh + pad < 0.0f)
                 continue;
         }
+        /* Set smooth rounded-clip via bg_fs shader for nearest overflow-hidden ancestor. */
+        {
+            int clip_anc = find_rounded_clip_ancestor(i);
+            if (clip_anc != -1) {
+                LunaElement* anc = &elements[clip_anc];
+                float adx, ady, adw, adh;
+                get_element_draw_bounds(anc, &adx, &ady, &adw, &adh);
+                float asc = anc->cur_scale;
+                g_bg_clip_enabled = 1;
+                g_bg_clip_pos[0]  = adx; g_bg_clip_pos[1]  = ady;
+                g_bg_clip_size[0] = adw; g_bg_clip_size[1] = adh;
+                g_bg_clip_rad4[0] = anc->rad_c[0]*asc; g_bg_clip_rad4[1] = anc->rad_c[1]*asc;
+                g_bg_clip_rad4[2] = anc->rad_c[2]*asc; g_bg_clip_rad4[3] = anc->rad_c[3]*asc;
+            } else {
+                g_bg_clip_enabled = 0;
+            }
+        }
         float rad4[4] = { e->rad_c[0] * scale, e->rad_c[1] * scale,
                           e->rad_c[2] * scale, e->rad_c[3] * scale };
         if (e->has_shadow) {
@@ -7887,9 +8953,25 @@ void luna_render(int fbw, int fbh) {
             }
         }
         set_element_scissor(i, fbw, fbh);
+        /* backdrop-filter: blur() — capture + blur the region under this element */
+        if (e->has_backdrop_blur && e->backdrop_blur_radius > 0.0f) {
+            glDisable(GL_SCISSOR_TEST);
+            apply_backdrop_blur(dx, dy, dw, dh, e->backdrop_blur_radius, rad4, fbw, fbh);
+            set_element_scissor(i, fbw, fbh);
+        }
+        /* Multiple background layers (bottom to top = last to first in CSS order) */
+        if (e->bg_layer_count > 1) {
+            for (int li = e->bg_layer_count - 1; li >= 0; li--)
+                draw_bg_layer(dx, dy, dw, dh, rad4, eff_op, &e->bg_layers[li]);
+            /* After drawing layers, still let draw_rect_full handle border + text bg */
+            draw_rect_full(dx, dy, dw, dh, 0, 0, 0, 0,
+                           rad4, e->border_width,
+                           e->cur_bd_r, e->cur_bd_g, e->cur_bd_b, e->cur_bd_a * eff_op, NULL);
+        } else {
         draw_rect_full(dx, dy, dw, dh, e->cur_r, e->cur_g, e->cur_b, e->cur_a * eff_op,
                        rad4, e->border_width,
                        e->cur_bd_r, e->cur_bd_g, e->cur_bd_b, e->cur_bd_a * eff_op, e);
+        }
         if (e->has_shadow) {
             for (int s = 0; s < e->shadow_count; s++) {
                 const LunaShadow* sh = &e->shadows[s];
@@ -7898,6 +8980,23 @@ void luna_render(int fbw, int fbh) {
                             sh->r, sh->g, sh->b, sh->a, rad4, eff_op);
             }
         }
+        /* Per-side borders: draw as thin solid rects on each active side */
+        if (e->has_border_top && e->border_top_w > 0.0f && e->border_top_a * eff_op > 0.004f)
+            draw_rect(dx, dy, dw, e->border_top_w * scale,
+                      e->border_top_r, e->border_top_g, e->border_top_b, e->border_top_a * eff_op,
+                      0, 0, 0,0,0,0);
+        if (e->has_border_bottom && e->border_bottom_w > 0.0f && e->border_bottom_a * eff_op > 0.004f)
+            draw_rect(dx, dy + dh - e->border_bottom_w * scale, dw, e->border_bottom_w * scale,
+                      e->border_bottom_r, e->border_bottom_g, e->border_bottom_b, e->border_bottom_a * eff_op,
+                      0, 0, 0,0,0,0);
+        if (e->has_border_left && e->border_left_w > 0.0f && e->border_left_a * eff_op > 0.004f)
+            draw_rect(dx, dy, e->border_left_w * scale, dh,
+                      e->border_left_r, e->border_left_g, e->border_left_b, e->border_left_a * eff_op,
+                      0, 0, 0,0,0,0);
+        if (e->has_border_right && e->border_right_w > 0.0f && e->border_right_a * eff_op > 0.004f)
+            draw_rect(dx + dw - e->border_right_w * scale, dy, e->border_right_w * scale, dh,
+                      e->border_right_r, e->border_right_g, e->border_right_b, e->border_right_a * eff_op,
+                      0, 0, 0,0,0,0);
         if (e->has_bg_image && e->bg_image_path[0]) {
             if (!e->bg_image_tex) {
                 e->bg_image_tex = load_or_get_texture(e->bg_image_path);
@@ -7909,10 +9008,12 @@ void luna_render(int fbw, int fbh) {
             }
         }
         {
-            float pad = (e->padding > 0.0f ? e->padding : e->pad_l) * scale;
-            float pad_t = (e->padding > 0.0f ? e->padding : e->pad_t) * scale;
-            float inner_w = dw - pad * 2.0f;
-            float inner_h = dh - pad_t * 2.0f;
+            float pad_l = e->pad_l * scale;
+            float pad_r = e->pad_r * scale;
+            float pad_t = e->pad_t * scale;
+            float pad_b = e->pad_b * scale;
+            float inner_w = dw - pad_l - pad_r;
+            float inner_h = dh - pad_t - pad_b;
             int show_ph = e->is_input && !e->text[0] && e->placeholder[0];
             const char* src = show_ph ? e->placeholder : e->text;
             if (src[0] || e->is_input) {
@@ -7930,24 +9031,6 @@ void luna_render(int fbw, int fbh) {
                     strncpy(tbuf, src, sizeof(tbuf) - 1);
                     tbuf[sizeof(tbuf) - 1] = '\0';
                     if (!show_ph) apply_text_transform_buf(tbuf, e->text_transform);
-                    if (!e->is_input && e->letter_spacing > 0.05f) {
-                        char spaced[768]; int si = 0;
-                        for (const char* p = tbuf; *p && si < (int)sizeof(spaced) - 2; ) {
-                            const char* b = p;
-                            int cp = utf8_decode(&p);
-                            int bl = (int)(p - b);
-                            if (si + bl >= (int)sizeof(spaced) - 2) break;
-                            memcpy(spaced + si, b, (size_t)bl); si += bl;
-                            if (*p && cp != ' ' && cp != '\n') {
-                                int gaps = (int)(e->letter_spacing / 3.0f);
-                                if (gaps < 1) gaps = 1;
-                                if (gaps > 3) gaps = 3;
-                                while (gaps-- > 0 && si < (int)sizeof(spaced) - 2) spaced[si++] = ' ';
-                            }
-                        }
-                        spaced[si] = '\0';
-                        strncpy(tbuf, spaced, sizeof(tbuf) - 1);
-                    }
                 }
                 float tr = e->t_r, tg = e->t_g, tb = e->t_b, ta = e->t_a * eff_op;
                 if (show_ph) ta *= 0.45f;
@@ -7955,7 +9038,7 @@ void luna_render(int fbw, int fbh) {
                 int ws = e->is_input && !e->input_multiline ? 1 : e->white_space;
                 if (e->is_input && !e->input_multiline)
                     input_update_scroll(e, inner_w);
-                float tx = dx + pad - (e->is_input && !e->input_multiline ? e->input_scroll_x : 0.0f);
+                float tx = dx + pad_l - (e->is_input && !e->input_multiline ? e->input_scroll_x : 0.0f);
                 if (tbuf[0])
                     render_text_fx(tbuf, tx, dy + pad_t, inner_w + (e->is_input ? e->input_scroll_x : 0.0f),
                                    inner_h, align, 1, tr, tg, tb, ta, e->font_size, e->font_bold,
@@ -7974,7 +9057,7 @@ void luna_render(int fbw, int fbh) {
                         float ch = (e->font_size > 0 ? (float)e->font_size : 16.0f) * 1.15f;
                         if (ch > inner_h) ch = inner_h;
                         float cy = dy + pad_t + (inner_h - ch) * 0.5f;
-                        draw_rect(dx + pad + cx, cy, cw, ch, cr, cg, cb, ca * eff_op, 0, 0, 0,0,0,0);
+                        draw_rect(dx + pad_l + cx, cy, cw, ch, cr, cg, cb, ca * eff_op, 0, 0, 0,0,0,0);
                     }
                 }
             }
@@ -7986,6 +9069,7 @@ void luna_render(int fbw, int fbh) {
         }
         glDisable(GL_SCISSOR_TEST);
     }
+    g_bg_clip_enabled = 0;
 }
 
 void luna_mouse_move(double x, double y) {
@@ -8021,6 +9105,8 @@ static void cache_uniform_locations(void) {
     bg_loc.uGradAngle   = glGetUniformLocation(bg_program, "uGradAngle");
     bg_loc.uGradCenter  = glGetUniformLocation(bg_program, "uGradCenter");
     bg_loc.uGradRadius  = glGetUniformLocation(bg_program, "uGradRadius");
+    bg_loc.uGradRadRx   = glGetUniformLocation(bg_program, "uGradRadRx");
+    bg_loc.uGradRadRy   = glGetUniformLocation(bg_program, "uGradRadRy");
     for (int i = 0; i < MAX_GRAD_STOPS; i++) {
         char uname[32];
         snprintf(uname, sizeof(uname), "uGradColors[%d]", i);
@@ -8028,6 +9114,15 @@ static void cache_uniform_locations(void) {
         snprintf(uname, sizeof(uname), "uGradStops[%d]", i);
         bg_loc.uGradStops[i]  = glGetUniformLocation(bg_program, uname);
     }
+    bg_loc.uFilterMode       = glGetUniformLocation(bg_program, "uFilterMode");
+    bg_loc.uFilterBrightness = glGetUniformLocation(bg_program, "uFilterBrightness");
+    bg_loc.uFilterContrast   = glGetUniformLocation(bg_program, "uFilterContrast");
+    bg_loc.uFilterSaturate   = glGetUniformLocation(bg_program, "uFilterSaturate");
+    bg_loc.uFilterHue        = glGetUniformLocation(bg_program, "uFilterHue");
+    bg_loc.uClipEnabled  = glGetUniformLocation(bg_program, "uClipEnabled");
+    bg_loc.uClipPos      = glGetUniformLocation(bg_program, "uClipPos");
+    bg_loc.uClipSize     = glGetUniformLocation(bg_program, "uClipSize");
+    bg_loc.uClipRadius4  = glGetUniformLocation(bg_program, "uClipRadius4");
     sh_loc.uResolution  = glGetUniformLocation(shadow_program, "uResolution");
     sh_loc.uPos         = glGetUniformLocation(shadow_program, "uPos");
     sh_loc.uSize        = glGetUniformLocation(shadow_program, "uSize");
@@ -8047,6 +9142,25 @@ static void cache_uniform_locations(void) {
     img_loc.uRadius     = glGetUniformLocation(img_program, "uRadius");
     img_loc.uAlpha      = glGetUniformLocation(img_program, "uAlpha");
     img_loc.uImage      = glGetUniformLocation(img_program, "uImage");
+    if (blur_program) {
+        blur_loc.uResolution  = glGetUniformLocation(blur_program, "uResolution");
+        blur_loc.uPos         = glGetUniformLocation(blur_program, "uPos");
+        blur_loc.uSize        = glGetUniformLocation(blur_program, "uSize");
+        blur_loc.uSrc         = glGetUniformLocation(blur_program, "uSrc");
+        blur_loc.uBlurDir     = glGetUniformLocation(blur_program, "uBlurDir");
+        blur_loc.uBlurRadius  = glGetUniformLocation(blur_program, "uBlurRadius");
+        blur_loc.uBlurTexSize = glGetUniformLocation(blur_program, "uBlurTexSize");
+        blur_loc.uBlurOrigin  = glGetUniformLocation(blur_program, "uBlurOrigin");
+    }
+    if (backdrop_program) {
+        backdrop_loc.uResolution  = glGetUniformLocation(backdrop_program, "uResolution");
+        backdrop_loc.uPos         = glGetUniformLocation(backdrop_program, "uPos");
+        backdrop_loc.uSize        = glGetUniformLocation(backdrop_program, "uSize");
+        backdrop_loc.uRadius4     = glGetUniformLocation(backdrop_program, "uRadius4");
+        backdrop_loc.uSrc         = glGetUniformLocation(backdrop_program, "uSrc");
+        backdrop_loc.uBlurTexSize = glGetUniformLocation(backdrop_program, "uBlurTexSize");
+        backdrop_loc.uBlurOrigin  = glGetUniformLocation(backdrop_program, "uBlurOrigin");
+    }
 }
 
 int luna_init(const LunaInitConfig* cfg) {
@@ -8075,6 +9189,20 @@ int luna_init(const LunaInitConfig* cfg) {
     img_program = glCreateProgram();
     glAttachShader(img_program, ivs); glAttachShader(img_program, ifs);
     glLinkProgram(img_program);
+    /* Blur shader programs */
+    {
+        GLuint bvs = compile_shader(bg_vs, GL_VERTEX_SHADER);
+        GLuint bfs = compile_shader(blur_fs, GL_FRAGMENT_SHADER);
+        blur_program = glCreateProgram();
+        glAttachShader(blur_program, bvs); glAttachShader(blur_program, bfs);
+        glLinkProgram(blur_program);
+
+        GLuint dvs = compile_shader(bg_vs, GL_VERTEX_SHADER);
+        GLuint dfs = compile_shader(backdrop_fs, GL_FRAGMENT_SHADER);
+        backdrop_program = glCreateProgram();
+        glAttachShader(backdrop_program, dvs); glAttachShader(backdrop_program, dfs);
+        glLinkProgram(backdrop_program);
+    }
     cache_uniform_locations();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);

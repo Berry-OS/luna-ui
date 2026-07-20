@@ -1,0 +1,431 @@
+/* Luna Shell — macOS Sonoma-inspired desktop for the Luna UI engine
+ * Copyright © 2026 Yuichiro Nakada / Project Luna (Vespera) — MPL 2.0 */
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  min-height: 100%;
+  background: #09091a;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Helvetica Neue", sans-serif;
+}
+body { position: relative; min-width: 1024px; min-height: 720px; }
+.hidden { display: none !important; }
+
+/* ── Wallpaper: Luna night sky (default = night theme) ── */
+#wallpaper {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  background: linear-gradient(162deg,
+    #06071a 0%, #0c1038 16%, #181d5c 32%,
+    #2e2472 50%, #552e88 66%,
+    #833a94 80%, #b04e8a 92%, #c86070 100%);
+  border-radius: 0;
+}
+#wallpaper.ocean  { background: linear-gradient(162deg, #000b18 0%, #001432 20%, #00326a 42%, #0060a8 62%, #009ed4 80%, #40c8f0 100%); }
+#wallpaper.forest { background: linear-gradient(162deg, #040b04 0%, #0a1e0c 22%, #163418 42%, #245c28 62%, #388038 80%, #58a84a 100%); }
+#wallpaper.sunset { background: linear-gradient(162deg, #0e0510 0%, #2c0c08 22%, #5a1c10 44%, #942e1c 64%, #c85028 84%, #e87040 100%); }
+
+/* Aurora glow */
+#wp_aurora1 {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  background: radial-gradient(ellipse 90% 55% at 68% 12%, rgba(90, 120, 255, 0.22), transparent);
+  border-radius: 0;
+}
+#wp_aurora2 {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  background: radial-gradient(ellipse 65% 65% at 12% 88%, rgba(155, 70, 210, 0.20), transparent);
+  border-radius: 0;
+}
+
+/* Moon */
+#wp_moon_halo {
+  position: absolute; right: 18%; top: 5%;
+  width: 290px; height: 290px; border-radius: 145px;
+  background: radial-gradient(circle, rgba(210, 226, 255, 0.14), transparent 68%);
+}
+#wp_moon {
+  position: absolute; right: 20%; top: 9%;
+  width: 166px; height: 166px; border-radius: 83px;
+  background: radial-gradient(circle at 34% 30%, #ffffff 0%, #eaf0ff 38%, #c8d4f0 68%, #96a4c8 100%);
+  box-shadow: 0 0 50px 16px rgba(196, 216, 255, 0.24), 0 0 100px 36px rgba(170, 200, 255, 0.10);
+}
+
+/* Stars */
+.star { position: absolute; border-radius: 50%; background: #ffffff; }
+#wp_star1 { left: 10%; top: 13%; width: 3px;  height: 3px;  opacity: 0.90; }
+#wp_star2 { left: 24%; top: 7%;  width: 2px;  height: 2px;  opacity: 0.58; }
+#wp_star3 { left: 38%; top: 16%; width: 2px;  height: 2px;  opacity: 0.72; }
+#wp_star4 { left: 53%; top: 8%;  width: 3px;  height: 3px;  opacity: 0.68; }
+#wp_star5 { left: 64%; top: 22%; width: 2px;  height: 2px;  opacity: 0.52; }
+#wp_star6 { left: 6%;  top: 32%; width: 2px;  height: 2px;  opacity: 0.64; }
+#wp_star7 { left: 31%; top: 28%; width: 3px;  height: 3px;  opacity: 0.46; }
+#wp_star8 { left: 78%; top: 32%; width: 2px;  height: 2px;  opacity: 0.78; }
+
+/* ── Menu bar ── */
+#menubar {
+  position: absolute; left: 0; top: 0; width: 100%; height: 28px;
+  background-color: rgba(8, 9, 20, 0.85);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex; flex-direction: row; align-items: center; justify-content: space-between;
+  padding: 0 8px;
+  z-index: 400; border-radius: 0;
+}
+/* mb_left is now just logo + "Luna" — no dummy menu items */
+#mb_left  { display: flex; flex-direction: row; align-items: center; gap: 2px; background-color: transparent; height: 28px; width: 120px; flex: 0 0 120px; }
+#mb_right { display: flex; flex-direction: row; align-items: center; justify-content: flex-end; gap: 2px; background-color: transparent; height: 28px; width: 320px; flex: 0 0 320px; }
+
+.mb_item {
+  color: rgba(244, 244, 252, 0.93); font-size: 13px; text-align: center;
+  height: 22px; padding: 3px 8px; border-radius: 5px; cursor: pointer;
+  background-color: transparent; white-space: nowrap; flex-shrink: 0;
+}
+.mb_item:hover { background-color: rgba(255, 255, 255, 0.13); }
+#mb_logo    { width: 36px; position: relative; }
+#logo_disc  { position: absolute; left: 10px; top: 3px; width: 16px; height: 16px; border-radius: 8px; background-color: #f0f4ff; }
+#logo_bite  { position: absolute; left: 17px; top: 1px; width: 14px; height: 14px; border-radius: 7px; background-color: #08091a; }
+#mb_appname { width: 50px; font-weight: 600; }
+.mb_status  { font-size: 12px; color: rgba(210, 218, 248, 0.72); }
+#mb_bat     { width: 44px; }
+#mb_wifi    { width: 62px; }
+#mb_cc      { width: 30px; font-size: 16px; }
+#mb_clock   { width: 142px; font-size: 12px; text-align: center; }
+
+/* ── Luna menu (Apple-menu style dropdown) ── */
+.menu_panel {
+  position: absolute; top: 32px;
+  background-color: rgba(26, 27, 46, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 14px;
+  box-shadow: 0 28px 72px rgba(0, 0, 0, 0.68),
+              0 4px 16px rgba(0, 0, 0, 0.36),
+              inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  padding: 6px;
+  z-index: 650;
+}
+#luna_menu { left: 6px; width: 252px; }
+
+/* Section heading inside menu (like macOS "System Preferences" label at top) */
+.menu_section_label {
+  display: block; height: 22px;
+  text-align: center; color: rgba(180, 186, 228, 0.55);
+  font-size: 11px; font-weight: 600; letter-spacing: 0.3px;
+  padding: 4px 14px 0 14px;
+}
+
+/* Menu item: flex row with symbol + label + optional shortcut key */
+.menu_item {
+  display: flex; flex-direction: row; align-items: center; gap: 0;
+  width: 100%; height: 30px;
+  padding: 0 10px 0 6px; border-radius: 8px; cursor: pointer;
+  background-color: transparent;
+}
+.menu_item:hover { background-color: rgba(10, 132, 255, 0.88); }
+.menu_item:hover .mi_sym   { color: rgba(255, 255, 255, 0.80); }
+.menu_item:hover .mi_label { color: #ffffff; }
+.menu_item:hover .mi_key   { color: rgba(255, 255, 255, 0.55); }
+
+.mi_sym {
+  width: 24px; flex: 0 0 24px;
+  text-align: center; color: rgba(160, 168, 216, 0.55);
+  font-size: 13px;
+}
+.mi_label {
+  flex: 1 1 auto;
+  color: #eaecff; font-size: 13px;
+}
+.mi_key {
+  color: rgba(148, 156, 204, 0.48); font-size: 11px;
+  white-space: nowrap; margin-left: 8px;
+}
+
+/* Destructive item (Log Out) */
+.mi_destructive .mi_label { color: rgba(255, 100, 90, 0.88); }
+.mi_destructive:hover      { background-color: rgba(255, 59, 48, 0.82); }
+.mi_destructive:hover .mi_label { color: #ffffff; }
+.mi_destructive:hover .mi_sym   { color: rgba(255, 255, 255, 0.80); }
+
+.menu_sep {
+  display: block; width: 88%; height: 1px;
+  background-color: rgba(255, 255, 255, 0.07);
+  margin: 3px auto;
+}
+
+/* ── Control Center ── */
+#control_center { right: 6px; width: 316px; height: 314px; padding: 14px; }
+.cc_row { display: flex; flex-direction: row; gap: 10px; background-color: transparent; margin-bottom: 6px; }
+.cc_cell {
+  flex: 1 1 auto;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  background-color: rgba(255, 255, 255, 0.06);
+  border-radius: 14px; padding: 12px 6px;
+}
+.cc_toggle {
+  width: 44px; flex: 0 0 24px; height: 24px; border-radius: 12px;
+  background-color: rgba(100, 100, 126, 0.36);
+  cursor: pointer; position: relative;
+}
+.cc_toggle.on { background-color: #0a84ff; }
+.cc_knob {
+  position: absolute; left: 3px; top: 3px; width: 18px; height: 18px; border-radius: 50%;
+  background-color: #ffffff; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.40);
+}
+.cc_label { width: 80px; color: rgba(200, 208, 248, 0.78); font-size: 11px; text-align: center; }
+.cc_section { display: block; height: 16px; text-align: left; color: rgba(140, 148, 194, 0.78); font-size: 11px; font-weight: 600; margin: 10px 4px 5px 4px; }
+.cc_track { position: relative; height: 22px; border-radius: 11px; background-color: rgba(255, 255, 255, 0.10); margin: 0 2px; }
+.cc_fill  { position: absolute; left: 0; top: 0; height: 22px; width: 160px; border-radius: 11px; background: linear-gradient(90deg, #5a8ef5, #0a84ff); }
+.cc_thumb { position: absolute; left: 150px; top: 2px; width: 18px; height: 18px; border-radius: 50%; background-color: #ffffff; box-shadow: 0 1px 5px rgba(0, 0, 0, 0.46); cursor: pointer; }
+.cc_stat_row { display: flex; flex-direction: row; align-items: center; gap: 8px; background-color: transparent; margin: 4px 2px 0 2px; }
+.cc_stat_label { color: #a8b4e0; font-size: 11px; width: 30px; flex: 0 0 30px; text-align: left; font-weight: 600; }
+.cc_bar { flex: 1 1 auto; height: 6px; border-radius: 3px; background-color: rgba(255, 255, 255, 0.10); position: relative; }
+.cc_bar_fill { position: absolute; left: 0; top: 0; height: 6px; width: 30px; border-radius: 3px; background: linear-gradient(90deg, #5a8ef5, #bf5af2); }
+
+/* ── Desktop widgets ── */
+.widget {
+  position: absolute;
+  background-color: rgba(10, 12, 28, 0.60);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 22px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.40);
+  padding: 16px 18px;
+}
+#widget_clock { right: 22px; top: 46px; width: 216px; height: 108px; }
+#wg_time { color: #f5f5f7; font-size: 48px; font-weight: 600; }
+#wg_date { color: rgba(162, 170, 214, 0.78); font-size: 12px; margin-top: 3px; }
+#widget_stats { right: 22px; top: 166px; width: 216px; height: 152px; }
+.st_row { display: flex; flex-direction: row; justify-content: space-between; background-color: transparent; margin-top: 8px; }
+.st_label { color: rgba(162, 170, 214, 0.78); font-size: 11px; }
+.st_val   { color: #f0f2ff; font-size: 11px; font-weight: 600; text-align: right; }
+.st_bar   { height: 4px; border-radius: 2px; background-color: rgba(255, 255, 255, 0.09); margin-top: 5px; position: relative; }
+.st_fill  { position: absolute; left: 0; top: 0; height: 4px; width: 20px; border-radius: 2px; background: linear-gradient(90deg, #5a8ef5, #0a84ff); }
+.st_fill.g_mem  { background: linear-gradient(90deg, #bf5af2, #9b3fe0); }
+.st_fill.g_disk { background: linear-gradient(90deg, #30d158, #25a244); }
+
+/* ── Traffic light buttons ── */
+.tl { position: absolute; top: 13px; width: 13px; height: 13px; border-radius: 50%; cursor: pointer; z-index: 20; }
+.tl_red    { left: 14px; background-color: #ff5f57; box-shadow: 0 0 0 1px rgba(255, 60, 50, 0.22); }
+.tl_yellow { left: 34px; background-color: #febc2e; box-shadow: 0 0 0 1px rgba(255, 180, 0, 0.22); }
+.tl_green  { left: 54px; background-color: #28c840; box-shadow: 0 0 0 1px rgba(0, 180, 40, 0.22); }
+.tl:hover  { opacity: 0.76; }
+
+/* ── About This Luna ── */
+#about_win {
+  position: absolute; left: 460px; top: 150px;
+  width: 360px; height: 408px;
+  background-color: rgba(22, 24, 48, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 16px;
+  box-shadow: 0 40px 96px rgba(0, 0, 0, 0.70), 0 4px 16px rgba(0, 0, 0, 0.32),
+              inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  display: flex; flex-direction: column; align-items: center;
+  padding: 52px 26px 22px 26px;
+  z-index: 300;
+}
+#about_drag { position: absolute; left: 0; top: 0; width: 360px; height: 38px; cursor: move; background-color: transparent; }
+#about_moon {
+  width: 96px; height: 96px; border-radius: 48px;
+  background: radial-gradient(circle at 34% 30%, #ffffff 0%, #e8eeff 40%, #c0ccea 70%, #96a4c8 100%);
+  box-shadow: 0 0 40px 12px rgba(196, 216, 255, 0.30), 0 0 80px 28px rgba(160, 192, 255, 0.12);
+  margin-bottom: 16px;
+}
+#about_title { color: #f5f5f7; font-size: 22px; font-weight: 600; }
+#about_ver   { color: rgba(132, 140, 182, 0.88); font-size: 12px; margin-top: 5px; }
+#about_sep   { width: 264px; height: 1px; background-color: rgba(255, 255, 255, 0.07); margin: 16px 0; }
+.about_line  { color: rgba(180, 188, 228, 0.88); font-size: 12px; margin-top: 6px; white-space: nowrap; }
+
+/* ── Settings window ── */
+#settings_win {
+  position: absolute; left: 320px; top: 80px;
+  width: 500px; height: 524px;
+  background-color: rgba(22, 24, 48, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 16px;
+  box-shadow: 0 40px 96px rgba(0, 0, 0, 0.70), 0 4px 16px rgba(0, 0, 0, 0.32),
+              inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  display: flex; flex-direction: column;
+  padding: 52px 22px 18px 22px;
+  z-index: 500;
+}
+#settings_drag { position: absolute; left: 0; top: 0; width: 500px; height: 38px; cursor: move; background-color: transparent; }
+#settings_title { color: #f5f5f7; font-size: 15px; font-weight: 600; margin-bottom: 14px; text-align: center; }
+
+/* Settings tabs */
+#settings_tabs {
+  display: flex; flex-direction: row; gap: 3px;
+  background-color: rgba(255, 255, 255, 0.05);
+  border-radius: 10px; padding: 3px; margin-bottom: 16px;
+  height: 34px; flex: 0 0 34px;
+}
+.stab {
+  flex: 1 1 auto; height: 28px; text-align: center;
+  color: rgba(144, 152, 200, 0.88); font-size: 12px;
+  padding: 6px 0; border-radius: 8px; cursor: pointer;
+  background-color: transparent;
+}
+.stab.active { background-color: rgba(255, 255, 255, 0.14); color: #f0f2ff; }
+.stab:hover  { color: #d8dcff; }
+
+/* Pref rows */
+#settings_panel_apps { flex: 1 1 auto; display: flex; flex-direction: column; gap: 5px; background-color: transparent; }
+.pref_row { display: flex; flex-direction: row; align-items: center; gap: 12px; height: 36px; flex: 0 0 36px; background-color: transparent; }
+.pref_label { width: 76px; flex: 0 0 76px; color: rgba(178, 186, 228, 0.88); font-size: 12px; text-align: right; }
+.pref_input {
+  flex: 1 1 auto; height: 30px;
+  background-color: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px; color: #f0f2ff; font-size: 12px; padding: 5px 10px;
+}
+.pref_input:hover { border-color: rgba(255, 255, 255, 0.26); }
+
+/* Display panel */
+#settings_panel_disp { flex: 1 1 auto; display: flex; flex-direction: column; gap: 0; background-color: transparent; }
+.pref_section { color: rgba(132, 140, 190, 0.88); font-size: 11px; font-weight: 600; margin: 12px 0 8px 0; }
+#wp_thumbs_row { display: flex; flex-direction: row; gap: 14px; background-color: transparent; height: 62px; margin-bottom: 4px; }
+.wp_thumb { width: 88px; height: 54px; border-radius: 10px; cursor: pointer; border: 2px solid rgba(255, 255, 255, 0.08); }
+.wp_thumb.selected { border-color: #0a84ff; box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.24); }
+.wp_thumb:hover    { border-color: rgba(255, 255, 255, 0.32); }
+.wp_t_night  { background: linear-gradient(135deg, #06071a 0%, #2e2472 55%, #833a94 100%); }
+.wp_t_ocean  { background: linear-gradient(135deg, #000b18 0%, #00326a 55%, #40c8f0 100%); }
+.wp_t_forest { background: linear-gradient(135deg, #040b04 0%, #163418 55%, #58a84a 100%); }
+.wp_t_sunset { background: linear-gradient(135deg, #0e0510 0%, #5a1c10 55%, #e87040 100%); }
+.wp_label_row { display: flex; flex-direction: row; gap: 14px; background-color: transparent; height: 18px; }
+.wp_lbl { width: 88px; color: rgba(102, 110, 160, 0.88); font-size: 10px; text-align: center; }
+.pref_row_full { display: flex; flex-direction: row; margin-top: 4px; height: 36px; flex: 0 0 36px; background-color: transparent; }
+.pref_input_full { flex: 1 1 auto; height: 30px; background-color: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px; color: #f0f2ff; font-size: 12px; padding: 5px 10px; }
+#settings_btns { display: flex; flex-direction: row; justify-content: flex-end; gap: 10px; background-color: transparent; margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(255, 255, 255, 0.06); flex: 0 0 48px; height: 48px; }
+
+/* ── Launchpad ── */
+#launchpad {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  background-color: rgba(6, 7, 18, 0.88);
+  display: flex; flex-direction: column; align-items: center;
+  padding-top: 56px; z-index: 700; border-radius: 0;
+}
+#lp_search {
+  width: 272px; height: 34px;
+  background-color: rgba(255, 255, 255, 0.11);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 10px; color: #f0f2ff; font-size: 13px; text-align: center;
+  padding: 6px 12px;
+}
+#lp_grid { width: 800px; height: 380px; display: flex; flex-direction: row; flex-wrap: wrap; justify-content: center; gap: 26px; margin-top: 40px; background-color: transparent; }
+.lp_app { width: 110px; display: flex; flex-direction: column; align-items: center; gap: 10px; cursor: pointer; background-color: transparent; }
+.lp_app:hover .lp_icon { box-shadow: 0 18px 44px rgba(0, 0, 0, 0.64), 0 0 0 2px rgba(140, 176, 255, 0.30); }
+.lp_icon { width: 72px; height: 72px; border-radius: 18px; color: #ffffff; font-size: 26px; font-weight: bold; text-align: center; padding-top: 18px; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.50); }
+.lp_label { width: 110px; color: rgba(220, 226, 252, 0.90); font-size: 12px; text-align: center; }
+#lp_hint  { color: rgba(100, 108, 158, 0.76); font-size: 12px; margin-top: 36px; }
+
+/* ── Notification toast ── */
+#toast {
+  position: absolute; right: 14px; top: 38px;
+  width: 340px; height: 76px;
+  background-color: rgba(20, 22, 46, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 16px;
+  box-shadow: 0 20px 52px rgba(0, 0, 0, 0.56),
+              inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  display: flex; flex-direction: row; align-items: center; gap: 14px;
+  padding: 14px 16px; z-index: 600;
+}
+#toast_icon { width: 44px; height: 44px; border-radius: 14px; flex: 0 0 44px; background: linear-gradient(145deg, #4e30a8, #362488); position: relative; }
+#toast_moon_disc { position: absolute; left: 12px; top: 12px; width: 20px; height: 20px; border-radius: 10px; background-color: #f4f6ff; }
+#toast_moon_bite { position: absolute; left: 20px; top: 9px;  width: 18px; height: 18px; border-radius: 9px;  background-color: #362488; }
+#toast_body  { flex: 1 1 auto; background-color: transparent; }
+#toast_title { color: #f5f5f7; font-size: 13px; font-weight: 600; }
+#toast_msg   { color: rgba(152, 160, 210, 0.88); font-size: 12px; margin-top: 2px; }
+#toast_close { width: 22px; height: 22px; flex: 0 0 22px; border-radius: 50%; background-color: rgba(255, 255, 255, 0.08); color: rgba(200, 208, 248, 0.78); font-size: 14px; text-align: center; padding-top: 1px; cursor: pointer; }
+#toast_close:hover { background-color: rgba(255, 255, 255, 0.18); }
+
+/* ── Confirmation dialog — macOS alert style ──
+ * flex column: icon → title → msg → separator → buttons
+ * No position:absolute on children; heights are part of the flow. */
+#confirm_overlay {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  background-color: rgba(4, 5, 16, 0.62);
+  z-index: 800; border-radius: 0;
+}
+#confirm_box {
+  position: absolute; left: 510px; top: 270px;
+  width: 420px; height: 248px;
+  background-color: rgba(22, 24, 48, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 20px;
+  box-shadow: 0 40px 100px rgba(0, 0, 0, 0.72),
+              0 8px 24px rgba(0, 0, 0, 0.40),
+              inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  display: flex; flex-direction: column; align-items: center;
+  padding: 28px 32px 22px 32px;
+}
+
+/* Luna icon above the dialog title */
+#confirm_icon {
+  width: 54px; height: 54px; border-radius: 16px;
+  background: linear-gradient(145deg, #4e30a8, #2e1c6e);
+  box-shadow: 0 8px 24px rgba(60, 30, 120, 0.50);
+  position: relative; flex: 0 0 54px;
+  margin-bottom: 14px;
+}
+#confirm_moon_disc { position: absolute; left: 14px; top: 14px; width: 24px; height: 24px; border-radius: 12px; background-color: #f0f4ff; }
+#confirm_moon_bite { position: absolute; left: 22px; top: 11px; width: 22px; height: 22px; border-radius: 11px; background-color: #2e1c6e; }
+
+#confirm_title { color: #f5f5f7; font-size: 17px; font-weight: 700; text-align: center; flex: 0 0 auto; margin-bottom: 8px; }
+#confirm_msg   { color: rgba(162, 170, 216, 0.88); font-size: 13px; text-align: center; flex: 1 1 auto; }
+
+#confirm_sep {
+  width: 100%; height: 1px;
+  background-color: rgba(255, 255, 255, 0.07);
+  flex: 0 0 1px; margin-top: 16px;
+}
+#confirm_btns {
+  display: flex; flex-direction: row; justify-content: center; gap: 12px;
+  background-color: transparent;
+  flex: 0 0 32px; height: 32px; margin-top: 14px;
+}
+#confirm_cancel { width: 88px; }
+#confirm_ok     { width: 124px; }
+
+/* ── Dialog / action buttons ── */
+.dlg_btn {
+  height: 32px; white-space: nowrap; flex: 0 0 auto;
+  padding: 7px 20px; border-radius: 10px;
+  background-color: rgba(255, 255, 255, 0.09);
+  color: #eaecff; font-size: 13px; font-weight: 500;
+  text-align: center; cursor: pointer;
+}
+.dlg_btn:hover         { background-color: rgba(255, 255, 255, 0.16); }
+.dlg_btn.primary       { background: linear-gradient(150deg, #1d7df8, #0a5ee0); box-shadow: 0 2px 8px rgba(10, 100, 220, 0.40); }
+.dlg_btn.primary:hover { background: linear-gradient(150deg, #3090ff, #1a70f2); }
+
+/* ── Dock ── */
+#dock {
+  position: absolute; bottom: 12px; left: 0;
+  width: 542px; height: 80px;
+  background-color: rgba(16, 18, 38, 0.70);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 24px;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.58),
+              0 2px 8px rgba(0, 0, 0, 0.32),
+              inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  display: flex; flex-direction: row; align-items: center; gap: 10px;
+  padding: 8px 14px; z-index: 450;
+}
+.dock_item { width: 54px; flex: 0 0 54px; display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer; background-color: transparent; }
+.dock_item:hover .dock_icon {
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.64),
+              0 0 0 2px rgba(170, 210, 255, 0.34),
+              0 0 18px rgba(140, 190, 255, 0.16);
+  opacity: 0.88;
+}
+.dock_icon { width: 52px; height: 52px; border-radius: 13px; color: #ffffff; font-size: 22px; font-weight: bold; text-align: center; padding-top: 12px; box-shadow: 0 8px 22px rgba(0, 0, 0, 0.46); }
+.dock_dot { width: 4px; height: 4px; border-radius: 50%; background-color: rgba(255, 255, 255, 0.78); }
+.dock_dot.spacer { background-color: transparent; }
+.dock_sep { width: 1px; flex: 0 0 1px; height: 54px; background-color: rgba(255, 255, 255, 0.14); }
+
+/* ── App icon gradients (dock & launchpad) ── */
+.g_files     { background: linear-gradient(145deg, #5ac8fa, #007aff); }
+.g_launchpad { background: linear-gradient(145deg, #e2e6f2, #a6b0c8); color: #283456; }
+.g_terminal  { background: linear-gradient(145deg, #191d2b, #090c14); color: #32d74b; font-size: 17px; padding-top: 16px; }
+.g_browser   { background: linear-gradient(145deg, #2eccd0, #5878e6); }
+.g_editor    { background: linear-gradient(145deg, #f4941a, #ffcc00); color: #563200; }
+.g_music     { background: linear-gradient(145deg, #f85878, #bc1862); }
+.g_settings  { background: linear-gradient(145deg, #9ca6b6, #6a7486); }
+.g_trash     { background: linear-gradient(145deg, #c8d0e0, #8a94ac); color: #343e58; }
+.g_demo      { background: linear-gradient(145deg, #a78bfa, #7838eb); font-size: 14px; padding-top: 16px; }
+.g_hello     { background: linear-gradient(145deg, #30d196, #10b880); color: #063824; font-size: 16px; padding-top: 15px; }

@@ -4,20 +4,20 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-PROFILE ?= release
-TARGET  := target/$(PROFILE)
-PORT    ?= 8081
-PREFIX  ?= /usr/local
-LU_LIB  := $(PREFIX)/lib/lu
+PROFILE  ?= release
+TARGET   := target/$(PROFILE)
+PORT     ?= 8081
+PREFIX   ?= /usr/local
+LUNA_LIB := $(PREFIX)/lib/luna
 # e.g. make webgl APP=/usr/bin/gtk4-demo
-APP     ?= $(TARGET)/hello-gtk
+APP      ?= $(TARGET)/hello-gtk
 
 GLFW_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 GLFW_LIBS   := $(shell pkg-config --libs glfw3 2>/dev/null)
 
 .PHONY: all build build-dri build-webgl build-desktop build-shell symlinks \
-        run server demo webgl run-gtk desktop lu-session install stop clean \
-        opengl_gui luna-ui sample
+        run server demo webgl run-gtk desktop luna-session install stop clean \
+        opengl_gui luna-shell luna-ui sample
 
 all: build symlinks
 
@@ -32,15 +32,15 @@ build-webgl:
 
 build-desktop: build-dri build-shell symlinks
 
-build-shell: opengl_gui luna-ui
+build-shell: luna-shell opengl_gui luna-ui
 
 # Symlink libwayland-client.so.0 (SONAME expected by GTK4)
 symlinks:
 	@echo "→ Creating symlinks in $(TARGET)/"
 	ln -sf libwayland_client.so $(TARGET)/libwayland-client.so.0
 	ln -sf libwayland_client.so $(TARGET)/libwayland-client.so
-	ln -sf vespera-server $(TARGET)/lu-compositor
-	ln -sf ../../opengl_gui $(TARGET)/lu-shell
+	ln -sf vespera-server $(TARGET)/luna-compositor
+	ln -sf ../../luna-shell $(TARGET)/luna-shell
 	@echo "✓ Done"
 
 UI_DIR = ui
@@ -51,8 +51,15 @@ $(UI_DIR)/demo.css.h $(UI_DIR)/demo.html.h: $(UI_DIR)/demo.css $(UI_DIR)/demo.ht
 $(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h: $(UI_DIR)/luna-ui.css $(UI_DIR)/luna-ui.html $(UI_DIR)/gen_include.sh
 	cd $(UI_DIR) && ./gen_include.sh luna-ui.css luna-ui.html
 
+$(UI_DIR)/luna-shell.css.h $(UI_DIR)/luna-shell.html.h: $(UI_DIR)/luna-shell.css $(UI_DIR)/luna-shell.html $(UI_DIR)/gen_include.sh
+	cd $(UI_DIR) && ./gen_include.sh luna-shell.css luna-shell.html
+
+luna-shell: $(UI_DIR)/luna-shell.c $(UI_DIR)/luna-ui.h $(UI_DIR)/stb_truetype.h $(UI_DIR)/stb_image_write.h $(UI_DIR)/luna-shell.css.h $(UI_DIR)/luna-shell.html.h
+	@echo "→ Building luna-shell (Luna Desktop shell)"
+	gcc -O2 -Wall -Wextra $(GLFW_CFLAGS) -I$(UI_DIR) $(UI_DIR)/luna-shell.c -o luna-shell -lm -lGL $(GLFW_LIBS)
+
 opengl_gui: $(UI_DIR)/opengl_gui.c $(UI_DIR)/luna-ui.h $(UI_DIR)/stb_truetype.h $(UI_DIR)/stb_image_write.h $(UI_DIR)/demo.css.h $(UI_DIR)/demo.html.h
-	@echo "→ Building lu-shell (opengl_gui)"
+	@echo "→ Building Luna UI demo host (opengl_gui)"
 	gcc -O2 -Wall -Wextra $(GLFW_CFLAGS) -I$(UI_DIR) $(UI_DIR)/opengl_gui.c -o opengl_gui -lm -lGL $(GLFW_LIBS)
 
 luna-ui: $(UI_DIR)/luna-ui.c $(UI_DIR)/luna-ui.h $(UI_DIR)/stb_truetype.h $(UI_DIR)/stb_image_write.h $(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h
@@ -115,32 +122,32 @@ webgl: build-webgl symlinks
 run-gtk: build-webgl symlinks
 	PROFILE=$(PROFILE) PORT=$(PORT) ./run-gtk $(APP)
 
-# Full Lu Desktop session (compositor + shell)
+# Full Luna Desktop session (compositor + shell)
 desktop: build-desktop
-	PROFILE=$(PROFILE) BACKEND=dri ./lu-session
+	PROFILE=$(PROFILE) BACKEND=dri ./luna-session
 
 # Software backend desktop (VM / no GPU)
 desktop-soft: build symlinks build-shell
-	PROFILE=$(PROFILE) BACKEND=software ./lu-session
+	PROFILE=$(PROFILE) BACKEND=software ./luna-session
 
-lu-session: build-desktop
-	chmod +x lu-session
+luna-session: build-desktop
+	chmod +x luna-session
 
 install: build-desktop
-	install -d $(PREFIX)/bin $(LU_LIB) $(PREFIX)/share/lu-desktop/shell
-	install -m 755 lu-session $(PREFIX)/bin/lu-session
-	install -m 755 $(TARGET)/vespera-server $(PREFIX)/bin/lu-compositor
-	install -m 755 opengl_gui $(PREFIX)/bin/lu-shell
-	install -m 755 $(TARGET)/libwayland_client.so $(LU_LIB)/
-	ln -sf libwayland_client.so $(LU_LIB)/libwayland-client.so.0
-	ln -sf libwayland_client.so $(LU_LIB)/libwayland-client.so
-	install -m 644 desktop/shell/layout.html desktop/shell/style.css $(PREFIX)/share/lu-desktop/shell/
-	install -m 644 ui/luna-ui.h ui/cssparser.h $(PREFIX)/share/lu-desktop/shell/
-	install -m 644 README.md $(PREFIX)/share/doc/lu-desktop/README.md 2>/dev/null || true
-	install -m 644 systemd/lu-desktop.service /etc/systemd/system/lu-desktop.service 2>/dev/null || \
-	  install -m 644 systemd/lu-desktop.service $(PREFIX)/share/lu-desktop/lu-desktop.service
+	install -d $(PREFIX)/bin $(LUNA_LIB) $(PREFIX)/share/luna-desktop/shell
+	install -m 755 luna-session $(PREFIX)/bin/luna-session
+	install -m 755 $(TARGET)/vespera-server $(PREFIX)/bin/luna-compositor
+	install -m 755 luna-shell $(PREFIX)/bin/luna-shell
+	install -m 755 $(TARGET)/libwayland_client.so $(LUNA_LIB)/
+	ln -sf libwayland_client.so $(LUNA_LIB)/libwayland-client.so.0
+	ln -sf libwayland_client.so $(LUNA_LIB)/libwayland-client.so
+	install -m 644 ui/luna-shell.html ui/luna-shell.css $(PREFIX)/share/luna-desktop/shell/
+	install -m 644 ui/luna-ui.h ui/cssparser.h $(PREFIX)/share/luna-desktop/shell/
+	install -m 644 README.md $(PREFIX)/share/doc/luna-desktop/README.md 2>/dev/null || true
+	install -m 644 systemd/luna-desktop.service /etc/systemd/system/luna-desktop.service 2>/dev/null || \
+	  install -m 644 systemd/luna-desktop.service $(PREFIX)/share/luna-desktop/luna-desktop.service
 	@echo "✓ Installed to $(PREFIX)"
-	@echo "  Enable boot: systemctl enable lu-desktop.service"
+	@echo "  Enable boot: systemctl enable luna-desktop.service"
 
 # Stop background compositor
 stop:
@@ -152,4 +159,7 @@ stop:
 
 clean:
 	cargo clean
-	rm -f opengl_gui luna-ui $(UI_DIR)/sample $(UI_DIR)/demo.css.h $(UI_DIR)/demo.html.h $(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h
+	rm -f opengl_gui luna-shell luna-ui $(UI_DIR)/sample \
+	  $(UI_DIR)/demo.css.h $(UI_DIR)/demo.html.h \
+	  $(UI_DIR)/luna-ui.css.h $(UI_DIR)/luna-ui.html.h \
+	  $(UI_DIR)/luna-shell.css.h $(UI_DIR)/luna-shell.html.h

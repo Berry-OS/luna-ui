@@ -1,9 +1,9 @@
 [Unit]
-Description=Lu Desktop Session
-Documentation=file:///usr/share/doc/lu-desktop/README.md
+Description=Luna Desktop Session
+Documentation=file:///usr/share/doc/luna-desktop/README.md
 After=systemd-user-sessions.service plymouth-quit.service
 Conflicts=getty@tty1.service
-ConditionPathExists=/usr/bin/lu-session
+ConditionPathExists=/usr/bin/luna-session
 
 [Service]
 Type=simple
@@ -14,7 +14,7 @@ TTYVHangup=yes
 TTYVTDisallocate=yes
 Environment=XDG_RUNTIME_DIR=/run/user/0
 Environment=BACKEND=dri
-ExecStart=/usr/bin/lu-session
+ExecStart=/usr/bin/luna-session
 Restart=on-failure
 RestartSec=2
 StandardInput=tty

@@ -25,13 +25,11 @@ static int g_select_panel_idx = -1;
 static int g_clock_idx = -1;
 static double g_last_clock_update = 0.0;
 
-static const char* g_layout_path = "ui/demo.html";
-static const char* g_css_path = "ui/demo.css";
-#define DEMO_CSS_INCLUDE
+static const char* g_layout_path = NULL;
+static const char* g_css_path = NULL;
 static const char* default_css =
 #include "demo.css.h"
 ;
-#define DEMO_HTML_INCLUDE
 static const char* default_html =
 #include "demo.html.h"
 ;
@@ -419,14 +417,23 @@ int main(int argc, char** argv) {
     LunaInitConfig cfg = { luna_window_width, luna_window_height, plat_proc };
     if (!luna_init(&cfg)) { fprintf(stderr, "luna_init failed\n"); return 1; }
 
-    luna_set_html_base_dir(g_layout_path);
-    if (!luna_load_html_file(g_layout_path) && !g_desktop_mode) {
+    if (g_layout_path) {
+        luna_set_html_base_dir(g_layout_path);
+        if (!luna_load_html_file(g_layout_path)) {
+            luna_set_html_base_dir("ui");
+            luna_parse_html(default_html);
+        }
+    } else {
         luna_set_html_base_dir("ui");
         luna_parse_html(default_html);
     }
     if (!luna_css_from_document) {
-        if (!luna_load_css_file(g_css_path) && !g_desktop_mode)
+        if (g_css_path) {
+            if (!luna_load_css_file(g_css_path))
+                luna_parse_css(default_css);
+        } else {
             luna_parse_css(default_css);
+        }
     }
     luna_inject_body_background();
     register_demo_handlers();

@@ -1,9 +1,11 @@
 **🚀 Luna Desktop**
 
-A **pure Rust** Wayland compositor + custom `libwayland-client` implementation + OpenGL desktop shell (`lu-shell` / `opengl_gui.c`). Run GTK4 apps while replacing Xorg or Weston!
+A **pure Rust** Wayland compositor + custom `libwayland-client` implementation + macOS-style desktop shell (`luna-shell` / `ui/luna-shell.c`). Run GTK4 apps while replacing Xorg or Weston!
 
 [![Sponsor](https://img.shields.io/badge/Sponsor%20this%20project-%E2%9D%A4%EF%B8%8F-white?logo=githubsponsors&logoColor=EA4AAA&labelColor=EA4AAA)](https://github.com/sponsors/yui0)
 
+![Screenshot](ui/sample_01.png)
+![Screenshot](ui/sample_02.png)
 ![Screenshot](screenshot.png)
 
 ---
@@ -13,23 +15,38 @@ A **pure Rust** Wayland compositor + custom `libwayland-client` implementation +
 | Name              | Actual Binary       | Role |
 |-------------------|---------------------|------|
 | **Luna Desktop**  | Full session        | The complete desktop environment users see after kernel boot |
-| **lu-compositor** | `vespera-server`    | DRM/KMS Wayland compositor (Xorg/Weston replacement) |
-| **lu-shell**      | `opengl_gui`        | Wallpaper, taskbar & shell UI (luUI engine) |
-| **Luna UI**       | `opengl_gui.c` HTML/CSS engine | UI toolkit for shell & settings apps |
+| **luna-compositor** | `vespera-server`  | DRM/KMS Wayland compositor (Xorg/Weston replacement) |
+| **luna-shell**    | `ui/luna-shell.c`   | macOS-style menu bar, Dock, Launchpad & widgets (Luna UI engine) |
+| **Luna UI**       | `ui/luna-ui.h` HTML/CSS engine | UI toolkit for shell & settings apps |
 | **wayland-client-rs** | `libwayland_client.so` | Pure Rust client lib that GTK apps connect to |
 
 **Internal codename:** Vespera
-**User-facing name:** **Lu** (short, memorable, like GNOME/KDE)
+**User-facing name:** **Luna** (short, memorable, like GNOME/KDE)
 
 ## 🔄 Boot Flow (After Kernel)
 
 ```bash
 systemd / init
-  └─ lu-session
-       ├─ lu-compositor  (vespera-server --backend dri) ✨
-       ├─ lu-shell       (opengl_gui --desktop) 🖼️
-       └─ GTK Apps       (WAYLAND_DISPLAY + LD_PRELOAD=libwayland-client) 📱
+  └─ luna-session
+       ├─ luna-compositor  (vespera-server --backend dri) ✨
+       ├─ luna-shell       (luna-shell --desktop) 🌙
+       └─ GTK Apps         (WAYLAND_DISPLAY + LD_PRELOAD=libwayland-client) 📱
 ```
+
+## 🌙 luna-shell — the Luna Desktop shell
+
+`ui/luna-shell.c` renders a full macOS-style desktop with the Luna UI engine alone:
+
+- Translucent menu bar — crescent-moon Luna menu, clock, network & power status
+- Dock with hover magnification, running-app indicators and Trash
+- Launchpad app grid with incremental search (Super / F4)
+- Control Center — toggles, brightness/volume sliders, CPU/RAM meters
+- Desktop widgets — clock plus CPU/memory/disk stats read from /proc
+- About This Luna, notification toasts, Shut Down / Restart / Log Out dialogs
+
+Dock & Launchpad apps are overridable via `LUNA_APP_<NAME>` (e.g. `LUNA_APP_TERMINAL=foot`).
+The layout (`ui/luna-shell.html` + `ui/luna-shell.css`) is embedded into the binary and can be
+replaced with `LUNA_DESKTOP_LAYOUT` / `LUNA_DESKTOP_CSS` or `--layout` / `--css`.
 
 Wayland protocol is used as an **internal bus**. No Weston, Mutter, or Xorg needed. GTK4 connects directly to the Vespera compositor.
 
@@ -37,22 +54,22 @@ Wayland protocol is used as an **internal bus**. No Weston, Mutter, or Xorg need
 
 ```bash
 cd vespera
-make desktop              # 🚀 DRI + lu-shell (GPU console)
+make desktop              # 🚀 DRI + luna-shell (GPU console)
 make desktop-soft         # 💻 Software backend (great for VMs)
 
 # Launch with GTK apps
-LU_APPS="target/release/hello-gtk" make desktop
+LUNA_APPS="target/release/hello-gtk" make desktop
 ```
 
 ## 📦 Production Install (Launch Desktop on tty1)
 
 ```bash
 sudo make install PREFIX=/usr/local
-sudo systemctl enable lu-desktop.service
-sudo systemctl start lu-desktop.service
+sudo systemctl enable luna-desktop.service
+sudo systemctl start luna-desktop.service
 ```
 
-Works alongside `getty@tty1` auto-login. For manual testing with existing sessions, just run `lu-session`.
+Works alongside `getty@tty1` auto-login. For manual testing with existing sessions, just run `luna-session`.
 
 ## 📁 Directory Structure
 

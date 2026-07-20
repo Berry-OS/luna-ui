@@ -1,14 +1,15 @@
 #!/bin/bash
-# Copyright © 2026 Yuichiro Nakada / Project Lu (Vespera)
+# Copyright © 2026 Yuichiro Nakada / Project Luna (Vespera)
 #
-# Lu Desktop session launcher.
-# Starts the compositor (vespera-server), desktop shell (lu-shell), and optional apps.
+# Luna Desktop session launcher.
+# Starts the compositor (luna-compositor), desktop shell (luna-shell),
+# and optional apps — right after kernel boot, instead of Xorg/Weston.
 #
 # Usage:
-#   ./lu-session                          # DRI compositor + lu-shell
-#   BACKEND=software ./lu-session         # software compositor (dev / VM)
-#   LU_APPS="hello-gtk" ./lu-session      # launch GTK apps after shell
-#   INSTALL_PREFIX=/usr/local make install && lu-session
+#   ./luna-session                          # DRI compositor + luna-shell
+#   BACKEND=software ./luna-session         # software compositor (dev / VM)
+#   LUNA_APPS="hello-gtk" ./luna-session    # launch GTK apps after shell
+#   INSTALL_PREFIX=/usr/local make install && luna-session
 
 set -euo pipefail
 
@@ -16,15 +17,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="${PROFILE:-release}"
 PREFIX="${INSTALL_PREFIX:-$SCRIPT_DIR}"
 TARGET="$SCRIPT_DIR/target/$PROFILE"
-BIN="${LU_BIN:-$PREFIX/bin}"
-LIB="${LU_LIB:-$PREFIX/lib/lu}"
+BIN="${LUNA_BIN:-$PREFIX/bin}"
+LIB="${LUNA_LIB:-$PREFIX/lib/luna}"
 BACKEND="${BACKEND:-dri}"
-SOCKET="${LU_SOCKET:-wayland-0}"
-SIZE="${LU_SIZE:-}"
-PORT="${LU_WEBGL_PORT:-}"
+SOCKET="${LUNA_SOCKET:-wayland-0}"
+SIZE="${LUNA_SIZE:-}"
+PORT="${LUNA_WEBGL_PORT:-}"
 
 # Dev mode: use local build artifacts when not installed.
-if [ ! -x "$BIN/lu-compositor" ] && [ -x "$TARGET/vespera-server" ]; then
+if [ ! -x "$BIN/luna-compositor" ] && [ -x "$TARGET/vespera-server" ]; then
     BIN="$TARGET"
     LIB="$TARGET"
 fi
@@ -32,9 +33,6 @@ fi
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
-
-export LU_DESKTOP_LAYOUT="${LU_DESKTOP_LAYOUT:-$SCRIPT_DIR/desktop/shell/layout.html}"
-export LU_DESKTOP_CSS="${LU_DESKTOP_CSS:-$SCRIPT_DIR/desktop/shell/style.css}"
 
 COMPOSITOR_PID=""
 SHELL_PID=""
@@ -50,18 +48,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [ ! -x "$BIN/lu-compositor" ] && [ ! -x "$BIN/vespera-server" ]; then
-    echo "→ Lu compositor not found; building from source..."
+if [ ! -x "$BIN/luna-compositor" ] && [ ! -x "$BIN/vespera-server" ]; then
+    echo "→ Luna compositor not found; building from source..."
     make -C "$SCRIPT_DIR" build-desktop PROFILE="$PROFILE"
     BIN="$TARGET"
     LIB="$TARGET"
 fi
 
-COMPOSITOR="$BIN/lu-compositor"
+COMPOSITOR="$BIN/luna-compositor"
 [ -x "$COMPOSITOR" ] || COMPOSITOR="$BIN/vespera-server"
 
-SHELL_BIN="$BIN/lu-shell"
-[ -x "$SHELL_BIN" ] || SHELL_BIN="$SCRIPT_DIR/opengl_gui"
+SHELL_BIN="$BIN/luna-shell"
+[ -x "$SHELL_BIN" ] || SHELL_BIN="$SCRIPT_DIR/luna-shell"
 
 ln -sf libwayland_client.so "$TARGET/libwayland-client.so.0" 2>/dev/null || true
 ln -sf libwayland_client.so "$TARGET/libwayland-client.so" 2>/dev/null || true
@@ -74,7 +72,7 @@ if [ "$BACKEND" = "webgl" ]; then
   COMPOSITOR_ARGS+=(--port "${PORT:-8081}")
 fi
 
-echo "→ Starting Lu compositor (backend=$BACKEND, socket=$SOCKET)"
+echo "→ Starting Luna compositor (backend=$BACKEND, socket=$SOCKET)"
 "$COMPOSITOR" "${COMPOSITOR_ARGS[@]}" &
 COMPOSITOR_PID=$!
 sleep 0.6
@@ -83,13 +81,16 @@ export WAYLAND_DISPLAY="$SOCKET"
 export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_PRELOAD="$LIB/libwayland-client.so.0"
 
-echo "→ Starting Lu shell"
+# Make sample apps (hello-gtk) reachable for the shell's dock/launchpad.
+export PATH="$TARGET:$PATH"
+
+echo "→ Starting Luna shell"
 "$SHELL_BIN" --desktop &
 SHELL_PID=$!
 sleep 0.3
 
-if [ -n "${LU_APPS:-}" ]; then
-    for app in $LU_APPS; do
+if [ -n "${LUNA_APPS:-}" ]; then
+    for app in $LUNA_APPS; do
         echo "→ Launching app: $app"
         $app &
         APP_PIDS+=($!)

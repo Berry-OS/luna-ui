@@ -7,6 +7,16 @@
   <link rel="stylesheet" type="text/css" href="demo.css">
 </head>
 <body>
+
+<!-- Notification pill (top centre) -->
+<div id="notif_pill">
+  <div id="notif_dot"></div>
+  <p id="notif_text">VPN connected — 7 peers online</p>
+  <p id="notif_close">✕</p>
+</div>
+
+
+<!-- Main window -->
 <div id="main_win" class="window focused">
   <div id="title_bar">
     <div id="title_drag" class="title_drag" draggable="1"></div>
@@ -23,48 +33,14 @@
     <div id="nav_2" class="nav_item" onclick="onNavClick()">Appearance<div id="nav_dot_2" class="nav_dot"></div></div>
     <div id="nav_3" class="nav_item" onclick="onNavClick()">Network</div>
     <div id="nav_4" class="nav_item" onclick="onNavClick()">Security</div>
-    <div id="tag_cloud">
-      <div class="tag">CSS</div>
-      <div class="tag">Flex</div>
-      <div class="tag wide">Shrink</div>
-      <div class="tag">Grid</div>
-      <div class="tag">Flow</div>
-      <div class="tag wide">Clip</div>
+    <div id="sidebar_vpn_block">
+      <div id="sidebar_vpn_dot"></div>
+      <p id="sidebar_vpn_label">VPN Active</p>
     </div>
-    <div id="shrink_row">
-      <div class="shrink_item">A</div>
-      <div class="shrink_item">BB</div>
-      <div class="shrink_item">CCC</div>
-      <div class="shrink_item">DD</div>
-    </div>
-    <div id="dense_demo">
-      <div id="dense_wide" class="dense_cell">Wide</div>
-      <div class="dense_cell">1</div>
-      <div class="dense_cell">2</div>
-      <div class="dense_cell">3</div>
-      <div class="dense_cell">4</div>
-    </div>
-    <div id="col_dense_demo">
-      <div id="col_dense_tall" class="col_dense_cell">T</div>
-      <div id="col_dense_b" class="col_dense_cell">B</div>
-      <div class="col_dense_cell">1</div>
-      <div class="col_dense_cell">2</div>
-      <div class="col_dense_cell">3</div>
-    </div>
-    <div id="stat_cpu" class="stat_card">
-      <p class="stat_label">CPU</p>
-      <p class="stat_val">42%</p>
-      <div class="stat_bar_bg"><div id="cpu_bar_fill" class="stat_bar_fill"></div></div>
-    </div>
-    <div id="stat_mem" class="stat_card">
-      <p class="stat_label">MEM</p>
-      <p class="stat_val">2.4G</p>
-      <div class="stat_bar_bg"><div id="mem_bar_fill" class="stat_bar_fill"></div></div>
-    </div>
-    <div id="stat_net" class="stat_card">
-      <p class="stat_label">NET</p>
-      <p class="stat_val">72K</p>
-      <div class="stat_bar_bg"><div id="net_bar_fill" class="stat_bar_fill"></div></div>
+    <div id="sidebar_stats_block">
+      <div class="sidebar_stat_row"><p class="ss_key">Peers</p><p class="ss_val">7</p></div>
+      <div class="sidebar_stat_row"><p class="ss_key">Ping</p><p class="ss_val">12 ms</p></div>
+      <div class="sidebar_stat_row"><p class="ss_key">Speed</p><p class="ss_val">1.2 MB/s</p></div>
     </div>
     <p id="sidebar_version">v3.12.0 — Vespera</p>
   </div>
@@ -73,21 +49,19 @@
     <p id="desc" aria-live="polite">Position, px units, browser-matched CSS.</p>
     <div id="sep1"></div>
     <div id="toolbar">
-      <div id="tool_save" class="tool_btn active" role="button" aria-label="Save settings" onclick="onToolClick()">Save</div>
+      <div id="tool_save" class="tool_btn active" role="button" onclick="onToolClick()">Save</div>
       <div id="tool_reset" class="tool_btn" role="button" onclick="onToolClick()">Reset</div>
       <div id="tool_export" class="tool_btn" role="button" onclick="onToolClick()">Export</div>
     </div>
-    <div id="apply_btn" aria-label="Apply all pending settings" onclick="onApply()">Apply Changes</div>
+    <div id="apply_btn" onclick="onApply()">Apply Changes</div>
     <div id="chip_row">
-      <div class="chip accent" aria-hidden="true">CSS</div>
-      <div class="chip" aria-hidden="true">Flex</div>
+      <div class="chip accent">CSS</div>
+      <div class="chip">Flex</div>
       <div class="chip">Grid</div>
       <div class="chip">HSL</div>
       <div class="chip">Wrap</div>
-      <div class="chip">Self</div>
-      <div id="chip_wide" class="chip">Axis</div>
       <div class="chip">GLSL</div>
-      <div class="chip">Focus</div>
+      <div id="chip_wide" class="chip">Focus</div>
     </div>
     <p id="toggle_row_label">Dark Mode</p>
     <div id="toggle_knob_track" class="toggle" onclick="onToggleClick()">
@@ -112,50 +86,30 @@
     <div id="hscroll_panel">
       <div id="hscroll_inner">
         <div id="hs_pin" class="hscroll_chip">Pin</div>
-        <div id="hs_1" class="hscroll_chip">Alpha</div>
-        <div id="hs_2" class="hscroll_chip">Beta</div>
-        <div id="hs_3" class="hscroll_chip">Gamma</div>
-        <div id="hs_4" class="hscroll_chip">Delta</div>
-        <div id="hs_5" class="hscroll_chip">Epsilon</div>
-        <div id="hs_6" class="hscroll_chip">Zeta</div>
+        <div class="hscroll_chip">Alpha</div>
+        <div class="hscroll_chip">Beta</div>
+        <div class="hscroll_chip">Gamma</div>
+        <div class="hscroll_chip">Delta</div>
+        <div class="hscroll_chip">Epsilon</div>
+        <div class="hscroll_chip">Zeta</div>
       </div>
     </div>
-    <p id="progress_label">Syncing...</p>
     <div id="progress_track">
       <div id="progress_fill"></div>
     </div>
-    <!-- activity_panel uses normal document flow for scrollable items -->
     <div id="activity_panel">
       <div id="activity_header" class="activity_sticky">Recent Activity</div>
-      <div id="act_1" class="activity_line">Sync complete — 2 min ago</div>
-      <div id="act_2" class="activity_line">Theme applied — Indigo</div>
-      <div id="act_3" class="activity_line">Network profile updated</div>
-      <div id="act_4" class="activity_line">Backup finished — 128 files</div>
-      <div id="act_5" class="activity_line">Driver update available</div>
-      <div id="act_6" class="activity_line">VPN connected — qberry</div>
+      <div class="activity_line">Sync complete — 2 min ago</div>
+      <div class="activity_line">Theme applied — Indigo</div>
+      <div class="activity_line">Network profile updated</div>
+      <div class="activity_line">Backup finished — 128 files</div>
+      <div class="activity_line">VPN connected — qberry</div>
       <div id="activity_footer" class="activity_sticky_bottom">End of feed</div>
     </div>
-    <div id="badge_active" class="badge">Active</div>
-    <div id="badge_update" class="badge">Update</div>
-    <div id="badge_err"    class="badge">Error</div>
-    <div id="sep2"></div>
-    <div id="metrics_row">
-      <div id="mp_online" class="metric_pill">
-        <p id="mp_val_online" class="mp_val">Online</p>
-        <p id="mp_lbl_online" class="mp_label">STATUS</p>
-      </div>
-      <div id="mp_peers" class="metric_pill">
-        <p id="mp_val_peers" class="mp_val">7</p>
-        <p id="mp_lbl_peers" class="mp_label">PEERS</p>
-      </div>
-      <div id="mp_latency" class="metric_pill">
-        <p id="mp_val_lat" class="mp_val">12ms</p>
-        <p id="mp_lbl_lat" class="mp_label">PING</p>
-      </div>
-    </div>
-    <p id="status_text" aria-live="assertive">v3.12.0 — Vespera GUI Engine</p>
   </div>
 </div>
+
+<!-- Right column: Toast -->
 <div id="toast" class="window card">
   <div id="toast_bar">
     <div id="toast_drag" draggable="1"></div>
@@ -165,19 +119,8 @@
     <div id="toast_close" onclick="onToastDismiss()"></div>
   </div>
 </div>
-<div id="info_win" class="window card">
-  <div id="info_drag" draggable="1"></div>
-  <div id="info_close" onclick="onInfoClose()"></div>
-  <div id="info_icon"></div>
-  <p id="info_title">Vespera GUI Engine</p>
-  <p id="info_msg">OpenGL window manager with CSS styling, gradients, and smooth transitions.</p>
-</div>
-<div id="dock" class="window">
-  <div id="dock_icon_info" class="dock_icon" onclick="onDockInfo()">i<p class="dock_label">Info</p></div>
-  <div id="dock_icon_theme" class="dock_icon" onclick="onDockTheme()">T<p class="dock_label">Theme</p></div>
-  <div id="dock_icon_notify" class="dock_icon" onclick="onDockNotify()">N<p class="dock_label">Alert</p></div>
-  <div id="dock_icon_toast" class="dock_icon" onclick="onDockToast()">✕<p class="dock_label">Toast</p></div>
-</div>
+
+<!-- Right column: System stats glass card -->
 <div id="quick_stats">
   <p id="qs_title">SYSTEM</p>
   <div id="qs_row1" class="qs_row">
@@ -198,23 +141,8 @@
   <div id="qs_bar"><div id="qs_bar_fill"></div></div>
   <p id="qs_footer">61% CAPACITY</p>
 </div>
-<div id="vtoolbar">
-  <div id="vtb_home" class="vtb active">H</div>
-  <div id="vtb_net" class="vtb">N</div>
-  <div id="vtb_sec" class="vtb">S</div>
-  <div id="vtb_sep"></div>
-  <div id="vtb_app" class="vtb">A</div>
-  <div id="vtb_log" class="vtb">L</div>
-  <div id="vtb_sep2"></div>
-  <div id="vtb_ai" class="vtb">AI</div>
-  <div id="vtb_cfg" class="vtb">C</div>
-</div>
-<div id="ai_card">
-  <p id="ai_title">AI ASSISTANT</p>
-  <div id="ai_orb"></div>
-  <p id="ai_status">Ready</p>
-  <p id="ai_hint">Click to open</p>
-</div>
+
+<!-- Right column: Connection status -->
 <div id="status_card">
   <p id="sc_title">CONNECTION</p>
   <div id="sc_dot"></div>
@@ -228,22 +156,16 @@
     <p class="sc_rval">7 online</p>
   </div>
 </div>
-<!-- Notification pill -->
-<div id="notif_pill">
-  <div id="notif_dot"></div>
-  <p id="notif_text">VPN connected — 7 peers online</p>
-  <p id="notif_close">✕</p>
+
+<!-- Right column: AI assistant -->
+<div id="ai_card">
+  <p id="ai_title">AI ASSISTANT</p>
+  <div id="ai_orb"></div>
+  <p id="ai_status">Ready</p>
+  <p id="ai_hint">Click to open</p>
 </div>
 
-<!-- Media / Image card -->
-<div id="media_card">
-  <img id="media_img" src="avatar.jpg" alt="">
-  <p id="media_label">Preview</p>
-  <p id="media_sub">background-image</p>
-  <div id="media_badge">NEW</div>
-</div>
-
-<!-- Transfer card -->
+<!-- Right column: Transfer -->
 <div id="transfer_card">
   <p id="tc_title">TRANSFER</p>
   <div id="tc_icon"></div>
@@ -251,69 +173,35 @@
   <div id="tc_bar_bg"><div id="tc_bar_fill"></div></div>
 </div>
 
-<!-- Pill tab bar -->
-<div id="tab_bar">
-  <div class="tab_pill active" onclick="onTabPillClick()">All</div>
-  <div class="tab_pill" onclick="onTabPillClick()">VPN</div>
-  <div class="tab_pill" onclick="onTabPillClick()">Log</div>
-</div>
-
-<!-- Color swatches -->
-<div id="swatch_row">
-  <div id="sw1" class="swatch sel" onclick="onSwatchClick()"></div>
-  <div id="sw2" class="swatch" onclick="onSwatchClick()"></div>
-  <div id="sw3" class="swatch" onclick="onSwatchClick()"></div>
-  <div id="sw4" class="swatch" onclick="onSwatchClick()"></div>
-  <div id="sw5" class="swatch" onclick="onSwatchClick()"></div>
-</div>
-
-<!-- Keyboard shortcuts card -->
-<div id="kbd_card">
-  <p id="kbd_title">SHORTCUTS</p>
-  <div id="kr1" class="kbd_row">
-    <p class="kbd_label">Connect</p>
-    <p class="kbd_key">⌘ C</p>
-  </div>
-  <div id="kr2" class="kbd_row">
-    <p class="kbd_label">Settings</p>
-    <p class="kbd_key">⌘ ,</p>
-  </div>
-  <div id="kr3" class="kbd_row">
-    <p class="kbd_label">Quit</p>
-    <p class="kbd_key">⌘ Q</p>
-  </div>
-</div>
-
-<div id="cmd_palette">
-  <p id="cmd_icon">⌘</p>
-  <p id="cmd_text">Search or type a command...</p>
-  <p id="cmd_key">⌘ K</p>
+<!-- Dock (bottom centre) -->
+<div id="dock" class="window">
+  <div id="dock_icon_info" class="dock_icon" onclick="onDockToggleToast()">i<p class="dock_label">Info</p></div>
+  <div id="dock_icon_theme" class="dock_icon" onclick="onDockTheme()">T<p class="dock_label">Theme</p></div>
+  <div id="dock_icon_notify" class="dock_icon" onclick="onDockNotify()">N<p class="dock_label">Alert</p></div>
+  <div id="dock_icon_toast" class="dock_icon" onclick="onDockToast()">✕<p class="dock_label">Toast</p></div>
 </div>
 
 <!-- Floating Action Button -->
 <div id="fab" onclick="onScreenshot()" title="Screenshot (F12)">📷</div>
 
+<!-- Modal overlay -->
 <div id="modal_overlay" class="overlay hidden">
   <div id="modal_dialog" class="window">
     <div id="modal_icon"></div>
     <p id="modal_title">Apply Changes?</p>
     <p id="modal_msg">Your preferences will be updated immediately.</p>
-    <div id="modal_cancel" role="button" aria-label="Cancel dialog" onclick="onModalCancel()">Cancel</div>
-    <div id="modal_confirm" role="button" aria-label="Confirm and apply" onclick="onModalConfirm()">Apply</div>
+    <div id="modal_cancel" role="button" onclick="onModalCancel()">Cancel</div>
+    <div id="modal_confirm" role="button" onclick="onModalConfirm()">Apply</div>
   </div>
 </div>
+
 <script>
-/* Browser implementations — opengl_gui maps the same names to C handlers */
 function _el() { return event && event.currentTarget; }
 function onClose() { window.close(); }
 function onMinimize() {}
 function onMaximize() {}
-function onApply() {
-  document.getElementById('modal_overlay').classList.remove('hidden');
-}
-function onModalCancel() {
-  document.getElementById('modal_overlay').classList.add('hidden');
-}
+function onApply() { document.getElementById('modal_overlay').classList.remove('hidden'); }
+function onModalCancel() { document.getElementById('modal_overlay').classList.add('hidden'); }
 function onModalConfirm() {
   document.getElementById('desc').textContent = 'Settings applied. Gradient CSS engine active!';
   document.getElementById('modal_overlay').classList.add('hidden');
@@ -334,36 +222,24 @@ function onToggleClick() { _el().classList.toggle('on'); }
 function onCheckboxClick() {
   const el = _el();
   el.classList.toggle('checked');
-  document.getElementById('chk_label').textContent = el.classList.contains('checked') ? 'Notifications: On' : 'Enable Notifications';
+  document.getElementById('chk_label').textContent =
+    el.classList.contains('checked') ? 'Notifications: On' : 'Enable Notifications';
 }
-function onSelectToggle() {
-  document.getElementById('select_panel').classList.toggle('hidden');
-}
+function onSelectToggle() { document.getElementById('select_panel').classList.toggle('hidden'); }
 function onSelectOption() {
   const el = _el();
   document.getElementById('theme_select_box').textContent = el.textContent + '  ▾';
   document.getElementById('select_panel').classList.add('hidden');
 }
 function onToastDismiss() { document.getElementById('toast').style.display = 'none'; }
-function onInfoClose() { document.getElementById('info_win').style.display = 'none'; }
-function onDockInfo() {
-  const w = document.getElementById('info_win');
-  w.style.display = w.style.display === 'none' ? '' : 'none';
+function onDockToggleToast() {
+  const t = document.getElementById('toast');
+  t.style.display = t.style.display === 'none' ? '' : 'none';
 }
-function onDockTheme() { onToggleClick.call(document.getElementById('toggle_knob_track')); }
-function onDockNotify() { onCheckboxClick.call(document.getElementById('checkbox_notify')); }
+function onDockTheme() { document.getElementById('toggle_knob_track').classList.toggle('on'); }
+function onDockNotify() { document.getElementById('checkbox_notify').classList.toggle('checked'); }
 function onDockToast() { document.getElementById('toast').style.display = ''; }
-function onSwatchClick() {
-  const el = _el();
-  document.querySelectorAll('.swatch').forEach(s => s.classList.remove('sel'));
-  el.classList.add('sel');
-}
-function onTabPillClick() {
-  const el = _el();
-  el.parentElement.querySelectorAll('.tab_pill').forEach(p => p.classList.remove('active'));
-  el.classList.add('active');
-}
-function onScreenshot() { alert('Screenshot: press F12 in Vespera GUI, or use Print Screen in browser.'); }
+function onScreenshot() { alert('Screenshot: press F12 in Vespera GUI, or Print Screen in browser.'); }
 </script>
 </body>
 </html>
