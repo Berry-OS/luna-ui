@@ -23,6 +23,10 @@ static int g_modal_overlay_idx = -1;
 static int g_info_win_idx = -1;
 static int g_select_panel_idx = -1;
 static int g_clock_idx = -1;
+static int g_brightness_thumb_idx = -1;
+static int g_brightness_track_idx = -1;
+static int g_brightness_fill_idx = -1;
+static int g_brightness_label_idx = -1;
 static double g_last_clock_update = 0.0;
 
 static const char* g_layout_path = NULL;
@@ -271,6 +275,37 @@ static void bind_demo_indices(void) {
     g_info_win_idx      = luna_get_element_by_id("info_win");
     g_select_panel_idx  = luna_get_element_by_id("select_panel");
     g_clock_idx         = luna_get_element_by_id("clock");
+    g_brightness_thumb_idx = luna_get_element_by_id("slider_thumb");
+    g_brightness_track_idx = luna_get_element_by_id("slider_track");
+    g_brightness_fill_idx  = luna_get_element_by_id("slider_fill");
+    g_brightness_label_idx = luna_get_element_by_id("slider_label");
+}
+
+static void update_brightness_slider(void) {
+    if (g_brightness_thumb_idx == -1 || g_brightness_track_idx == -1) return;
+    LunaElement* thumb = luna_element_at(g_brightness_thumb_idx);
+    LunaElement* track = luna_element_at(g_brightness_track_idx);
+    if (!thumb || !track) return;
+    float usable = track->w - thumb->w;
+    if (usable < 1.0f) usable = 1.0f;
+    if (thumb->rel_x < 0.0f) thumb->rel_x = 0.0f;
+    if (thumb->rel_x > usable) thumb->rel_x = usable;
+    thumb->pos_overridden_x = 1;
+    float ratio = thumb->rel_x / usable;
+    if (g_brightness_fill_idx != -1) {
+        LunaElement* fill = luna_element_at(g_brightness_fill_idx);
+        fill->w = thumb->rel_x + thumb->w * 0.5f;
+        if (fill->w < 0.0f) fill->w = 0.0f;
+        if (fill->w > track->w) fill->w = track->w;
+        fill->has_css_width = 1;
+        fill->css_width = fill->w;
+        fill->pos_overridden_x = 1;
+    }
+    if (g_brightness_label_idx != -1) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Brightness: %d%%", (int)(ratio * 100.0f + 0.5f));
+        luna_set_text(g_brightness_label_idx, buf);
+    }
 }
 
 static void register_demo_handlers(void) {
@@ -284,6 +319,7 @@ static void register_demo_handlers(void) {
     luna_register_js_handler("onToastDismiss", toast_dismiss);
     luna_register_js_handler("onInfoClose", info_close_click);
     luna_register_js_handler("onDockInfo", dock_toggle_info_click);
+    luna_register_js_handler("onDockToggleToast", dock_toggle_info_click);
     luna_register_js_handler("onDockTheme", dock_toggle_theme_click);
     luna_register_js_handler("onDockNotify", dock_toggle_notify_click);
     luna_register_js_handler("onDockToast", dock_reopen_toast_click);
@@ -461,6 +497,7 @@ int main(int argc, char** argv) {
         glClearColor(0.06f, 0.06f, 0.10f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         luna_update(now, dt);
+        update_brightness_slider();
         update_clock(now);
         luna_render(fbw, fbh);
         glfwSwapBuffers(g_window);

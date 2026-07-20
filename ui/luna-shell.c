@@ -520,20 +520,6 @@ static void center_element(int idx) {
     luna_mark_layout_dirty();
 }
 
-/* Center the dock horizontally — replaces unsupported CSS transform: translateX(-50%). */
-static void center_dock(void) {
-    int idx = luna_get_element_by_id("dock");
-    if (idx < 0) return;
-    LunaElement* e = luna_element_at(idx);
-    float dw = (e->css_width > 0) ? e->css_width : (e->w > 10 ? e->w : 542.0f);
-    float target = floorf((luna_window_width - dw) * 0.5f);
-    if (!e->pos_overridden_x || fabsf(e->rel_x - target) > 0.5f) {
-        e->rel_x = target;
-        e->pos_overridden_x = 1;
-        luna_mark_layout_dirty();
-    }
-}
-
 /* ── Toast notifications ── */
 
 static void toast_show(const char* title, const char* msg, double secs) {
@@ -1476,7 +1462,6 @@ int main(int argc, char** argv) {
         update_stats();
         update_launchpad_filter();
         poll_shell_state();
-        center_dock();
         slider_tick("bright_thumb", "bright_fill", "bright_track");
         slider_tick("vol_thumb", "vol_fill", "vol_track");
         if (g_toast_deadline > 0.0 && g_now > g_toast_deadline) {

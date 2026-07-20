@@ -488,18 +488,21 @@ const char* blur_fs =
     "in vec2 FragPos;\n"
     "out vec4 FragColor;\n"
     "uniform sampler2D uSrc;\n"
+    "uniform vec2 uSize;\n"
     "uniform vec2 uBlurDir;\n"
     "uniform float uBlurRadius;\n"
     "uniform vec2 uBlurTexSize;\n"
     "uniform vec2 uBlurOrigin;\n"
     "void main() {\n"
-    "    vec2 screenPos = uBlurOrigin + vec2(FragPos.x, uBlurTexSize.y - FragPos.y - (uBlurTexSize.y - uBlurOrigin.y - uBlurTexSize.y));\n"
-    /* Simpler: FragPos is in element-local coords (0..w, 0..h y-flipped).
-       Screen position: x = origin.x + FragPos.x; y = origin.y + (h - FragPos.y)
-       UV into full window texture: uv = screenPos / texSize */
-    "    float h = textureSize(uSrc, 0).y;\n"
-    "    vec2 sp = vec2(uBlurOrigin.x + FragPos.x, uBlurOrigin.y + h - FragPos.y);\n"
-    "    vec2 uv = sp / uBlurTexSize;\n"
+    /* FragPos: element-local, y-flipped (0=bottom, uSize.y=top).
+       Screen (y-down): sx = origin.x + FragPos.x
+                        sy = origin.y + (uSize.y - FragPos.y)
+       GL texture (y-up): sp.y = tex_h - sy */
+    "    float th = uBlurTexSize.y;\n"
+    "    vec2 screenPos = vec2(uBlurOrigin.x + FragPos.x,\n"
+    "                          uBlurOrigin.y + (uSize.y - FragPos.y));\n"
+    "    vec2 uv = vec2(screenPos.x / uBlurTexSize.x,\n"
+    "                   (th - screenPos.y) / th);\n"
     "    float r = max(uBlurRadius, 0.5);\n"
     "    float sigma = r * 0.35 + 0.5;\n"
     "    vec4 col = vec4(0.0);\n"
@@ -536,8 +539,10 @@ const char* backdrop_fs =
     "    float alpha = 1.0 - smoothstep(-1.0, 0.5, sdf);\n"
     "    if(alpha <= 0.0) discard;\n"
     "    float th = uBlurTexSize.y;\n"
-    "    vec2 sp = vec2(uBlurOrigin.x + FragPos.x, uBlurOrigin.y + th - FragPos.y);\n"
-    "    vec2 uv = sp / uBlurTexSize;\n"
+    "    vec2 screenPos = vec2(uBlurOrigin.x + FragPos.x,\n"
+    "                          uBlurOrigin.y + (uSize.y - FragPos.y));\n"
+    "    vec2 uv = vec2(screenPos.x / uBlurTexSize.x,\n"
+    "                   (th - screenPos.y) / th);\n"
     "    vec4 tc = texture(uSrc, clamp(uv, vec2(0.0), vec2(1.0)));\n"
     "    FragColor = vec4(tc.rgb, alpha);\n"
     "}\0";
@@ -705,6 +710,7 @@ struct LunaElement {
     int cursor_pointer;
     int cursor_type; // 0=default 1=pointer 2=text 3=crosshair 4=ew-resize 5=ns-resize
     int text_align;
+    int has_text_align;
     int font_size;
     int font_bold;
     float line_height;
@@ -1219,6 +1225,9 @@ static stbtt_fontinfo g_font_info;
 static unsigned char* g_font_ttf = NULL;
 static long           g_font_ttf_sz = 0;
 static int            g_font_info_ok = 0;
+static stbtt_fontinfo g_cjk_font_info;
+static unsigned char* g_cjk_font_ttf = NULL;
+static int            g_cjk_font_info_ok = 0;
 
 #define LUNA_DYN_ATLAS_W 1024
 #define LUNA_DYN_ATLAS_H 1024
@@ -1315,6 +1324,37 @@ static int font_path_score(const char* path) {
     return score;
 }
 
+/* UI sans-serif: match demo.css stack (Inter / system UI), not CJK faces. */
+static int font_path_score_ui(const char* path) {
+    char lower[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+    for (size_t i = 0; i < n; i++) lower[i] = (char)tolower((unsigned char)path[i]);
+    lower[n] = '\0';
+    if (strstr(lower, "emoji") || strstr(lower, "icon") || strstr(lower, "symbol")) return -1000;
+    if (strstr(lower, "comic")) return -500;
+    if (strstr(lower, "cjk") || strstr(lower, "notosansjp") || strstr(lower, "notosanscjk")) return -1000;
+    if (strstr(lower, "serif") && !strstr(lower, "sans")) return -400;
+    if (strstr(lower, "mono")) return -400;
+    int score = 0;
+    if (strstr(lower, "inter")) score += 500;
+    if (strstr(lower, "segoeui") || strstr(lower, "segoe ui")) score += 480;
+    if (strstr(lower, "liberationsans")) score += 460;
+    if (strstr(lower, "dejavusans")) score += 450;
+    if (strstr(lower, "notosans-regular")) score += 440;
+    if (strstr(lower, "roboto")) score += 420;
+    if (strstr(lower, "ubuntu")) score += 400;
+    if (strstr(lower, "cantarell")) score += 390;
+    if (strstr(lower, "raleway")) score += 430;
+    if (strstr(lower, "josefin")) score += 400;
+    if (strstr(lower, "hanken")) score += 330;
+    if (strstr(lower, "opensans") || strstr(lower, "open sans")) score += 320;
+    if (strstr(lower, "arial")) score += 300;
+    if (strstr(lower, "helvetica")) score += 290;
+    if (score == 0 && strstr(lower, "sans")) score += 80;
+    return score;
+}
+
 static void dyn_atlas_reset(void) {
     memset(g_dyn_pixels, 0, sizeof(g_dyn_pixels));
     g_dyn_pack_x = 1; g_dyn_pack_y = 1; g_dyn_pack_row_h = 0;
@@ -1333,18 +1373,20 @@ static LunaDynGlyph* dyn_find_glyph(int cp, int px) {
 }
 
 static LunaDynGlyph* dyn_bake_glyph(int cp, int px) {
-    if (!g_font_info_ok || px < 8) return NULL;
+    stbtt_fontinfo* finfo = g_cjk_font_info_ok ? &g_cjk_font_info : &g_font_info;
+    if (!g_cjk_font_info_ok && !g_font_info_ok) return NULL;
+    if (px < 8) return NULL;
     LunaDynGlyph* hit = dyn_find_glyph(cp, px);
     if (hit) return hit;
     if (g_dyn_glyph_count >= LUNA_MAX_DYN_GLYPHS) return NULL;
 
-    float scale = stbtt_ScaleForPixelHeight(&g_font_info, (float)px);
+    float scale = stbtt_ScaleForPixelHeight(finfo, (float)px);
     int ascent, descent, lineGap;
-    stbtt_GetFontVMetrics(&g_font_info, &ascent, &descent, &lineGap);
+    stbtt_GetFontVMetrics(finfo, &ascent, &descent, &lineGap);
     int advance, lsb;
-    stbtt_GetCodepointHMetrics(&g_font_info, cp, &advance, &lsb);
+    stbtt_GetCodepointHMetrics(finfo, cp, &advance, &lsb);
     int x0, y0, x1, y1;
-    stbtt_GetCodepointBitmapBox(&g_font_info, cp, scale, scale, &x0, &y0, &x1, &y1);
+    stbtt_GetCodepointBitmapBox(finfo, cp, scale, scale, &x0, &y0, &x1, &y1);
     int gw = x1 - x0;
     int gh = y1 - y0;
     if (gw < 1) gw = 1;
@@ -1366,7 +1408,7 @@ static LunaDynGlyph* dyn_bake_glyph(int cp, int px) {
 
     int ax = g_dyn_pack_x + pad;
     int ay = g_dyn_pack_y + pad;
-    stbtt_MakeCodepointBitmap(&g_font_info, &g_dyn_pixels[ay * LUNA_DYN_ATLAS_W + ax],
+    stbtt_MakeCodepointBitmap(finfo, &g_dyn_pixels[ay * LUNA_DYN_ATLAS_W + ax],
                               gw, gh, LUNA_DYN_ATLAS_W, scale, scale, cp);
 
     LunaDynGlyph* g = &g_dyn_glyphs[g_dyn_glyph_count];
@@ -2959,8 +3001,9 @@ static int element_overflow_visible(int idx) {
     while (p != -1) {
         LunaElement* par = &elements[p];
         if (overflow_clips(par->overflow_x) || overflow_clips(par->overflow_y)) {
-            float cx = par->x + par->pad_l, cy = par->y + par->pad_t;
-            float cw = par->w - par->pad_l - par->pad_r, ch = par->h - par->pad_t - par->pad_b;
+            float cx = par->x + par->border_width + par->pad_l, cy = par->y + par->border_width + par->pad_t;
+            float cw = par->w - par->border_width * 2.0f - par->pad_l - par->pad_r;
+            float ch = par->h - par->border_width * 2.0f - par->pad_t - par->pad_b;
             if (cw <= 0.0f || ch <= 0.0f) return 0;
             int clip_x = overflow_clips(par->overflow_x);
             int clip_y = overflow_clips(par->overflow_y);
@@ -4315,7 +4358,7 @@ void update_element_style(LunaElement* e) {
     e->cursor_type = 0; e->position_fixed = 0;
     e->has_bottom = 0; e->has_right = 0;
     e->has_top = 0; e->has_left = 0;
-    e->text_align = 0; e->font_size = 16; e->font_bold = 0;
+    e->text_align = 0; e->has_text_align = 0; e->font_size = 16; e->font_bold = 0;
     e->line_height = 0.0f; e->white_space = 0; e->text_overflow = 0; e->overflow_wrap = 1;
     e->letter_spacing = 0.0f; e->text_transform = 0; e->text_decoration = 0;
     e->has_text_shadow = 0;
@@ -4479,43 +4522,56 @@ void update_element_style(LunaElement* e) {
             e->position_sticky = r->position_sticky;
             if (r->position_mode != POS_UNSET) e->position_mode = r->position_mode;
         }
+        /* Sticky insets (left/top/right/bottom) are thresholds only — the element
+           stays in normal/flex flow. Applying them as positioned offsets would
+           pull sticky items out of flex (e.g. Pin overlapping Alpha). */
         if (r->has_left && !e->pos_overridden_x && offsets_should_apply(e)) {
-            e->pct_left = r->pct_left;
-            if (r->pct_left) { e->raw_left = r->raw_left; e->raw_left_off = r->raw_left_off; }
-            else e->rel_x = r->left;
-            e->has_left = 1; e->has_right = 0; e->css_positioned |= 1;
+            e->has_left = 1; e->has_right = 0;
+            if (e->position_sticky) {
+                e->sticky_use_left = 1;
+                e->sticky_left = r->pct_left ? r->raw_left : r->left;
+                if (r->pct_left) { e->pct_left = 1; e->raw_left = r->raw_left; e->raw_left_off = r->raw_left_off; }
+            } else {
+                e->pct_left = r->pct_left;
+                if (r->pct_left) { e->raw_left = r->raw_left; e->raw_left_off = r->raw_left_off; }
+                else e->rel_x = r->left;
+                e->css_positioned |= 1;
+            }
         }
         if (r->has_top && !e->pos_overridden_y && offsets_should_apply(e)) {
-            e->pct_top = r->pct_top;
-            if (r->pct_top) { e->raw_top = r->raw_top; e->raw_top_off = r->raw_top_off; }
-            else e->rel_y = r->top;
-            e->has_top = 1; e->has_bottom = 0; e->css_positioned |= 2;
+            e->has_top = 1; e->has_bottom = 0;
+            if (e->position_sticky) {
+                if (!e->sticky_use_bottom) {
+                    e->sticky_use_top = 1;
+                    e->sticky_top = r->pct_top ? r->raw_top : r->top;
+                }
+                if (r->pct_top) { e->pct_top = 1; e->raw_top = r->raw_top; e->raw_top_off = r->raw_top_off; }
+            } else {
+                e->pct_top = r->pct_top;
+                if (r->pct_top) { e->raw_top = r->raw_top; e->raw_top_off = r->raw_top_off; }
+                else e->rel_y = r->top;
+                e->css_positioned |= 2;
+            }
         }
         if (r->has_bottom && !e->pos_overridden_y && offsets_should_apply(e)) {
             e->has_bottom = 1; e->pct_bottom = r->pct_bottom;
             if (r->pct_bottom) e->raw_bottom = r->raw_bottom; else e->bottom_val = r->bottom;
-            e->css_positioned |= 2;
+            if (e->position_sticky) {
+                e->sticky_use_bottom = 1;
+                e->sticky_bottom = r->pct_bottom ? e->raw_bottom : e->bottom_val;
+            } else {
+                e->css_positioned |= 2;
+            }
         }
         if (r->has_right && !e->pos_overridden_x && offsets_should_apply(e)) {
             e->has_right = 1; e->pct_right = r->pct_right;
             if (r->pct_right) e->raw_right = r->raw_right; else e->right_val = r->right;
-            e->css_positioned |= 1;
-        }
-        if (r->has_top && e->position_sticky && !e->sticky_use_bottom) {
-            e->sticky_use_top = 1;
-            e->sticky_top = r->pct_top ? e->rel_y : r->top;
-        }
-        if (r->has_bottom && e->position_sticky) {
-            e->sticky_use_bottom = 1;
-            e->sticky_bottom = r->pct_bottom ? e->bottom_val : r->bottom;
-        }
-        if (r->has_left && e->position_sticky) {
-            e->sticky_use_left = 1;
-            e->sticky_left = r->pct_left ? e->raw_left : r->left;
-        }
-        if (r->has_right && e->position_sticky) {
-            e->sticky_use_right = 1;
-            e->sticky_right = r->pct_right ? e->raw_right : r->right;
+            if (e->position_sticky) {
+                e->sticky_use_right = 1;
+                e->sticky_right = r->pct_right ? e->raw_right : e->right_val;
+            } else {
+                e->css_positioned |= 1;
+            }
         }
         if (r->has_opacity) e->opacity = r->opacity;
         if (r->has_cursor)  { e->cursor_pointer = r->cursor_pointer; e->cursor_type = r->cursor_type; }
@@ -4636,7 +4692,7 @@ void update_element_style(LunaElement* e) {
         }
         if (r->has_visibility) e->visibility_hidden = r->visibility_hidden;
         if (r->has_pointer_events) e->pointer_events_none = r->pointer_events_none;
-        if (r->has_text_align)  e->text_align = r->text_align;
+        if (r->has_text_align)  { e->has_text_align = 1; e->text_align = r->text_align; }
         if (r->has_font_size)   e->font_size = r->font_size;
         if (r->has_font_weight) e->font_bold = r->font_bold;
         if (r->has_line_height) e->line_height = r->line_height;
@@ -4804,8 +4860,13 @@ static void set_html_base_dir(const char* layout_path) {
     strncpy(g_html_base_dir, layout_path, sizeof(g_html_base_dir) - 1);
     g_html_base_dir[sizeof(g_html_base_dir) - 1] = '\0';
     char* slash = strrchr(g_html_base_dir, '/');
-    if (slash) *slash = '\0';
-    else g_html_base_dir[0] = '\0';
+    if (slash) {
+        *slash = '\0';
+    } else if (strchr(g_html_base_dir, '.')) {
+        /* Bare filename like "demo.html" — resolve relative to cwd */
+        g_html_base_dir[0] = '\0';
+    }
+    /* else: bare directory name like "ui" — keep as base */
 }
 
 static void resolve_resource_path(const char* href, char* out, size_t outsz) {
@@ -5319,6 +5380,45 @@ static void layout_block_container(int container_idx) {
         ch->rel_y = y + ch->margin_top;
         y += ch->margin_top + ch->h + ch->margin_bottom;
     }
+
+    /* height:auto on absolute/fixed → shrink-wrap in-flow children (browser parity).
+       Without this, menus/panels keep a collapsed height and only paint a short
+       background while children draw outside the panel. */
+    if (!cont->has_css_height && !cont->pct_h &&
+        (cont->position_mode == POS_ABSOLUTE || cont->position_fixed)) {
+        float auto_h = y + cont->pad_b;
+        if (cont->border_width > 0.0f && cont->box_sizing != BOX_CONTENT)
+            auto_h += cont->border_width * 2.0f;
+        cont->h = auto_h;
+        if (cont->has_min_height && cont->h < cont->css_min_height)
+            cont->h = cont->css_min_height;
+        if (cont->has_max_height && cont->h > cont->css_max_height)
+            cont->h = cont->css_max_height;
+    }
+}
+
+static int is_positioned_element(const LunaElement* e) {
+    return e->position_fixed || e->position_sticky ||
+           e->position_mode == POS_ABSOLUTE || e->position_mode == POS_RELATIVE;
+}
+
+static int find_containing_block(int idx) {
+    int p = elements[idx].parent_idx;
+    while (p != -1) {
+        if (is_positioned_element(&elements[p])) return p;
+        p = elements[p].parent_idx;
+    }
+    return elements[idx].parent_idx;
+}
+
+static void containing_block_rect(int cb_idx, float* ox, float* oy, float* cw, float* ch) {
+    LunaElement* cb = &elements[cb_idx];
+    *ox = cb->x + cb->border_width + cb->pad_l;
+    *oy = cb->y + cb->border_width + cb->pad_t;
+    *cw = cb->w - cb->border_width * 2.0f - cb->pad_l - cb->pad_r;
+    *ch = cb->h - cb->border_width * 2.0f - cb->pad_t - cb->pad_b;
+    if (*cw < 0.0f) *cw = 0.0f;
+    if (*ch < 0.0f) *ch = 0.0f;
 }
 
 void update_layout() {
@@ -5326,6 +5426,8 @@ void update_layout() {
         LunaElement* e = &elements[i];
         int par = e->parent_idx;
         float parent_w, parent_h;
+        float cb_ox = 0.0f, cb_oy = 0.0f;
+        int use_cb = (e->position_mode == POS_ABSOLUTE && par != -1);
 
         // body/html root element: always cover full window regardless of CSS sizes
         if (par == -1 && e->z_index <= -9000 &&
@@ -5339,6 +5441,9 @@ void update_layout() {
         if (e->position_fixed || par == -1) {
             parent_w = window_width;
             parent_h = window_height;
+        } else if (use_cb) {
+            int cb = find_containing_block(i);
+            containing_block_rect(cb, &cb_ox, &cb_oy, &parent_w, &parent_h);
         } else {
             parent_w = elements[par].w;
             parent_h = elements[par].h;
@@ -5408,6 +5513,9 @@ void update_layout() {
         if (e->position_fixed || par == -1) {
             e->x = e->rel_x + e->margin_left;
             e->y = e->rel_y + e->margin_top;
+        } else if (use_cb) {
+            e->x = cb_ox + e->rel_x + e->margin_left;
+            e->y = cb_oy + e->rel_y + e->margin_top;
         } else {
             e->x = elements[par].x + e->rel_x + e->margin_left;
             e->y = elements[par].y + e->rel_y + e->margin_top;
@@ -5495,7 +5603,9 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
         LunaElement* ch = &elements[kids[k]];
         float ml = flex_main_size(ch, row_mode);
         main_sz[k] = ml;
-        int positioned = row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2);
+        /* Sticky stays in-flow even if left/top insets were declared. */
+        int positioned = ch->position_sticky ? 0
+            : (row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2));
         if (!positioned && ch->flex_grow > 0) {
             grow_n++;
             grow_sum += (float)ch->flex_grow;
@@ -5509,7 +5619,8 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
     if (free_main > 0.0f) {
         for (int k = 0; k < n; k++) {
             LunaElement* ch = &elements[kids[k]];
-            int positioned = row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2);
+            int positioned = ch->position_sticky ? 0
+                : (row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2));
             if (!positioned && ch->flex_grow > 0 && grow_n > 0)
                 main_sz[k] += free_main * ((float)ch->flex_grow / grow_sum);
         }
@@ -5518,14 +5629,16 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
         float shrink_sum = 0.0f;
         for (int k = 0; k < n; k++) {
             LunaElement* ch = &elements[kids[k]];
-            int positioned = row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2);
+            int positioned = ch->position_sticky ? 0
+                : (row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2));
             if (positioned || ch->flex_shrink <= 0) continue;
             shrink_sum += (float)ch->flex_shrink * main_sz[k];
         }
         if (shrink_sum > 0.0f) {
             for (int k = 0; k < n; k++) {
                 LunaElement* ch = &elements[kids[k]];
-                int positioned = row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2);
+                int positioned = ch->position_sticky ? 0
+                    : (row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2));
                 if (positioned || ch->flex_shrink <= 0) continue;
                 float factor = ((float)ch->flex_shrink * main_sz[k]) / shrink_sum;
                 float min_sz = flex_min_main(ch, row_mode);
@@ -6123,12 +6236,14 @@ static void apply_sticky_positions(void) {
 
         if (scroll_y != -1) {
             LunaElement* par = &elements[scroll_y];
+            float inner_top = par->y + par->border_width + par->pad_t;
+            float inner_bottom = par->y + par->h - par->border_width - par->pad_b;
             if (e->sticky_use_bottom) {
-                float stick_y = par->y + par->h - par->pad_b - e->h - e->sticky_bottom;
+                float stick_y = inner_bottom - e->h - e->sticky_bottom;
                 if (e->y > stick_y) e->y = stick_y;
             } else if (e->sticky_use_top) {
-                float min_y = par->y + par->pad_t + e->sticky_top;
-                float max_y = par->y + par->h - par->pad_b - e->h;
+                float min_y = inner_top + e->sticky_top;
+                float max_y = inner_bottom - e->h;
                 if (max_y < min_y) max_y = min_y;
                 if (e->y < min_y) e->y = min_y;
                 if (e->y > max_y) e->y = max_y;
@@ -6137,11 +6252,13 @@ static void apply_sticky_positions(void) {
 
         if (scroll_x != -1) {
             LunaElement* par = &elements[scroll_x];
+            float inner_left = par->x + par->border_width + par->pad_l;
             if (e->sticky_use_left) {
-                float min_x = par->x + par->pad_l + e->sticky_left;
+                float min_x = inner_left + e->sticky_left;
                 if (e->x < min_x) e->x = min_x;
             } else if (e->sticky_use_right) {
-                float stick_x = par->x + par->w - par->pad_r - e->w - e->sticky_right;
+                float inner_right = par->x + par->w - par->border_width - par->pad_r;
+                float stick_x = inner_right - e->w - e->sticky_right;
                 if (e->x > stick_x) e->x = stick_x;
             }
         }
@@ -6683,6 +6800,44 @@ static void get_element_draw_bounds(LunaElement* e, float* out_x, float* out_y, 
     *out_h = dh;
 }
 
+static void apply_sticky_clip_bands(int idx, float* cx, float* cy, float* cw, float* ch) {
+    LunaElement* e = &elements[idx];
+    if (e->position_sticky) return;
+
+    for (int p = e->parent_idx; p != -1; p = elements[p].parent_idx) {
+        LunaElement* par = &elements[p];
+        if (!overflow_scrollable(par->overflow_y)) continue;
+        float st = par->scroll_top;
+        if (par->scroll_dest_top > st) st = par->scroll_dest_top;
+        if (st <= 0.5f) continue;
+
+        float inner_top = par->y + par->border_width + par->pad_t;
+        float inner_bottom = par->y + par->h - par->border_width - par->pad_b;
+
+        for (int si = 0; si < elem_count; si++) {
+            LunaElement* st = &elements[si];
+            if (st->parent_idx != p || !st->position_sticky || st->display_none) continue;
+
+            if ((st->sticky_use_top || st->has_top) && !st->sticky_use_bottom) {
+                float stick_y = inner_top + (st->sticky_use_top ? st->sticky_top : 0.0f);
+                if (fabsf(st->y - stick_y) > 1.5f || st->h <= 0.0f) continue;
+                float band_bottom = st->y + st->h;
+                if (band_bottom <= *cy) continue;
+                if (band_bottom >= *cy + *ch) { *ch = 0.0f; return; }
+                *ch = (*cy + *ch) - band_bottom;
+                *cy = band_bottom;
+            } else if (st->sticky_use_bottom && !st->sticky_use_top) {
+                float stick_y = inner_bottom - st->h - st->sticky_bottom;
+                if (fabsf(st->y - stick_y) > 1.5f || st->h <= 0.0f) continue;
+                float band_top = st->y;
+                if (band_top >= *cy + *ch) continue;
+                if (band_top <= *cy) { *ch = 0.0f; return; }
+                *ch = band_top - *cy;
+            }
+        }
+    }
+}
+
 static int get_overflow_clip_rect(int idx, float* cx, float* cy, float* cw, float* ch) {
     int has = 0;
     int p = elements[idx].parent_idx;
@@ -6692,8 +6847,10 @@ static int get_overflow_clip_rect(int idx, float* cx, float* cy, float* cw, floa
             float ptx, pty;
             accum_ancestor_transform(p, &ptx, &pty);
             ptx += par->cur_tx; pty += par->cur_ty;
-            float px = par->x + par->pad_l + ptx, py = par->y + par->pad_t + pty;
-            float pw = par->w - par->pad_l - par->pad_r, ph = par->h - par->pad_t - par->pad_b;
+            float px = par->x + par->border_width + par->pad_l + ptx;
+            float py = par->y + par->border_width + par->pad_t + pty;
+            float pw = par->w - par->border_width * 2.0f - par->pad_l - par->pad_r;
+            float ph = par->h - par->border_width * 2.0f - par->pad_t - par->pad_b;
             if (pw <= 0.0f || ph <= 0.0f) return 0;
             float clip_x = overflow_clips(par->overflow_x) ? px : -1e7f;
             float clip_y = overflow_clips(par->overflow_y) ? py : -1e7f;
@@ -6714,6 +6871,7 @@ static int get_overflow_clip_rect(int idx, float* cx, float* cy, float* cw, floa
         }
         p = par->parent_idx;
     }
+    if (has) apply_sticky_clip_bands(idx, cx, cy, cw, ch);
     return has;
 }
 
@@ -6999,6 +7157,10 @@ static int cmp_render_order(const void* a, const void* b) {
     int ia = *(const int*)a, ib = *(const int*)b;
     int za = g_cached_eff_z[ia], zb = g_cached_eff_z[ib];
     if (za != zb) return za - zb;
+    /* Sticky headers/footers paint above scrolling siblings. */
+    int sa = elements[ia].position_sticky ? 1 : 0;
+    int sb = elements[ib].position_sticky ? 1 : 0;
+    if (sa != sb) return sa - sb;
     return ia - ib; // preserve DOM order for same effective z-index
 }
 
@@ -7011,6 +7173,7 @@ static void build_render_order() {
             if (elements[p].z_index > z) z = elements[p].z_index;
             p = elements[p].parent_idx;
         }
+        if (elements[i].position_sticky) z += 1;
         g_cached_eff_z[i] = z;
         render_order[i] = i;
     }
@@ -7109,24 +7272,18 @@ static void scan_fonts_dir(const char* dir, FontPathList* reg, FontPathList* bol
 }
 
 // Try each path in the list; return first successfully loaded buffer.
-static unsigned char* try_load_font_list(FontPathList* fpl) {
-    /* Prefer CJK-capable faces so Japanese text paints correctly. */
+static unsigned char* try_load_font_list(FontPathList* fpl, int (*score_fn)(const char*), long* out_sz) {
+    long dummy = 0;
+    if (!out_sz) out_sz = &dummy;
     int best = -1, best_score = -999999;
     for (int i = 0; i < fpl->count; i++) {
-        int sc = font_path_score(fpl->paths[i]);
+        int sc = score_fn(fpl->paths[i]);
         if (sc > best_score) { best_score = sc; best = i; }
     }
-    if (best >= 0) {
-        unsigned char* buf = read_file_bytes(fpl->paths[best], &g_font_ttf_sz);
+    if (best >= 0 && best_score > 0) {
+        unsigned char* buf = read_file_bytes(fpl->paths[best], out_sz);
         if (buf) {
             fprintf(stderr, "[vespera] Font loaded: %s (score=%d)\n", fpl->paths[best], best_score);
-            return buf;
-        }
-    }
-    for (int i = 0; i < fpl->count; i++) {
-        unsigned char* buf = read_file_bytes(fpl->paths[i], &g_font_ttf_sz);
-        if (buf) {
-            fprintf(stderr, "[vespera] Font loaded: %s\n", fpl->paths[i]);
             return buf;
         }
     }
@@ -7140,22 +7297,47 @@ void init_font() {
     FontPathList bold_list = {0};
 
     scan_fonts_dir("/usr/share/fonts", &reg, &bold_list);
+    scan_fonts_dir("ui/fonts", &reg, &bold_list);
+    scan_fonts_dir("fonts", &reg, &bold_list);
 
-    unsigned char* reg_buf = try_load_font_list(&reg);
-    if (!reg_buf) { fprintf(stderr, "[vespera] Warning: no regular font found under /usr/share/fonts\n"); }
+    const char* env_ui = getenv("LUNA_FONT_REGULAR");
+    unsigned char* reg_buf = NULL;
+    if (env_ui && env_ui[0]) {
+        reg_buf = read_file_bytes(env_ui, &g_font_ttf_sz);
+        if (reg_buf) fprintf(stderr, "[vespera] Font loaded: %s (LUNA_FONT_REGULAR)\n", env_ui);
+    }
+    if (!reg_buf) reg_buf = try_load_font_list(&reg, font_path_score_ui, &g_font_ttf_sz);
+
+    const char* env_cjk = getenv("LUNA_FONT_CJK");
+    long cjk_sz = 0;
+    if (env_cjk && env_cjk[0]) {
+        g_cjk_font_ttf = read_file_bytes(env_cjk, &cjk_sz);
+        if (g_cjk_font_ttf) fprintf(stderr, "[vespera] CJK font loaded: %s (LUNA_FONT_CJK)\n", env_cjk);
+    }
+    if (!g_cjk_font_ttf) g_cjk_font_ttf = try_load_font_list(&reg, font_path_score, &cjk_sz);
+
+    if (!reg_buf) fprintf(stderr, "[vespera] Warning: no regular font found under /usr/share/fonts\n");
     else {
         bake_font_set(reg_buf, font_regular);
-        g_font_ttf = reg_buf; /* keep for CJK / dynamic glyphs */
+        g_font_ttf = reg_buf;
         int off = stbtt_GetFontOffsetForIndex(g_font_ttf, 0);
         if (off < 0) off = 0;
         g_font_info_ok = stbtt_InitFont(&g_font_info, g_font_ttf, off) ? 1 : 0;
         dyn_atlas_reset();
     }
 
-    unsigned char* bold_buf = try_load_font_list(&bold_list);
+    if (g_cjk_font_ttf) {
+        int off = stbtt_GetFontOffsetForIndex(g_cjk_font_ttf, 0);
+        if (off < 0) off = 0;
+        g_cjk_font_info_ok = stbtt_InitFont(&g_cjk_font_info, g_cjk_font_ttf, off) ? 1 : 0;
+    }
+
+    unsigned char* bold_buf = try_load_font_list(&bold_list, font_path_score_ui, NULL);
+    int bold_loaded = 0;
     if (bold_buf) {
         bake_font_set(bold_buf, font_bold_atlas);
         bold_font_loaded = 1;
+        bold_loaded = 1;
         free(bold_buf);
     }
 
@@ -7164,11 +7346,11 @@ void init_font() {
 
     glCreateVertexArrays(1, &text_vao); glGenBuffers(1, &text_vbo);
     glBindVertexArray(text_vao); glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
-    /* Batched glyph quads: whole line uploaded once, drawn with one call. */
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 4 * 6 * LUNA_TEXT_BATCH_GLYPHS, NULL, GL_DYNAMIC_DRAW);
     glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), 0);
     glEnableVertexAttribArray(0);
-    if (reg_buf || bold_buf) font_loaded = 1;
+    if (reg_buf) font_loaded = 1;
+    (void)bold_loaded;
 }
 
 FontAtlas* get_atlas(int size, int bold, int* out_is_fake_bold) {
@@ -8697,9 +8879,27 @@ void luna_register_js_handler(const char* n, LunaEventHandler fn) { register_js_
 void luna_set_on_click(int i, LunaEventHandler fn) { set_on_click(i, fn); }
 void luna_set_html_base_dir(const char* p) { set_html_base_dir(p); }
 int luna_load_html_file(const char* p) { char* s = read_file(p); if (!s) return 0; parse_html(s); free(s); return 1; }
-int luna_load_css_file(const char* p) { char* s = read_file(p); if (!s) return 0; parse_css(s); free(s); return 1; }
+int luna_load_css_file(const char* p) {
+    char* s = read_file(p);
+    if (!s) return 0;
+    parse_css(s);
+    free(s);
+    if (elem_count > 0) {
+        for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
+        generate_pseudo_elements();
+        g_layout_dirty = 1; g_render_order_dirty = 1;
+    }
+    return 1;
+}
 void luna_parse_html(const char* h) { parse_html(h); }
-void luna_parse_css(const char* c) { parse_css(c); }
+void luna_parse_css(const char* c) {
+    parse_css(c);
+    if (elem_count > 0) {
+        for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
+        generate_pseudo_elements();
+        g_layout_dirty = 1; g_render_order_dirty = 1;
+    }
+}
 void luna_wire_onclick_handlers(void) { wire_element_onclick_handlers(); }
 
 void luna_push_focus_trap(int idx, LunaTrapDismissFn on_dismiss, int backdrop_dismiss) {
@@ -8890,6 +9090,9 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+static int sticky_is_stuck_in_scroll(int idx);
+static void repaint_stuck_sticky_layers(int fbw, int fbh);
+
 void luna_render(int fbw, int fbh) {
     g_luna_fbw = fbw;
     g_luna_fbh = fbh;
@@ -8954,7 +9157,7 @@ void luna_render(int fbw, int fbh) {
         }
         set_element_scissor(i, fbw, fbh);
         /* backdrop-filter: blur() — capture + blur the region under this element */
-        if (e->has_backdrop_blur && e->backdrop_blur_radius > 0.0f) {
+        if (e->has_backdrop_blur && e->backdrop_blur_radius > 0.0f && !e->position_sticky) {
             glDisable(GL_SCISSOR_TEST);
             apply_backdrop_blur(dx, dy, dw, dh, e->backdrop_blur_radius, rad4, fbw, fbh);
             set_element_scissor(i, fbw, fbh);
@@ -9034,7 +9237,16 @@ void luna_render(int fbw, int fbh) {
                 }
                 float tr = e->t_r, tg = e->t_g, tb = e->t_b, ta = e->t_a * eff_op;
                 if (show_ph) ta *= 0.45f;
-                int align = e->text_align ? e->text_align : (e->is_input ? 0 : 1);
+                int align;
+                if (e->has_text_align) {
+                    align = e->text_align;
+                } else if (e->display_mode == DISPLAY_FLEX || e->display_mode == DISPLAY_GRID) {
+                    if (e->justify_content == FLEX_JUSTIFY_CENTER) align = 1;
+                    else if (e->justify_content == FLEX_JUSTIFY_END) align = 2;
+                    else align = 0; /* flex-start → left, matches CSS */
+                } else {
+                    align = 0; /* CSS default text-align: start */
+                }
                 int ws = e->is_input && !e->input_multiline ? 1 : e->white_space;
                 if (e->is_input && !e->input_multiline)
                     input_update_scroll(e, inner_w);
@@ -9070,6 +9282,79 @@ void luna_render(int fbw, int fbh) {
         glDisable(GL_SCISSOR_TEST);
     }
     g_bg_clip_enabled = 0;
+    repaint_stuck_sticky_layers(fbw, fbh);
+}
+
+static int sticky_is_stuck_in_scroll(int idx) {
+    LunaElement* e = &elements[idx];
+    if (!e->position_sticky || e->display_none) return 0;
+    if (e->sticky_use_bottom && !e->sticky_use_top) {
+        int scroll_p = -1;
+        for (int p = e->parent_idx; p != -1; p = elements[p].parent_idx) {
+            if (overflow_scrollable(elements[p].overflow_y)) { scroll_p = p; break; }
+        }
+        if (scroll_p == -1 || elements[scroll_p].scroll_top <= 0.5f) return 0;
+        LunaElement* par = &elements[scroll_p];
+        float inner_bottom = par->y + par->h - par->border_width - par->pad_b;
+        float stick = inner_bottom - e->h - e->sticky_bottom;
+        return fabsf(e->y - stick) <= 1.5f;
+    }
+    for (int p = e->parent_idx; p != -1; p = elements[p].parent_idx) {
+        if (!overflow_scrollable(elements[p].overflow_y)) continue;
+        float st = elements[p].scroll_top;
+        if (elements[p].scroll_dest_top > st) st = elements[p].scroll_dest_top;
+        if (st <= 0.5f) return 0;
+        return 1;
+    }
+    return 0;
+}
+
+static void repaint_stuck_sticky_layers(int fbw, int fbh) {
+    for (int i = 0; i < elem_count; i++) {
+        if (!sticky_is_stuck_in_scroll(i) || !is_visible(i)) continue;
+        LunaElement* e = &elements[i];
+        float eff_op = element_effective_opacity(i);
+        if (eff_op <= 0.004f) continue;
+        float dx, dy, dw, dh;
+        get_element_draw_bounds(e, &dx, &dy, &dw, &dh);
+        if (dw <= 0.0f || dh <= 0.0f) continue;
+        float scale = e->cur_scale;
+        float rad4[4] = { e->rad_c[0]*scale, e->rad_c[1]*scale,
+                          e->rad_c[2]*scale, e->rad_c[3]*scale };
+        set_element_scissor(i, fbw, fbh);
+        float sr = e->cur_r, sg = e->cur_g, sb = e->cur_b;
+        if (e->has_gradient && e->grad_stop_count > 0) {
+            sr = e->grad_stop_r[0]; sg = e->grad_stop_g[0]; sb = e->grad_stop_b[0];
+        } else if (sr + sg + sb < 0.03f) {
+            sr = 0.969f; sg = 0.969f; sb = 0.992f;
+        }
+        draw_rect(dx, dy, dw, dh, sr, sg, sb, eff_op, 0, 0, 0,0,0,0);
+        draw_rect_full(dx, dy, dw, dh, e->cur_r, e->cur_g, e->cur_b, e->cur_a * eff_op,
+                       rad4, e->border_width,
+                       e->cur_bd_r, e->cur_bd_g, e->cur_bd_b, e->cur_bd_a * eff_op, e);
+        if (e->has_border_bottom && e->border_bottom_w > 0.0f && e->border_bottom_a * eff_op > 0.004f)
+            draw_rect(dx, dy + dh - e->border_bottom_w * scale, dw, e->border_bottom_w * scale,
+                      e->border_bottom_r, e->border_bottom_g, e->border_bottom_b, e->border_bottom_a * eff_op,
+                      0, 0, 0,0,0,0);
+        if (e->has_border_top && e->border_top_w > 0.0f && e->border_top_a * eff_op > 0.004f)
+            draw_rect(dx, dy, dw, e->border_top_w * scale,
+                      e->border_top_r, e->border_top_g, e->border_top_b, e->border_top_a * eff_op,
+                      0, 0, 0,0,0,0);
+        if (e->text[0]) {
+            char tbuf[512];
+            strncpy(tbuf, e->text, sizeof(tbuf) - 1);
+            tbuf[sizeof(tbuf) - 1] = '\0';
+            apply_text_transform_buf(tbuf, e->text_transform);
+            float pad_l = e->pad_l * scale, pad_t = e->pad_t * scale;
+            float pad_r = e->pad_r * scale, pad_b = e->pad_b * scale;
+            float inner_w = dw - pad_l - pad_r, inner_h = dh - pad_t - pad_b;
+            int align = e->has_text_align ? e->text_align : 0;
+            render_text_fx(tbuf, dx + pad_l, dy + pad_t, inner_w, inner_h, align, 1,
+                           e->t_r, e->t_g, e->t_b, e->t_a * eff_op, e->font_size, e->font_bold,
+                           e->line_height, e->white_space, e->text_overflow, e->overflow_wrap, e);
+        }
+        glDisable(GL_SCISSOR_TEST);
+    }
 }
 
 void luna_mouse_move(double x, double y) {
