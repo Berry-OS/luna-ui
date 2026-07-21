@@ -15,7 +15,7 @@ A **pure Rust** Wayland compositor + custom `libwayland-client` implementation +
 | Name              | Actual Binary       | Role |
 |-------------------|---------------------|------|
 | **Luna Desktop**  | Full session        | The complete desktop environment users see after kernel boot |
-| **luna-compositor** | `vespera-server`  | DRM/KMS Wayland compositor (Xorg/Weston replacement) |
+| **luna-compositor** | `luna-compositor`  | DRM/KMS Wayland compositor (Xorg/Weston replacement) |
 | **luna-shell**    | `ui/luna-shell.c`   | macOS-style menu bar, Dock, Launchpad & widgets (Luna UI engine) |
 | **Luna UI**       | `ui/luna-ui.h` HTML/CSS engine | UI toolkit for shell & settings apps |
 | **wayland-client-rs** | `libwayland_client.so` | Pure Rust client lib that GTK apps connect to |
@@ -28,7 +28,7 @@ A **pure Rust** Wayland compositor + custom `libwayland-client` implementation +
 ```bash
 systemd / init
   └─ luna-session
-       ├─ luna-compositor  (vespera-server --backend dri) ✨
+       ├─ luna-compositor  (--backend dri) ✨
        ├─ luna-shell       (luna-shell --desktop) 🌙
        └─ GTK Apps         (WAYLAND_DISPLAY + LD_PRELOAD=libwayland-client) 📱
 ```
@@ -110,16 +110,16 @@ Open `http://localhost:8081/` → Real-time 1280×720 RGBA streaming via WebGL!
 
 ```bash
 make demo
-# vespera-server runs in background
+# luna-compositor runs in background
 # GTK app connects via LD_PRELOAD
-# Output saved to /tmp/vespera.ppm every frame
+# Output saved to /tmp/luna-compositor.ppm every frame
 ```
 
 ### 🎮 **DRI / Hardware Backend**
 
 ```bash
 cargo build -p wayland-server-rs --features dri
-./target/debug/vespera-server --backend dri
+./target/debug/luna-compositor --backend dri
 ```
 
 ## 🛠️ Build Commands

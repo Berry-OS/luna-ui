@@ -539,6 +539,22 @@ static void on_toast_close(LunaElement* e) {
 
 /* ── App launching ── */
 
+static void child_session_env(void) {
+    const char* preload = getenv("LUNA_WAYLAND_CLIENT_PRELOAD");
+    const char* libpath = getenv("LUNA_WAYLAND_CLIENT_LIBPATH");
+    if (libpath && *libpath) {
+        const char* existing = getenv("LD_LIBRARY_PATH");
+        char buf[1024];
+        if (existing && *existing)
+            snprintf(buf, sizeof(buf), "%s:%s", libpath, existing);
+        else
+            snprintf(buf, sizeof(buf), "%s", libpath);
+        setenv("LD_LIBRARY_PATH", buf, 1);
+    }
+    if (preload && *preload)
+        setenv("LD_PRELOAD", preload, 1);
+}
+
 static LunaApp* resolve_app(LunaElement* e) {
     for (int idx = elem_idx_of(e); idx != -1; idx = luna_element_at(idx)->parent_idx) {
         const char* id = luna_element_at(idx)->id;
@@ -565,6 +581,7 @@ static void app_launch(LunaApp* app) {
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
+        child_session_env();
         execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
         _exit(127);
     }
@@ -597,6 +614,7 @@ static void spawn_command(const char* cmd) {
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
+        child_session_env();
         execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
         _exit(127);
     }
@@ -1259,6 +1277,93 @@ static void bind_indices(void) {
 
 /* ── GLFW platform glue ── */
 
+static int g_egl_software_applied = 0;
+
+static int env_is_true(const char* v) {
+    return v && (!strcmp(v, "1") || !strcasecmp(v, "yes") || !strcasecmp(v, "true") || !strcmp(v, "on"));
+}
+
+static int env_is_false(const char* v) {
+    return v && (!strcmp(v, "0") || !strcasecmp(v, "no") || !strcasecmp(v, "false") || !strcmp(v, "off"));
+}
+
+static void apply_egl_software_env(void) {
+    if (!getenv("EGL_PLATFORM"))
+        setenv("EGL_PLATFORM", "wayland", 0);
+    setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "llvmpipe", 1);
+    setenv("GALLIUM_DRIVER", "llvmpipe", 1);
+    g_egl_software_applied = 1;
+    fprintf(stderr, "[luna-shell] using software EGL (llvmpipe)\n");
+}
+
+static int should_use_egl_software_early(void) {
+    const char* mode = getenv("LUNA_EGL_SOFTWARE");
+    if (env_is_true(mode)) return 1;
+    if (env_is_false(mode)) return 0;
+    const char* backend = getenv("LUNA_BACKEND");
+    return backend && !strcmp(backend, "software");
+}
+
+static void setup_wayland_egl_env(void) {
+    if (getenv("WAYLAND_DISPLAY") && !getenv("EGL_PLATFORM"))
+        setenv("EGL_PLATFORM", "wayland", 0);
+    if (should_use_egl_software_early())
+        apply_egl_software_env();
+}
+
+static int glfw_create_main_window(void) {
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_SAMPLES, 4);
+    if (g_fullscreen) {
+        glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+        glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
+    }
+    g_window = glfwCreateWindow((int)luna_window_width, (int)luna_window_height,
+                                "Luna Desktop", NULL, NULL);
+    return g_window != NULL;
+}
+
+/* glfw_start_window() から参照するため前方宣言 */
+static void glfw_error_cb(int err, const char* desc);
+
+static int glfw_start_window(void) {
+#if defined(GLFW_PLATFORM_WAYLAND)
+    if (getenv("WAYLAND_DISPLAY"))
+        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_WAYLAND);
+#endif
+    glfwSetErrorCallback(glfw_error_cb);
+    if (!glfwInit()) {
+        fprintf(stderr, "[luna-shell] glfwInit failed\n");
+        return 0;
+    }
+    if (glfw_create_main_window())
+        return 1;
+
+    if (!g_egl_software_applied && getenv("WAYLAND_DISPLAY")
+        && !env_is_false(getenv("LUNA_EGL_SOFTWARE"))) {
+        fprintf(stderr, "[luna-shell] EGL surface failed; retrying with llvmpipe\n");
+        glfwTerminate();
+        apply_egl_software_env();
+#if defined(GLFW_PLATFORM_WAYLAND)
+        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_WAYLAND);
+#endif
+        glfwSetErrorCallback(glfw_error_cb);
+        if (!glfwInit()) {
+            fprintf(stderr, "[luna-shell] glfwInit failed after llvmpipe fallback\n");
+            return 0;
+        }
+        if (glfw_create_main_window())
+            return 1;
+    }
+
+    fprintf(stderr, "[luna-shell] failed to create window\n");
+    glfwTerminate();
+    return 0;
+}
+
 static void glfw_error_cb(int err, const char* desc) {
     fprintf(stderr, "GLFW Error %d: %s\n", err, desc);
 }
@@ -1342,6 +1447,8 @@ static void parse_args(int argc, char** argv) {
                 "                  [--layout PATH] [--css PATH] [--screenshot PATH]\n"
                 "  env: LUNA_DESKTOP_LAYOUT / LUNA_DESKTOP_CSS — external layout override\n"
                 "       LUNA_APP_<NAME>=<cmd> — override dock/launchpad app commands\n"
+                "       LUNA_WAYLAND_CLIENT_PRELOAD — vendored libwayland-client for child apps\n"
+                "       LUNA_EGL_SOFTWARE — auto|1|0 (llvmpipe fallback for EGL on Wayland)\n"
                 "  keys: Super/F4 — Launchpad, Esc — close overlay\n"
                 "        Cmd+, — Settings, F12 — screenshot\n"
                 "  settings: ~/.config/luna-shell/settings.conf\n");
@@ -1358,29 +1465,9 @@ int main(int argc, char** argv) {
     parse_args(argc, argv);
     settings_load();
     shell_paths_init();
+    setup_wayland_egl_env();
 
-#if defined(GLFW_PLATFORM_WAYLAND)
-    if (getenv("WAYLAND_DISPLAY"))
-        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_WAYLAND);
-#endif
-    glfwSetErrorCallback(glfw_error_cb);
-    if (!glfwInit()) { fprintf(stderr, "[luna-shell] glfwInit failed\n"); return 1; }
-
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_SAMPLES, 4);
-    /* Borderless maximised window — never exclusive fullscreen which fights compositors. */
-    if (g_fullscreen) {
-        glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
-        glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
-    }
-
-    /* Always windowed (NULL monitor): avoids mode-change conflicts with
-     * luna-compositor and lets GTK apps on the same session share the display. */
-    g_window = glfwCreateWindow((int)luna_window_width, (int)luna_window_height,
-                                "Luna Desktop", NULL, NULL);
-    if (!g_window) { fprintf(stderr, "[luna-shell] failed to create window\n"); glfwTerminate(); return 1; }
+    if (!glfw_start_window()) return 1;
     g_luna_glfw_window = g_window;
     glfwMakeContextCurrent(g_window);
     glfwSwapInterval(1);

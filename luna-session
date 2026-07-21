@@ -6,29 +6,67 @@
 # and optional apps — right after kernel boot, instead of Xorg/Weston.
 #
 # Usage:
-#   ./luna-session                          # DRI compositor + luna-shell
-#   BACKEND=software ./luna-session         # software compositor (dev / VM)
-#   LUNA_APPS="hello-gtk" ./luna-session    # launch GTK apps after shell
+#   ./luna-session                              # DRI compositor + luna-shell
+#   BACKEND=software ./luna-session             # software compositor (dev / VM)
+#   LUNA_USE_SYSTEM_WAYLAND=1 ./luna-session  # GTK/GLFW via system libwayland-*
+#   LUNA_APPS="hello-gtk" ./luna-session        # launch GTK apps after shell
 #   INSTALL_PREFIX=/usr/local make install && luna-session
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="${PROFILE:-release}"
-PREFIX="${INSTALL_PREFIX:-$SCRIPT_DIR}"
-TARGET="$SCRIPT_DIR/target/$PROFILE"
-BIN="${LUNA_BIN:-$PREFIX/bin}"
-LIB="${LUNA_LIB:-$PREFIX/lib/luna}"
+# Source-tree cargo output (only present when running from the repo).
+SOURCE_TARGET="$SCRIPT_DIR/target/$PROFILE"
 BACKEND="${BACKEND:-dri}"
 SOCKET="${LUNA_SOCKET:-wayland-0}"
 SIZE="${LUNA_SIZE:-}"
 PORT="${LUNA_WEBGL_PORT:-}"
+FBDEV="${LUNA_FBDEV:-}"
 
-# Dev mode: use local build artifacts when not installed.
-if [ ! -x "$BIN/luna-compositor" ] && [ -x "$TARGET/vespera-server" ]; then
-    BIN="$TARGET"
-    LIB="$TARGET"
-fi
+# Resolve BIN / LIB for both layouts:
+#   installed:  $PREFIX/bin/{luna-session,luna-compositor,luna-shell}
+#               $PREFIX/lib/luna/libwayland*.so
+#   source:     $SCRIPT_DIR/luna-session
+#               $SCRIPT_DIR/target/$PROFILE/{luna-compositor,libwayland*.so}
+#
+# Bug (fixed): INSTALL_PREFIX defaulted to SCRIPT_DIR, so an installed
+# /usr/local/bin/luna-session looked for /usr/local/bin/bin/luna-compositor.
+resolve_paths() {
+    if [ -n "${LUNA_BIN:-}" ]; then
+        BIN="$LUNA_BIN"
+    elif [ -n "${INSTALL_PREFIX:-}" ]; then
+        BIN="$INSTALL_PREFIX/bin"
+    elif [ -x "$SCRIPT_DIR/luna-compositor" ]; then
+        # Installed next to this script (e.g. /usr/local/bin)
+        BIN="$SCRIPT_DIR"
+    elif [ -x "$SOURCE_TARGET/luna-compositor" ]; then
+        BIN="$SOURCE_TARGET"
+    else
+        BIN=""
+    fi
+
+    if [ -n "${LUNA_LIB:-}" ]; then
+        LIB="$LUNA_LIB"
+    elif [ -n "${INSTALL_PREFIX:-}" ]; then
+        LIB="$INSTALL_PREFIX/lib/luna"
+    elif [ -n "$BIN" ] && [ -d "$BIN/../lib/luna" ]; then
+        LIB="$(cd "$BIN/../lib/luna" && pwd)"
+    elif [ -d "$SOURCE_TARGET" ]; then
+        LIB="$SOURCE_TARGET"
+    else
+        LIB=""
+    fi
+
+    # Dev symlink dir for PATH / vendored client discovery.
+    if [ -d "$SOURCE_TARGET" ]; then
+        TARGET="$SOURCE_TARGET"
+    else
+        TARGET="$BIN"
+    fi
+}
+
+resolve_paths
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 mkdir -p "$XDG_RUNTIME_DIR"
@@ -36,63 +74,275 @@ chmod 700 "$XDG_RUNTIME_DIR"
 
 COMPOSITOR_PID=""
 SHELL_PID=""
+INPUT_METHOD_PID=""
 APP_PIDS=()
+USE_SYSTEM_WAYLAND=0
+VENDORED_CLIENT=""
+CLEANING=0
+
+process_running() {
+    local pid="$1" state
+    kill -0 "$pid" 2>/dev/null || return 1
+    state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+    [ -n "$state" ] && [[ "$state" != Z* ]]
+}
 
 cleanup() {
+    [ "$CLEANING" = "0" ] || return
+    CLEANING=1
+    local pids=()
     for pid in "${APP_PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
+        [ -n "$pid" ] && pids+=("$pid")
     done
-    [ -n "$SHELL_PID" ] && kill "$SHELL_PID" 2>/dev/null || true
-    [ -n "$COMPOSITOR_PID" ] && kill "$COMPOSITOR_PID" 2>/dev/null || true
-    rm -f "$XDG_RUNTIME_DIR/$SOCKET"
+    [ -n "$INPUT_METHOD_PID" ] && pids+=("$INPUT_METHOD_PID")
+    [ -n "$SHELL_PID" ] && pids+=("$SHELL_PID")
+    [ -n "$COMPOSITOR_PID" ] && pids+=("$COMPOSITOR_PID")
+    for pid in "${pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    # Give the compositor time to restore CRTC/KD/VT state before escalation.
+    for _ in $(seq 1 30); do
+        local alive=0
+        for pid in "${pids[@]}"; do
+            process_running "$pid" && alive=1
+        done
+        [ "$alive" = "1" ] || break
+        sleep 0.1
+    done
+    for pid in "${pids[@]}"; do
+        if process_running "$pid"; then
+            echo "warning: process $pid did not stop; sending KILL"
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    [ "$USE_SYSTEM_WAYLAND" = "1" ] || rm -f "$XDG_RUNTIME_DIR/$SOCKET"
 }
 trap cleanup EXIT INT TERM
 
-if [ ! -x "$BIN/luna-compositor" ] && [ ! -x "$BIN/vespera-server" ]; then
-    echo "→ Luna compositor not found; building from source..."
-    make -C "$SCRIPT_DIR" build-desktop PROFILE="$PROFILE"
-    BIN="$TARGET"
-    LIB="$TARGET"
+has_system_wayland_client() {
+    ldconfig -p 2>/dev/null | grep -q 'libwayland-client\.so\.0' \
+        || [ -f /usr/lib/x86_64-linux-gnu/libwayland-client.so.0 ] \
+        || [ -f /usr/lib/aarch64-linux-gnu/libwayland-client.so.0 ] \
+        || [ -f /usr/lib/libwayland-client.so.0 ]
+}
+
+resolve_vendored_client() {
+    local candidates=()
+    [ -n "${LIB:-}" ] && candidates+=("$LIB/libwayland-client.so.0" "$LIB/libwayland_client.so")
+    [ -n "${TARGET:-}" ] && candidates+=("$TARGET/libwayland-client.so.0" "$TARGET/libwayland_client.so")
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate" ] || [ -L "$candidate" ]; then
+            # Follow symlink to a real file when possible.
+            if [ -f "$candidate" ]; then
+                echo "$candidate"
+                return 0
+            fi
+            local real
+            real="$(readlink -f "$candidate" 2>/dev/null || true)"
+            if [ -n "$real" ] && [ -f "$real" ]; then
+                echo "$candidate"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+resolve_wayland_client_mode() {
+    case "${LUNA_USE_SYSTEM_WAYLAND:-auto}" in
+        1|yes|true|system)
+            USE_SYSTEM_WAYLAND=1
+            ;;
+        0|no|false|vendored)
+            USE_SYSTEM_WAYLAND=0
+            ;;
+        auto|*)
+            if VENDORED_CLIENT="$(resolve_vendored_client)"; then
+                USE_SYSTEM_WAYLAND=0
+            elif has_system_wayland_client; then
+                USE_SYSTEM_WAYLAND=1
+            else
+                echo "→ No vendored libwayland-client and system libwayland-client not found"
+                echo "  Build vendored client: make -C \"$SCRIPT_DIR\" build"
+                echo "  Or install system libs: apt install libwayland-client0"
+                exit 1
+            fi
+            ;;
+    esac
+
+    if [ "$USE_SYSTEM_WAYLAND" = "0" ]; then
+        VENDORED_CLIENT="${VENDORED_CLIENT:-$(resolve_vendored_client || true)}"
+        if [ -z "$VENDORED_CLIENT" ]; then
+            if has_system_wayland_client; then
+                echo "→ Vendored libwayland-client missing; falling back to system libwayland-client"
+                USE_SYSTEM_WAYLAND=1
+            else
+                echo "→ Building vendored libwayland-client..."
+                make -C "$SCRIPT_DIR" build PROFILE="$PROFILE"
+                VENDORED_CLIENT="$(resolve_vendored_client)" || {
+                    echo "error: failed to build libwayland_client.so"
+                    exit 1
+                }
+            fi
+        fi
+    fi
+}
+
+if [ -z "${BIN:-}" ] || [ ! -x "$BIN/luna-compositor" ]; then
+    if [ -f "$SCRIPT_DIR/Makefile" ]; then
+        echo "→ Luna compositor not found; building from source..."
+        make -C "$SCRIPT_DIR" build-dri PROFILE="$PROFILE"
+        BIN="$SOURCE_TARGET"
+        LIB="$SOURCE_TARGET"
+        TARGET="$SOURCE_TARGET"
+    else
+        echo "error: luna-compositor not found"
+        echo "  looked next to session: $SCRIPT_DIR/luna-compositor"
+        echo "  and in source target:   $SOURCE_TARGET/luna-compositor"
+        echo "  Install:  make install PREFIX=/usr/local"
+        echo "  Or override: LUNA_BIN=/usr/local/bin luna-session"
+        exit 1
+    fi
 fi
 
 COMPOSITOR="$BIN/luna-compositor"
-[ -x "$COMPOSITOR" ] || COMPOSITOR="$BIN/vespera-server"
-
 SHELL_BIN="$BIN/luna-shell"
 [ -x "$SHELL_BIN" ] || SHELL_BIN="$SCRIPT_DIR/luna-shell"
+if [ ! -x "$SHELL_BIN" ]; then
+    echo "error: luna-shell not found (tried $BIN/luna-shell and $SCRIPT_DIR/luna-shell)"
+    exit 1
+fi
 
-ln -sf libwayland_client.so "$TARGET/libwayland-client.so.0" 2>/dev/null || true
-ln -sf libwayland_client.so "$TARGET/libwayland-client.so" 2>/dev/null || true
+echo "→ Paths: BIN=$BIN  LIB=${LIB:-"(none)"}  COMPOSITOR=$COMPOSITOR"
+
+resolve_wayland_client_mode
+
+# Ensure dev symlinks exist when using the vendored client from target/.
+if [ "$USE_SYSTEM_WAYLAND" = "0" ] && [ -d "$TARGET" ]; then
+    ln -sf libwayland_client.so "$TARGET/libwayland-client.so.0" 2>/dev/null || true
+    ln -sf libwayland_client.so "$TARGET/libwayland-client.so" 2>/dev/null || true
+fi
 
 COMPOSITOR_ARGS=(--socket "$SOCKET" --backend "$BACKEND")
+if [ "$BACKEND" = "dri" ] && [ -n "${LUNA_TTY:-}" ]; then
+    COMPOSITOR_ARGS+=(--tty "$LUNA_TTY")
+fi
+case "${LUNA_PHYSICAL_INPUT:-1}" in
+    0|no|false|off) COMPOSITOR_ARGS+=(--no-input) ;;
+esac
 if [ -n "$SIZE" ]; then
     COMPOSITOR_ARGS+=(--size "$SIZE")
 fi
 if [ "$BACKEND" = "webgl" ]; then
-  COMPOSITOR_ARGS+=(--port "${PORT:-8081}")
+    COMPOSITOR_ARGS+=(--port "${PORT:-8081}")
+fi
+# Software / DRI-fallback needs an output target; default to /dev/fb0 when present.
+if [ -z "$FBDEV" ] && [ -e /dev/fb0 ]; then
+    case "$BACKEND" in
+        software|dri) FBDEV=/dev/fb0 ;;
+    esac
+fi
+if [ -n "$FBDEV" ]; then
+    COMPOSITOR_ARGS+=(--fbdev "$FBDEV")
 fi
 
-echo "→ Starting Luna compositor (backend=$BACKEND, socket=$SOCKET)"
+echo "→ Starting Luna compositor (backend=$BACKEND, socket=$SOCKET${FBDEV:+, fbdev=$FBDEV})"
 "$COMPOSITOR" "${COMPOSITOR_ARGS[@]}" &
 COMPOSITOR_PID=$!
 sleep 0.6
+if ! kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
+    echo "error: luna-compositor exited immediately (check DRM master / VT / journal)"
+    echo "  Tip: stop other graphical sessions, switch to a free VT, or use BACKEND=software"
+    wait "$COMPOSITOR_PID" || true
+    exit 1
+fi
 
 export WAYLAND_DISPLAY="$SOCKET"
-export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LD_PRELOAD="$LIB/libwayland-client.so.0"
+unset DISPLAY
+export LUNA_BACKEND="$BACKEND"
 
-# Make sample apps (hello-gtk) reachable for the shell's dock/launchpad.
-export PATH="$TARGET:$PATH"
+setup_egl_env() {
+    export EGL_PLATFORM="${EGL_PLATFORM:-wayland}"
+    case "${LUNA_EGL_SOFTWARE:-auto}" in
+        1|yes|true|on)
+            export LIBGL_ALWAYS_SOFTWARE=1
+            export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+            export GALLIUM_DRIVER=llvmpipe
+            ;;
+        0|no|false|off)
+            ;;
+        auto|*)
+            if [ "$BACKEND" = "software" ]; then
+                export LIBGL_ALWAYS_SOFTWARE=1
+                export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+                export GALLIUM_DRIVER=llvmpipe
+            fi
+            ;;
+    esac
+}
+setup_egl_env
 
-echo "→ Starting Luna shell"
-"$SHELL_BIN" --desktop &
+if [ "$USE_SYSTEM_WAYLAND" = "1" ]; then
+    echo "→ Wayland clients: system libwayland-client"
+    unset LD_PRELOAD
+    unset LUNA_WAYLAND_CLIENT_PRELOAD
+    unset LUNA_WAYLAND_CLIENT_LIBPATH
+else
+    echo "→ Wayland clients: vendored libwayland-client ($VENDORED_CLIENT)"
+    export LUNA_WAYLAND_CLIENT_PRELOAD="$VENDORED_CLIENT"
+    export LUNA_WAYLAND_CLIENT_LIBPATH="$LIB"
+    unset LD_PRELOAD
+fi
+
+# Make sample apps (hello-gtk) and installed binaries reachable for dock/launchpad.
+export PATH="$BIN${TARGET:+:$TARGET}:$PATH"
+
+echo "→ Starting Luna shell ($SHELL_BIN)"
+# GLFW links system libwayland; never preload the vendored client into luna-shell.
+env -u LD_PRELOAD "$SHELL_BIN" --desktop &
 SHELL_PID=$!
 sleep 0.3
+if ! kill -0 "$SHELL_PID" 2>/dev/null; then
+    echo "error: luna-shell exited immediately"
+    echo "  Common cause: EGL window surface failed on this compositor."
+    echo "  Try: LUNA_EGL_SOFTWARE=1 LUNA_USE_SYSTEM_WAYLAND=1 $0"
+    wait "$SHELL_PID" || true
+    exit 1
+fi
+
+# A Wayland input method is a regular client with a privileged compositor
+# protocol. Start Whiz when installed; set LUNA_INPUT_METHOD=none to opt out,
+# or provide an absolute path/custom command name.
+INPUT_METHOD="${LUNA_INPUT_METHOD:-whiz-im-wayland}"
+if [ "$INPUT_METHOD" != "none" ] && [ "$INPUT_METHOD" != "0" ]; then
+    if command -v "$INPUT_METHOD" >/dev/null 2>&1; then
+        echo "→ Starting input method ($INPUT_METHOD)"
+        env -u LD_PRELOAD "$INPUT_METHOD" &
+        INPUT_METHOD_PID=$!
+        sleep 0.1
+        if ! kill -0 "$INPUT_METHOD_PID" 2>/dev/null; then
+            echo "warning: input method exited immediately; continuing without IME"
+            wait "$INPUT_METHOD_PID" || true
+            INPUT_METHOD_PID=""
+        fi
+    elif [ -n "${LUNA_INPUT_METHOD:-}" ]; then
+        echo "warning: LUNA_INPUT_METHOD not found: $INPUT_METHOD"
+    fi
+fi
 
 if [ -n "${LUNA_APPS:-}" ]; then
     for app in $LUNA_APPS; do
         echo "→ Launching app: $app"
-        $app &
+        if [ "$USE_SYSTEM_WAYLAND" = "1" ]; then
+            env -u LD_PRELOAD $app &
+        else
+            LD_LIBRARY_PATH="${LUNA_WAYLAND_CLIENT_LIBPATH:-$LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            LD_PRELOAD="$VENDORED_CLIENT" \
+                $app &
+        fi
         APP_PIDS+=($!)
     done
 fi
@@ -103,4 +353,15 @@ if [ "$BACKEND" = "webgl" ]; then
     echo ""
 fi
 
-wait "$SHELL_PID"
+# Supervise both core processes.  If either one exits, the EXIT trap stops the
+# other and lets the compositor's graceful signal path restore the console.
+set +e
+wait -n "$SHELL_PID" "$COMPOSITOR_PID"
+SESSION_STATUS=$?
+set -e
+if ! kill -0 "$SHELL_PID" 2>/dev/null; then
+    echo "→ Luna shell exited (status=$SESSION_STATUS); stopping session"
+else
+    echo "→ Luna compositor exited (status=$SESSION_STATUS); stopping session"
+fi
+exit "$SESSION_STATUS"

@@ -53,6 +53,35 @@ typedef struct LunaInitConfig {
     LunaGetProcFn get_proc;
 } LunaInitConfig;
 
+/*
+ * Host-neutral input constants. Values intentionally match GLFW so existing
+ * GLFW hosts remain source-compatible while Wayland/EGL hosts need no GLFW
+ * headers or library.
+ */
+enum {
+    LUNA_RELEASE = 0,
+    LUNA_PRESS = 1,
+    LUNA_REPEAT = 2,
+    LUNA_MOUSE_BUTTON_LEFT = 0,
+    LUNA_MOD_SHIFT = 0x0001,
+    LUNA_KEY_SPACE = 32,
+    LUNA_KEY_ESCAPE = 256,
+    LUNA_KEY_ENTER = 257,
+    LUNA_KEY_TAB = 258,
+    LUNA_KEY_BACKSPACE = 259,
+    LUNA_KEY_DELETE = 261,
+    LUNA_KEY_RIGHT = 262,
+    LUNA_KEY_LEFT = 263,
+    LUNA_KEY_DOWN = 264,
+    LUNA_KEY_UP = 265,
+    LUNA_KEY_PAGE_UP = 266,
+    LUNA_KEY_PAGE_DOWN = 267,
+    LUNA_KEY_HOME = 268,
+    LUNA_KEY_END = 269,
+    LUNA_KEY_F12 = 301,
+    LUNA_KEY_KP_ENTER = 335
+};
+
 void luna_set_platform(const LunaPlatform* p);
 int  luna_init(const LunaInitConfig* cfg);
 void luna_shutdown(void);
@@ -1202,11 +1231,13 @@ static int    g_a11y_live_assertive = 0;
 static int    g_top_z = 100;
 #define DRAG_THRESHOLD 4.0
 
-GLFWcursor* g_hand_cursor     = NULL;
+#ifdef LUNA_UI_GLFW
+GLFWcursor* g_hand_cursor       = NULL;
 GLFWcursor* g_cursor_ibeam      = NULL;
 GLFWcursor* g_cursor_crosshair  = NULL;
 GLFWcursor* g_cursor_hresize    = NULL;
 GLFWcursor* g_cursor_vresize    = NULL;
+#endif
 int         g_current_cursor    = -1;
 
 GLuint text_vao, text_vbo;
@@ -8360,7 +8391,7 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
     (void)window;
     double mx = g_luna_mx, my = g_luna_my;
 
-    if (action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_LEFT) {
+    if (action == LUNA_PRESS && button == LUNA_MOUSE_BUTTON_LEFT) {
         g_drag_moved = 0;
         g_press_x = mx;
         g_press_y = my;
@@ -8424,7 +8455,7 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
                 }
             }
         }
-    } else if (action == GLFW_RELEASE && button == GLFW_MOUSE_BUTTON_LEFT) {
+    } else if (action == LUNA_RELEASE && button == LUNA_MOUSE_BUTTON_LEFT) {
         int hit = hit_test_at(mx, my);
 
         for (int i = 0; i < elem_count; i++) {
@@ -8690,7 +8721,7 @@ static void char_callback_impl(unsigned int codepoint) {
 
 static void key_callback(void* window, int key, int scancode, int action, int mods) {
     (void)window; (void)scancode;
-    if (action == GLFW_PRESS && key == GLFW_KEY_F12) {
+    if (action == LUNA_PRESS && key == LUNA_KEY_F12) {
         char path[512];
         time_t t = time(NULL);
         struct tm* tm_info = localtime(&t);
@@ -8701,7 +8732,7 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
         return;
     }
 
-    if (action == GLFW_PRESS && key == GLFW_KEY_ESCAPE) {
+    if (action == LUNA_PRESS && key == LUNA_KEY_ESCAPE) {
         int trap = get_focus_trap_root();
         if (trap != -1) {
             LunaTrapDismissFn fn = get_trap_dismiss_fn(trap);
@@ -8712,13 +8743,13 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
         return;
     }
 
-    if (action == GLFW_PRESS && key == GLFW_KEY_TAB) {
-        focus_move_tab((mods & GLFW_MOD_SHIFT) != 0);
+    if (action == LUNA_PRESS && key == LUNA_KEY_TAB) {
+        focus_move_tab((mods & LUNA_MOD_SHIFT) != 0);
         return;
     }
 
-    if ((action == GLFW_PRESS || action == GLFW_REPEAT) &&
-        (key == GLFW_KEY_UP || key == GLFW_KEY_DOWN)) {
+    if ((action == LUNA_PRESS || action == LUNA_REPEAT) &&
+        (key == LUNA_KEY_UP || key == LUNA_KEY_DOWN)) {
         int trap = get_focus_trap_root();
         if (trap != -1) {
             int has_options = 0;
@@ -8729,38 +8760,38 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
                 break;
             }
             if (has_options) {
-                focus_select_option_step(key == GLFW_KEY_UP);
+                focus_select_option_step(key == LUNA_KEY_UP);
                 return;
             }
         }
     }
 
     /* Text field editing — consume keys so scroll/button shortcuts don't fight IME */
-    if (focused_is_input() && (action == GLFW_PRESS || action == GLFW_REPEAT)) {
+    if (focused_is_input() && (action == LUNA_PRESS || action == LUNA_REPEAT)) {
         LunaElement* fe = &elements[g_focused_element_idx];
-        if (key == GLFW_KEY_BACKSPACE) { input_backspace(fe); return; }
-        if (key == GLFW_KEY_DELETE) { input_delete_forward(fe); return; }
-        if (key == GLFW_KEY_LEFT) {
+        if (key == LUNA_KEY_BACKSPACE) { input_backspace(fe); return; }
+        if (key == LUNA_KEY_DELETE) { input_delete_forward(fe); return; }
+        if (key == LUNA_KEY_LEFT) {
             fe->caret = utf8_prev_boundary(fe->text, fe->caret);
             input_ensure_caret(fe); return;
         }
-        if (key == GLFW_KEY_RIGHT) {
+        if (key == LUNA_KEY_RIGHT) {
             fe->caret = utf8_next_boundary(fe->text, fe->caret);
             input_ensure_caret(fe); return;
         }
-        if (key == GLFW_KEY_HOME) { fe->caret = 0; return; }
-        if (key == GLFW_KEY_END) { fe->caret = (int)strlen(fe->text); return; }
-        if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+        if (key == LUNA_KEY_HOME) { fe->caret = 0; return; }
+        if (key == LUNA_KEY_END) { fe->caret = (int)strlen(fe->text); return; }
+        if (key == LUNA_KEY_ENTER || key == LUNA_KEY_KP_ENTER) {
             if (fe->input_multiline) { char_callback_impl('\n'); return; }
             if (fe->on_click) fe->on_click(fe);
             return;
         }
-        if (key == GLFW_KEY_SPACE) return; /* composition / char callback handles space */
+        if (key == LUNA_KEY_SPACE) return; /* composition / char callback handles space */
         /* Let other keys fall through only for non-editable combos */
     }
 
-    if (action == GLFW_PRESS &&
-        (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER || key == GLFW_KEY_SPACE)) {
+    if (action == LUNA_PRESS &&
+        (key == LUNA_KEY_ENTER || key == LUNA_KEY_KP_ENTER || key == LUNA_KEY_SPACE)) {
         if (g_focused_element_idx != -1) {
             LunaElement* fe = &elements[g_focused_element_idx];
             if (fe->is_input) return;
@@ -8775,7 +8806,7 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
         return;
     }
 
-    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+    if (action != LUNA_PRESS && action != LUNA_REPEAT) return;
 
     int start = g_focused_element_idx;
     if (start == -1) {
@@ -8788,37 +8819,37 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
     int sx = find_scroll_target_x(start);
     float line = 20.0f;
 
-    if (sy != -1 && (key == GLFW_KEY_UP || key == GLFW_KEY_DOWN ||
-                     key == GLFW_KEY_PAGE_UP || key == GLFW_KEY_PAGE_DOWN ||
-                     key == GLFW_KEY_HOME || key == GLFW_KEY_END)) {
+    if (sy != -1 && (key == LUNA_KEY_UP || key == LUNA_KEY_DOWN ||
+                     key == LUNA_KEY_PAGE_UP || key == LUNA_KEY_PAGE_DOWN ||
+                     key == LUNA_KEY_HOME || key == LUNA_KEY_END)) {
         LunaElement* sc = &elements[sy];
         float pad = sc->padding;
         float inner_h = sc->h - pad * 2.0f;
         float max_scroll = sc->scroll_content_h - inner_h;
         if (max_scroll < 0.0f) max_scroll = 0.0f;
         float page = inner_h * 0.85f;
-        if (key == GLFW_KEY_UP) add_scroll_top(sy, -line, 0);
-        else if (key == GLFW_KEY_DOWN) add_scroll_top(sy, line, 0);
-        else if (key == GLFW_KEY_PAGE_UP) add_scroll_top(sy, -page, 0);
-        else if (key == GLFW_KEY_PAGE_DOWN) add_scroll_top(sy, page, 0);
-        else if (key == GLFW_KEY_HOME) set_scroll_top(sy, 0.0f, 0);
-        else if (key == GLFW_KEY_END) set_scroll_top(sy, max_scroll, 0);
+        if (key == LUNA_KEY_UP) add_scroll_top(sy, -line, 0);
+        else if (key == LUNA_KEY_DOWN) add_scroll_top(sy, line, 0);
+        else if (key == LUNA_KEY_PAGE_UP) add_scroll_top(sy, -page, 0);
+        else if (key == LUNA_KEY_PAGE_DOWN) add_scroll_top(sy, page, 0);
+        else if (key == LUNA_KEY_HOME) set_scroll_top(sy, 0.0f, 0);
+        else if (key == LUNA_KEY_END) set_scroll_top(sy, max_scroll, 0);
         return;
     }
 
-    if (sx != -1 && (key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT ||
-                     ((mods & GLFW_MOD_SHIFT) &&
-                      (key == GLFW_KEY_PAGE_UP || key == GLFW_KEY_PAGE_DOWN)))) {
+    if (sx != -1 && (key == LUNA_KEY_LEFT || key == LUNA_KEY_RIGHT ||
+                     ((mods & LUNA_MOD_SHIFT) &&
+                      (key == LUNA_KEY_PAGE_UP || key == LUNA_KEY_PAGE_DOWN)))) {
         LunaElement* sc = &elements[sx];
         float pad = sc->padding;
         float inner_w = sc->w - pad * 2.0f;
         float max_scroll = sc->scroll_content_w - inner_w;
         if (max_scroll < 0.0f) max_scroll = 0.0f;
         float page = inner_w * 0.85f;
-        if (key == GLFW_KEY_LEFT) add_scroll_left(sx, -line, 0);
-        else if (key == GLFW_KEY_RIGHT) add_scroll_left(sx, line, 0);
-        else if (key == GLFW_KEY_PAGE_UP) add_scroll_left(sx, -page, 0);
-        else if (key == GLFW_KEY_PAGE_DOWN) add_scroll_left(sx, page, 0);
+        if (key == LUNA_KEY_LEFT) add_scroll_left(sx, -line, 0);
+        else if (key == LUNA_KEY_RIGHT) add_scroll_left(sx, line, 0);
+        else if (key == LUNA_KEY_PAGE_UP) add_scroll_left(sx, -page, 0);
+        else if (key == LUNA_KEY_PAGE_DOWN) add_scroll_left(sx, page, 0);
         (void)mods;
     }
 }
@@ -9367,7 +9398,7 @@ void luna_mouse_button(int b, int a, int m, double x, double y) {
 }
 void luna_scroll(double xo, double yo) { scroll_callback(NULL, xo, yo); }
 void luna_key(int k, int sc, int a, int m) {
-    g_luna_shift = (m & 1) ? 1 : 0; /* GLFW_MOD_SHIFT = 1 */
+    g_luna_shift = (m & LUNA_MOD_SHIFT) ? 1 : 0;
     key_callback(NULL, k, sc, a, m);
 }
 void luna_char(unsigned int codepoint) { char_callback_impl(codepoint); }

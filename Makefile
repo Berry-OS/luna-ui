@@ -15,9 +15,9 @@ APP      ?= $(TARGET)/hello-gtk
 GLFW_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 GLFW_LIBS   := $(shell pkg-config --libs glfw3 2>/dev/null)
 
-.PHONY: all build build-dri build-webgl build-desktop build-shell symlinks \
-        run server demo webgl run-gtk desktop luna-session install stop clean \
-        opengl_gui luna-shell luna-ui sample
+.PHONY: all build build-dri build-webgl build-desktop build-desktop-system build-shell \
+        symlinks symlinks-system run server demo webgl run-gtk desktop desktop-system \
+        luna-session install install-system stop clean opengl_gui luna-shell luna-ui sample
 
 all: build symlinks
 
@@ -30,7 +30,10 @@ build-dri:
 build-webgl:
 	cargo build --features webgl $(if $(filter release,$(PROFILE)),--release,)
 
-build-desktop: build-dri build-shell symlinks
+build-desktop: build build-dri build-shell symlinks
+
+# Compositor + shell only; GTK/GLFW use system libwayland-client
+build-desktop-system: build-dri build-shell symlinks-system
 
 build-shell: luna-shell opengl_gui luna-ui
 
@@ -39,7 +42,12 @@ symlinks:
 	@echo "→ Creating symlinks in $(TARGET)/"
 	ln -sf libwayland_client.so $(TARGET)/libwayland-client.so.0
 	ln -sf libwayland_client.so $(TARGET)/libwayland-client.so
-	ln -sf vespera-server $(TARGET)/luna-compositor
+	ln -sf ../../luna-shell $(TARGET)/luna-shell
+	@echo "✓ Done"
+
+# Symlinks without libwayland-client (use system Wayland)
+symlinks-system:
+	@echo "→ Creating symlinks in $(TARGET)/ (system Wayland)"
 	ln -sf ../../luna-shell $(TARGET)/luna-shell
 	@echo "✓ Done"
 
@@ -78,13 +86,13 @@ run: build symlinks
 
 # Start pure Rust compositor (no libwayland-server)
 server: build
-	$(TARGET)/vespera-server --socket wayland-1 --screenshot /tmp/vespera.ppm
+	$(TARGET)/luna-compositor --socket wayland-1 --screenshot /tmp/luna-compositor.ppm
 
 # Start compositor and connect a GTK app via Rust libwayland-client
 demo: build symlinks
 	@echo "→ Starting compositor (wayland-1)"
 	export XDG_RUNTIME_DIR=$${XDG_RUNTIME_DIR:-/tmp}; \
-	  $(TARGET)/vespera-server --socket wayland-1 --screenshot /tmp/vespera.ppm & \
+	  $(TARGET)/luna-compositor --socket wayland-1 --screenshot /tmp/luna-compositor.ppm & \
 	sleep 0.5; \
 	echo "→ Connecting app: $(APP)"; \
 	XDG_RUNTIME_DIR=$${XDG_RUNTIME_DIR:-/tmp} \
@@ -103,8 +111,8 @@ demo: build symlinks
 webgl: build-webgl symlinks
 	@echo "→ Starting WebGL compositor (port=$(PORT))"
 	export XDG_RUNTIME_DIR=$${XDG_RUNTIME_DIR:-/tmp}; \
-	  $(TARGET)/vespera-server --socket wayland-webgl --backend webgl --port $(PORT) & \
-	echo $$! > /tmp/vespera-server.pid; \
+	  $(TARGET)/luna-compositor --socket wayland-webgl --backend webgl --port $(PORT) & \
+	echo $$! > /tmp/luna-compositor.pid; \
 	sleep 0.5; \
 	echo ""; \
 	echo "  Open in browser → http://localhost:$(PORT)/"; \
@@ -122,39 +130,76 @@ webgl: build-webgl symlinks
 run-gtk: build-webgl symlinks
 	PROFILE=$(PROFILE) PORT=$(PORT) ./run-gtk $(APP)
 
-# Full Luna Desktop session (compositor + shell)
+# Full Luna Desktop session (compositor + shell + vendored libwayland-client)
 desktop: build-desktop
+	chmod +x luna-session
 	PROFILE=$(PROFILE) BACKEND=dri ./luna-session
 
+# Luna Desktop with system libwayland-client (recommended for production)
+desktop-system: build-desktop-system
+	chmod +x luna-session
+	PROFILE=$(PROFILE) BACKEND=dri LUNA_USE_SYSTEM_WAYLAND=1 ./luna-session
+
 # Software backend desktop (VM / no GPU)
-desktop-soft: build symlinks build-shell
+desktop-soft: build-desktop
+	chmod +x luna-session
 	PROFILE=$(PROFILE) BACKEND=software ./luna-session
+
+# Software backend + system libwayland-client
+desktop-soft-system: build-desktop-system
+	chmod +x luna-session
+	PROFILE=$(PROFILE) BACKEND=software LUNA_USE_SYSTEM_WAYLAND=1 ./luna-session
 
 luna-session: build-desktop
 	chmod +x luna-session
 
+# Rewrite systemd unit paths for the chosen PREFIX.
+define install_systemd
+	@sed -e 's|/usr/local|$(PREFIX)|g' systemd/luna-desktop.service > /tmp/luna-desktop.service.$$$$; \
+	  if install -m 644 /tmp/luna-desktop.service.$$$$ /etc/systemd/system/luna-desktop.service 2>/dev/null; then \
+	    echo "→ Installed systemd unit → /etc/systemd/system/luna-desktop.service"; \
+	  else \
+	    install -d $(PREFIX)/share/luna-desktop; \
+	    install -m 644 /tmp/luna-desktop.service.$$$$ $(PREFIX)/share/luna-desktop/luna-desktop.service; \
+	    echo "→ Unit saved to $(PREFIX)/share/luna-desktop/luna-desktop.service (no root for /etc)"; \
+	  fi; \
+	  rm -f /tmp/luna-desktop.service.$$$$
+endef
+
 install: build-desktop
-	install -d $(PREFIX)/bin $(LUNA_LIB) $(PREFIX)/share/luna-desktop/shell
+	install -d $(PREFIX)/bin $(LUNA_LIB) $(PREFIX)/share/luna-desktop/shell $(PREFIX)/share/doc/luna-desktop
 	install -m 755 luna-session $(PREFIX)/bin/luna-session
-	install -m 755 $(TARGET)/vespera-server $(PREFIX)/bin/luna-compositor
+	install -m 755 $(TARGET)/luna-compositor $(PREFIX)/bin/luna-compositor
 	install -m 755 luna-shell $(PREFIX)/bin/luna-shell
 	install -m 755 $(TARGET)/libwayland_client.so $(LUNA_LIB)/
 	ln -sf libwayland_client.so $(LUNA_LIB)/libwayland-client.so.0
 	ln -sf libwayland_client.so $(LUNA_LIB)/libwayland-client.so
 	install -m 644 ui/luna-shell.html ui/luna-shell.css $(PREFIX)/share/luna-desktop/shell/
 	install -m 644 ui/luna-ui.h ui/cssparser.h $(PREFIX)/share/luna-desktop/shell/
-	install -m 644 README.md $(PREFIX)/share/doc/luna-desktop/README.md 2>/dev/null || true
-	install -m 644 systemd/luna-desktop.service /etc/systemd/system/luna-desktop.service 2>/dev/null || \
-	  install -m 644 systemd/luna-desktop.service $(PREFIX)/share/luna-desktop/luna-desktop.service
+	#install -m 644 README.md $(PREFIX)/share/doc/luna-desktop/README.md 2>/dev/null || true
+	$(install_systemd)
 	@echo "✓ Installed to $(PREFIX)"
+	@echo "  Enable boot: systemctl enable luna-desktop.service"
+
+# Install using system libwayland (skip building/installing libwayland*.so)
+install-system: build-desktop-system
+	install -d $(PREFIX)/bin $(LUNA_LIB) $(PREFIX)/share/luna-desktop/shell $(PREFIX)/share/doc/luna-desktop
+	install -m 755 luna-session $(PREFIX)/bin/luna-session
+	install -m 755 $(TARGET)/luna-compositor $(PREFIX)/bin/luna-compositor
+	install -m 755 luna-shell $(PREFIX)/bin/luna-shell
+	install -m 644 ui/luna-shell.html ui/luna-shell.css $(PREFIX)/share/luna-desktop/shell/
+	install -m 644 ui/luna-ui.h ui/cssparser.h $(PREFIX)/share/luna-desktop/shell/
+	#install -m 644 README.md $(PREFIX)/share/doc/luna-desktop/README.md 2>/dev/null || true
+	$(install_systemd)
+	@echo "✓ Installed to $(PREFIX) (using system libwayland)"
 	@echo "  Enable boot: systemctl enable luna-desktop.service"
 
 # Stop background compositor
 stop:
-	@if [ -f /tmp/vespera-server.pid ]; then \
-	  PID=$$(cat /tmp/vespera-server.pid); \
+	@if [ -f /tmp/luna-compositor.pid ]; then \
+	  PID=$$(cat /tmp/luna-compositor.pid); \
 	  kill "$$PID" 2>/dev/null && echo "→ Compositor stopped (PID=$$PID)" || true; \
-	  rm -f /tmp/vespera-server.pid; \
+	  rm -f /tmp/luna-compositor.pid; \
 	fi
 
 clean:

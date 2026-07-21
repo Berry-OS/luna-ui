@@ -9,7 +9,7 @@ name = "wayland_server"
 crate-type = ["rlib"]
 
 [[bin]]
-name = "vespera-server"
+name = "luna-compositor"
 path = "src/bin/server.rs"
 
 [dependencies]

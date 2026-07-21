@@ -8,6 +8,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod input;
 pub mod object;
 pub mod protocol;
 pub mod render;
@@ -22,11 +24,8 @@ pub use render::{software::SoftwareBackend, Backend, Framebuffer};
 pub use server::Server;
 
 pub fn run(socket_name: &str, backend: Box<dyn Backend>) -> std::io::Result<()> {
-    let mut server = Server::new(socket_name, backend)?;
-    eprintln!(
-        "[vespera-server] listening on $XDG_RUNTIME_DIR/{}",
-        socket_name
-    );
-    server.run();
-    Ok(())
+  let mut server = Server::new(socket_name, backend)?;
+  eprintln!("[luna-compositor] listening on $XDG_RUNTIME_DIR/{}", socket_name);
+  server.run();
+  Ok(())
 }

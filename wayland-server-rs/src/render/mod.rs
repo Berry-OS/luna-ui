@@ -12,6 +12,9 @@ pub mod software;
 #[cfg(all(target_os = "linux", feature = "dri"))]
 pub mod dri;
 
+#[cfg(all(target_os = "linux", feature = "dri"))]
+pub mod vt;
+
 #[cfg(target_arch = "wasm32")]
 pub mod webgl;
 
@@ -118,9 +121,12 @@ fn blend(dst: u32, src: u32) -> u32 {
 #[derive(Debug, Clone)]
 pub enum InputEvent {
     PointerMotion { x: f32, y: f32 },
+    PointerRelative { dx: f32, dy: f32 },
     PointerButton { button: u32, pressed: bool },
     PointerAxis { axis: u32, value: f32 },
     Key { keycode: u32, pressed: bool },
+    Reset,
+    VtSwitch(u8),
 }
 
 pub trait Backend {
@@ -133,4 +139,16 @@ pub trait Backend {
     ) -> Option<(std::sync::mpsc::Receiver<InputEvent>, std::os::unix::io::RawFd)> {
         None
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn deactivate(&mut self) {}
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn activate(&mut self) {}
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn switch_vt(&mut self, _vt: u8) {}
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shutdown(&mut self) {}
 }
