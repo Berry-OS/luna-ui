@@ -1,0 +1,539 @@
+/* luna_linux.h - header-only X11/GLX host for Luna UI */
+
+#if defined(LUNA_UI_PLATFORM_PRELUDE)
+#ifndef LUNA_LINUX_PRELUDE_INCLUDED
+#define LUNA_LINUX_PRELUDE_INCLUDED
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+#include <X11/Xatom.h>
+#include <X11/cursorfont.h>
+#include <GL/gl.h>
+#include <GL/glx.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <limits.h>
+#define LUNA_UI_PLATFORM_GL_INCLUDED 1
+#endif
+#endif /* LUNA_UI_PLATFORM_PRELUDE */
+
+#if defined(LUNA_UI_PLATFORM_BODY)
+#ifndef LUNA_LINUX_BODY_INCLUDED
+#define LUNA_LINUX_BODY_INCLUDED
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct LunaLinuxOptions {
+    const char* display_name;
+    int screen;
+} LunaLinuxOptions;
+
+void luna_linux_set_options(const LunaLinuxOptions* options);
+Display* luna_linux_display(void);
+Window luna_linux_window(void);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* LUNA_LINUX_BODY_INCLUDED */
+
+#if defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_LINUX_IMPLEMENTATION_INCLUDED)
+#define LUNA_LINUX_IMPLEMENTATION_INCLUDED
+
+#ifndef GLX_CONTEXT_MAJOR_VERSION_ARB
+#define GLX_CONTEXT_MAJOR_VERSION_ARB 0x2091
+#define GLX_CONTEXT_MINOR_VERSION_ARB 0x2092
+#define GLX_CONTEXT_PROFILE_MASK_ARB  0x9126
+#define GLX_CONTEXT_CORE_PROFILE_BIT_ARB 0x00000001
+#endif
+
+typedef GLXContext (*LunaGlXCreateContextAttribsARB)(Display*, GLXFBConfig,
+                                                      GLXContext, Bool,
+                                                      const int*);
+typedef int (*LunaGlXSwapIntervalEXT)(Display*, GLXDrawable, int);
+
+typedef struct LunaLinuxState {
+    Display* display;
+    int screen;
+    Window window;
+    Colormap colormap;
+    GLXContext context;
+    Atom wm_delete;
+    Atom clipboard;
+    Atom utf8_string;
+    XIM xim;
+    XIC xic;
+    Cursor cursors[6];
+    int width;
+    int height;
+    int running;
+    int mouse_down;
+    char* clipboard_text;
+    LunaLinuxOptions options;
+    LunaAppConfig config;
+} LunaLinuxState;
+
+static LunaLinuxState luna_x11;
+static LunaLinuxOptions luna_x11_options;
+
+static void luna_linux_sleep_millis(long ms) {
+    struct timeval tv; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
+    select(0, NULL, NULL, NULL, &tv);
+}
+
+static double luna_linux_time_impl(void) {
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+#endif
+    {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+    }
+}
+
+static void* luna_linux_get_proc(const char* name) {
+    void* p = (void*)glXGetProcAddressARB((const GLubyte*)name);
+    if (!p) p = dlsym(RTLD_DEFAULT, name);
+    return p;
+}
+
+static int luna_linux_mods(unsigned int state) {
+    int mods = 0;
+    if (state & ShiftMask) mods |= LUNA_MOD_SHIFT;
+    if (state & ControlMask) mods |= LUNA_MOD_CONTROL;
+    if (state & Mod1Mask) mods |= LUNA_MOD_ALT;
+    if (state & Mod4Mask) mods |= LUNA_MOD_SUPER;
+    return mods;
+}
+
+static int luna_linux_key(KeySym sym) {
+    switch (sym) {
+        case XK_space: return LUNA_KEY_SPACE;
+        case XK_Escape: return LUNA_KEY_ESCAPE;
+        case XK_Return: return LUNA_KEY_ENTER;
+        case XK_KP_Enter: return LUNA_KEY_KP_ENTER;
+        case XK_Tab: case XK_ISO_Left_Tab: return LUNA_KEY_TAB;
+        case XK_BackSpace: return LUNA_KEY_BACKSPACE;
+        case XK_Delete: return LUNA_KEY_DELETE;
+        case XK_Right: return LUNA_KEY_RIGHT;
+        case XK_Left: return LUNA_KEY_LEFT;
+        case XK_Down: return LUNA_KEY_DOWN;
+        case XK_Up: return LUNA_KEY_UP;
+        case XK_Page_Up: return LUNA_KEY_PAGE_UP;
+        case XK_Page_Down: return LUNA_KEY_PAGE_DOWN;
+        case XK_Home: return LUNA_KEY_HOME;
+        case XK_End: return LUNA_KEY_END;
+        case XK_F12: return LUNA_KEY_F12;
+        default:
+            if (sym >= XK_A && sym <= XK_Z) return (int)('A' + sym - XK_A);
+            if (sym >= XK_a && sym <= XK_z) return (int)('A' + sym - XK_a);
+            if (sym >= XK_0 && sym <= XK_9) return (int)('0' + sym - XK_0);
+            return (int)sym;
+    }
+}
+
+static void luna_linux_emit_utf8(const char* s, int n) {
+    const unsigned char* p = (const unsigned char*)s;
+    const unsigned char* end = p + n;
+    while (p < end) {
+        unsigned int cp;
+        if (*p < 0x80) { cp = *p++; }
+        else if ((*p & 0xe0) == 0xc0 && p + 1 < end) {
+            cp = ((unsigned int)(p[0] & 0x1f) << 6) | (unsigned int)(p[1] & 0x3f); p += 2;
+        } else if ((*p & 0xf0) == 0xe0 && p + 2 < end) {
+            cp = ((unsigned int)(p[0] & 0x0f) << 12) |
+                 ((unsigned int)(p[1] & 0x3f) << 6) | (unsigned int)(p[2] & 0x3f); p += 3;
+        } else if ((*p & 0xf8) == 0xf0 && p + 3 < end) {
+            cp = ((unsigned int)(p[0] & 0x07) << 18) |
+                 ((unsigned int)(p[1] & 0x3f) << 12) |
+                 ((unsigned int)(p[2] & 0x3f) << 6) | (unsigned int)(p[3] & 0x3f); p += 4;
+        } else { ++p; continue; }
+        luna_char(cp);
+    }
+}
+
+static void luna_linux_set_cursor_impl(int type) {
+    unsigned int shape = XC_left_ptr;
+    if (!luna_x11.display || !luna_x11.window) return;
+    switch (type) {
+        case 1: shape = XC_hand2; break;
+        case 2: shape = XC_xterm; break;
+        case 3: shape = XC_crosshair; break;
+        case 4: shape = XC_sb_h_double_arrow; break;
+        case 5: shape = XC_sb_v_double_arrow; break;
+    }
+    if (!luna_x11.cursors[type])
+        luna_x11.cursors[type] = XCreateFontCursor(luna_x11.display, shape);
+    XDefineCursor(luna_x11.display, luna_x11.window, luna_x11.cursors[type]);
+}
+
+static void luna_linux_close_impl(void) { luna_x11.running = 0; }
+static void luna_linux_redraw_impl(void) { }
+
+static void luna_linux_iconify_impl(void) {
+    if (luna_x11.display && luna_x11.window)
+        XIconifyWindow(luna_x11.display, luna_x11.window, luna_x11.screen);
+}
+
+static void luna_linux_maximize_impl(void) {
+    Atom state = XInternAtom(luna_x11.display, "_NET_WM_STATE", False);
+    Atom max_h = XInternAtom(luna_x11.display, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
+    Atom max_v = XInternAtom(luna_x11.display, "_NET_WM_STATE_MAXIMIZED_VERT", False);
+    XEvent e;
+    memset(&e, 0, sizeof(e));
+    e.xclient.type = ClientMessage;
+    e.xclient.window = luna_x11.window;
+    e.xclient.message_type = state;
+    e.xclient.format = 32;
+    e.xclient.data.l[0] = 2; /* toggle */
+    e.xclient.data.l[1] = (long)max_h;
+    e.xclient.data.l[2] = (long)max_v;
+    XSendEvent(luna_x11.display, RootWindow(luna_x11.display, luna_x11.screen), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &e);
+}
+
+static void luna_linux_set_clipboard_impl(const char* utf8) {
+    free(luna_x11.clipboard_text);
+    luna_x11.clipboard_text = luna_strdup_local(utf8 ? utf8 : "");
+    XSetSelectionOwner(luna_x11.display, luna_x11.clipboard, luna_x11.window, CurrentTime);
+}
+
+static char* luna_linux_read_selection(Atom target) {
+    Atom property; double deadline;
+    if (!luna_x11.display || !luna_x11.window) return NULL;
+    property = XInternAtom(luna_x11.display, "LUNA_UI_CLIPBOARD_DATA", False);
+    XDeleteProperty(luna_x11.display, luna_x11.window, property);
+    XConvertSelection(luna_x11.display, luna_x11.clipboard, target, property,
+                      luna_x11.window, CurrentTime);
+    XFlush(luna_x11.display);
+    deadline = luna_linux_time_impl() + 0.5;
+    while (luna_linux_time_impl() < deadline) {
+        XEvent event;
+        if (XCheckTypedWindowEvent(luna_x11.display, luna_x11.window,
+                                   SelectionNotify, &event)) {
+            Atom actual_type = None;
+            int actual_format = 0;
+            unsigned long count = 0, remaining = 0;
+            unsigned char* data = NULL;
+            char* result = NULL;
+            if (event.xselection.property == None) return NULL;
+            if (XGetWindowProperty(luna_x11.display, luna_x11.window, property,
+                                   0, LONG_MAX / 4, True, AnyPropertyType,
+                                   &actual_type, &actual_format, &count,
+                                   &remaining, &data) == Success && data &&
+                actual_format == 8) {
+                result = (char*)malloc((size_t)count + 1u);
+                if (result) { memcpy(result, data, (size_t)count); result[count] = '\0'; }
+            }
+            if (data) XFree(data);
+            return result;
+        }
+        luna_linux_sleep_millis(1);
+    }
+    return NULL;
+}
+
+static char* luna_linux_get_clipboard_impl(void) {
+    Window owner; char* result;
+    if (!luna_x11.display) return NULL;
+    owner = XGetSelectionOwner(luna_x11.display, luna_x11.clipboard);
+    if (owner == None) return NULL;
+    if (owner == luna_x11.window)
+        return luna_x11.clipboard_text ? luna_strdup_local(luna_x11.clipboard_text) : NULL;
+    result = luna_linux_read_selection(luna_x11.utf8_string);
+    if (!result) result = luna_linux_read_selection(XA_STRING);
+    return result;
+}
+
+static float luna_linux_scale_impl(void) {
+    int px, mm;
+    if (!luna_x11.display) return 1.0f;
+    px = DisplayWidth(luna_x11.display, luna_x11.screen);
+    mm = DisplayWidthMM(luna_x11.display, luna_x11.screen);
+    if (mm <= 0) return 1.0f;
+    {
+        float dpi = (float)px * 25.4f / (float)mm;
+        if (dpi < 72.0f || dpi > 384.0f) return 1.0f;
+        return dpi / 96.0f;
+    }
+}
+
+static void luna_linux_selection_request(XSelectionRequestEvent* req) {
+    XEvent reply;
+    Atom property = req->property ? req->property : req->target;
+    memset(&reply, 0, sizeof(reply));
+    reply.xselection.type = SelectionNotify;
+    reply.xselection.display = req->display;
+    reply.xselection.requestor = req->requestor;
+    reply.xselection.selection = req->selection;
+    reply.xselection.target = req->target;
+    reply.xselection.time = req->time;
+    reply.xselection.property = None;
+    if (luna_x11.clipboard_text &&
+        (req->target == luna_x11.utf8_string || req->target == XA_STRING)) {
+        XChangeProperty(luna_x11.display, req->requestor, property, req->target, 8,
+                        PropModeReplace, (const unsigned char*)luna_x11.clipboard_text,
+                        (int)strlen(luna_x11.clipboard_text));
+        reply.xselection.property = property;
+    }
+    XSendEvent(luna_x11.display, req->requestor, False, 0, &reply);
+}
+
+static void luna_linux_set_frameless(Display* dpy, Window win) {
+    typedef struct { unsigned long flags, functions, decorations; long input_mode; unsigned long status; } MotifHints;
+    Atom prop = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+    MotifHints hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = 2;
+    hints.decorations = 0;
+    XChangeProperty(dpy, win, prop, prop, 32, PropModeReplace,
+                    (unsigned char*)&hints, 5);
+}
+
+void luna_linux_set_options(const LunaLinuxOptions* options) {
+    if (options) luna_x11_options = *options;
+    else memset(&luna_x11_options, 0, sizeof(luna_x11_options));
+}
+Display* luna_linux_display(void) { return luna_x11.display; }
+Window luna_linux_window(void) { return luna_x11.window; }
+void* luna_app_native_handle(void) { return (void*)(uintptr_t)luna_x11.window; }
+void luna_app_quit(void) { luna_linux_close_impl(); }
+void luna_app_request_redraw(void) { luna_linux_redraw_impl(); }
+
+int luna_app_run(const LunaAppConfig* user_cfg) {
+    LunaAppConfig cfg;
+    int fb_attrs[] = {
+        GLX_X_RENDERABLE, True,
+        GLX_DRAWABLE_TYPE, GLX_WINDOW_BIT,
+        GLX_RENDER_TYPE, GLX_RGBA_BIT,
+        GLX_X_VISUAL_TYPE, GLX_TRUE_COLOR,
+        GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, GLX_ALPHA_SIZE, 8,
+        GLX_DOUBLEBUFFER, True,
+        None
+    };
+    int count = 0;
+    GLXFBConfig* configs;
+    GLXFBConfig fb;
+    XVisualInfo* vi;
+    XSetWindowAttributes swa;
+    LunaGlXCreateContextAttribsARB create_context;
+    const int ctx_attrs[] = {
+        GLX_CONTEXT_MAJOR_VERSION_ARB, 3,
+        GLX_CONTEXT_MINOR_VERSION_ARB, 3,
+        GLX_CONTEXT_PROFILE_MASK_ARB, GLX_CONTEXT_CORE_PROFILE_BIT_ARB,
+        None
+    };
+    LunaPlatform platform;
+    LunaInitConfig init;
+    double previous;
+
+    memset(&cfg, 0, sizeof(cfg));
+    if (user_cfg) cfg = *user_cfg;
+    if (!cfg.title) cfg.title = "Luna UI";
+    if (cfg.width <= 0) cfg.width = 1024;
+    if (cfg.height <= 0) cfg.height = 768;
+    if (!user_cfg) { cfg.resizable = 1; cfg.vsync = 1; }
+
+    memset(&luna_x11, 0, sizeof(luna_x11));
+    luna_x11.options = luna_x11_options;
+    luna_x11.config = cfg;
+    luna_x11.display = XOpenDisplay(luna_x11.options.display_name);
+    if (!luna_x11.display) { fprintf(stderr, "[luna-ui] XOpenDisplay failed\n"); return 1; }
+    luna_x11.screen = luna_x11.options.screen >= 0 ? luna_x11.options.screen : DefaultScreen(luna_x11.display);
+
+    configs = glXChooseFBConfig(luna_x11.display, luna_x11.screen, fb_attrs, &count);
+    if (!configs || count <= 0) return 1;
+    fb = configs[0];
+    vi = glXGetVisualFromFBConfig(luna_x11.display, fb);
+    if (!vi) { XFree(configs); return 1; }
+    swa.colormap = XCreateColormap(luna_x11.display,
+                                   RootWindow(luna_x11.display, vi->screen),
+                                   vi->visual, AllocNone);
+    swa.event_mask = ExposureMask | StructureNotifyMask | PointerMotionMask |
+                     ButtonPressMask | ButtonReleaseMask | KeyPressMask | KeyReleaseMask |
+                     FocusChangeMask;
+    luna_x11.colormap = swa.colormap;
+    luna_x11.window = XCreateWindow(luna_x11.display,
+                                    RootWindow(luna_x11.display, vi->screen),
+                                    0, 0, (unsigned int)cfg.width, (unsigned int)cfg.height,
+                                    0, vi->depth, InputOutput, vi->visual,
+                                    CWColormap | CWEventMask, &swa);
+    if (!luna_x11.window) return 1;
+    XStoreName(luna_x11.display, luna_x11.window, cfg.title);
+    if (cfg.frameless) luna_linux_set_frameless(luna_x11.display, luna_x11.window);
+    luna_x11.wm_delete = XInternAtom(luna_x11.display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(luna_x11.display, luna_x11.window, &luna_x11.wm_delete, 1);
+    luna_x11.clipboard = XInternAtom(luna_x11.display, "CLIPBOARD", False);
+    luna_x11.utf8_string = XInternAtom(luna_x11.display, "UTF8_STRING", False);
+
+    create_context = (LunaGlXCreateContextAttribsARB)
+        glXGetProcAddressARB((const GLubyte*)"glXCreateContextAttribsARB");
+    if (create_context)
+        luna_x11.context = create_context(luna_x11.display, fb, 0, True, ctx_attrs);
+    if (!luna_x11.context)
+        luna_x11.context = glXCreateNewContext(luna_x11.display, fb, GLX_RGBA_TYPE, 0, True);
+    XFree(vi); XFree(configs);
+    if (!luna_x11.context || !glXMakeCurrent(luna_x11.display, luna_x11.window, luna_x11.context)) return 1;
+
+    {
+        typedef void (*SwapExt)(Display*, GLXDrawable, int);
+        typedef int (*SwapMesa)(unsigned int);
+        SwapExt ext = (SwapExt)glXGetProcAddressARB((const GLubyte*)"glXSwapIntervalEXT");
+        SwapMesa mesa = (SwapMesa)glXGetProcAddressARB((const GLubyte*)"glXSwapIntervalMESA");
+        if (ext) ext(luna_x11.display, luna_x11.window, cfg.vsync ? 1 : 0);
+        else if (mesa) mesa(cfg.vsync ? 1u : 0u);
+    }
+
+    luna_x11.xim = XOpenIM(luna_x11.display, NULL, NULL, NULL);
+    if (luna_x11.xim) {
+        luna_x11.xic = XCreateIC(luna_x11.xim,
+                                 XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+                                 XNClientWindow, luna_x11.window,
+                                 XNFocusWindow, luna_x11.window,
+                                 NULL);
+    }
+
+    memset(&platform, 0, sizeof(platform));
+    platform.struct_size = sizeof(platform);
+    platform.api_version = LUNA_UI_API_VERSION;
+    platform.get_time = luna_linux_time_impl;
+    platform.get_proc = luna_linux_get_proc;
+    platform.set_cursor = luna_linux_set_cursor_impl;
+    platform.request_close = luna_linux_close_impl;
+    platform.iconify = luna_linux_iconify_impl;
+    platform.maximize_toggle = luna_linux_maximize_impl;
+    platform.request_redraw = luna_linux_redraw_impl;
+    platform.set_clipboard = luna_linux_set_clipboard_impl;
+    platform.get_clipboard = luna_linux_get_clipboard_impl;
+    platform.get_scale = luna_linux_scale_impl;
+    luna_set_platform(&platform);
+
+    memset(&init, 0, sizeof(init));
+    init.width = (float)cfg.width;
+    init.height = (float)cfg.height;
+    init.get_proc = luna_linux_get_proc;
+    init.frameless = cfg.frameless;
+    if (!luna_init(&init)) return 1;
+    if (cfg.html) luna_parse_html(cfg.html);
+    else if (cfg.html_path && !luna_load_html_file(cfg.html_path))
+        fprintf(stderr, "[luna-ui] could not load HTML: %s\n", cfg.html_path);
+    if (cfg.css) luna_parse_css(cfg.css);
+    else if (cfg.css_path && !luna_load_css_file(cfg.css_path))
+        fprintf(stderr, "[luna-ui] could not load CSS: %s\n", cfg.css_path);
+    luna_inject_body_background();
+    if (cfg.on_init) cfg.on_init(cfg.userdata);
+    luna_wire_onclick_handlers();
+
+    XMapWindow(luna_x11.display, luna_x11.window);
+    XFlush(luna_x11.display);
+    luna_x11.width = cfg.width;
+    luna_x11.height = cfg.height;
+    luna_x11.running = 1;
+    previous = luna_linux_time_impl();
+
+    while (luna_x11.running) {
+        while (XPending(luna_x11.display)) {
+            XEvent e;
+            XNextEvent(luna_x11.display, &e);
+            if (XFilterEvent(&e, None)) continue;
+            switch (e.type) {
+                case ClientMessage:
+                    if ((Atom)e.xclient.data.l[0] == luna_x11.wm_delete) luna_x11.running = 0;
+                    break;
+                case ConfigureNotify:
+                    luna_x11.width = e.xconfigure.width;
+                    luna_x11.height = e.xconfigure.height;
+                    luna_resize((float)luna_x11.width, (float)luna_x11.height);
+                    luna_framebuffer_resized();
+                    break;
+                case MotionNotify:
+                    luna_mouse_move(e.xmotion.x, e.xmotion.y);
+                    break;
+                case ButtonPress:
+                    if (e.xbutton.button == Button4) luna_scroll(0, 1);
+                    else if (e.xbutton.button == Button5) luna_scroll(0, -1);
+                    else if (e.xbutton.button == 6) luna_scroll(-1, 0);
+                    else if (e.xbutton.button == 7) luna_scroll(1, 0);
+                    else {
+                        int b = e.xbutton.button == Button1 ? LUNA_MOUSE_BUTTON_LEFT :
+                                e.xbutton.button == Button3 ? LUNA_MOUSE_BUTTON_RIGHT :
+                                LUNA_MOUSE_BUTTON_MIDDLE;
+                        luna_mouse_button(b, LUNA_PRESS, luna_linux_mods(e.xbutton.state),
+                                          e.xbutton.x, e.xbutton.y);
+                    }
+                    break;
+                case ButtonRelease:
+                    if (e.xbutton.button <= Button3) {
+                        int b = e.xbutton.button == Button1 ? LUNA_MOUSE_BUTTON_LEFT :
+                                e.xbutton.button == Button3 ? LUNA_MOUSE_BUTTON_RIGHT :
+                                LUNA_MOUSE_BUTTON_MIDDLE;
+                        luna_mouse_button(b, LUNA_RELEASE, luna_linux_mods(e.xbutton.state),
+                                          e.xbutton.x, e.xbutton.y);
+                    }
+                    break;
+                case KeyPress: {
+                    KeySym sym = NoSymbol;
+                    Status status = 0;
+                    char buf[128];
+                    int n;
+                    if (luna_x11.xic)
+                        n = Xutf8LookupString(luna_x11.xic, &e.xkey, buf, sizeof(buf), &sym, &status);
+                    else {
+                        n = XLookupString(&e.xkey, buf, sizeof(buf), &sym, NULL);
+                        status = XLookupBoth;
+                    }
+                    luna_key(luna_linux_key(sym), e.xkey.keycode, LUNA_PRESS,
+                             luna_linux_mods(e.xkey.state));
+                    if (n > 0 && (status == XLookupChars || status == XLookupBoth))
+                        luna_linux_emit_utf8(buf, n);
+                    break;
+                }
+                case KeyRelease: {
+                    KeySym sym = XLookupKeysym(&e.xkey, 0);
+                    luna_key(luna_linux_key(sym), e.xkey.keycode, LUNA_RELEASE,
+                             luna_linux_mods(e.xkey.state));
+                    break;
+                }
+                case FocusIn: if (luna_x11.xic) XSetICFocus(luna_x11.xic); break;
+                case FocusOut: if (luna_x11.xic) XUnsetICFocus(luna_x11.xic); break;
+                case SelectionRequest: luna_linux_selection_request(&e.xselectionrequest); break;
+            }
+        }
+        {
+            double now = luna_linux_time_impl();
+            double dt = now - previous;
+            previous = now;
+            if (dt < 0.0 || dt > 0.25) dt = 1.0 / 60.0;
+            if (cfg.on_frame) cfg.on_frame(dt, cfg.userdata);
+            luna_update(now, dt);
+            if (luna_x11.width > 0 && luna_x11.height > 0) {
+                luna_render(luna_x11.width, luna_x11.height);
+                glXSwapBuffers(luna_x11.display, luna_x11.window);
+            }
+            if (!cfg.vsync) luna_linux_sleep_millis(1);
+        }
+    }
+
+    if (cfg.on_shutdown) cfg.on_shutdown(cfg.userdata);
+    luna_shutdown();
+    if (luna_x11.xic) XDestroyIC(luna_x11.xic);
+    if (luna_x11.xim) XCloseIM(luna_x11.xim);
+    for (int i = 0; i < 6; ++i) if (luna_x11.cursors[i]) XFreeCursor(luna_x11.display, luna_x11.cursors[i]);
+    free(luna_x11.clipboard_text);
+    glXMakeCurrent(luna_x11.display, None, NULL);
+    if (luna_x11.context) glXDestroyContext(luna_x11.display, luna_x11.context);
+    if (luna_x11.window) XDestroyWindow(luna_x11.display, luna_x11.window);
+    if (luna_x11.colormap) XFreeColormap(luna_x11.display, luna_x11.colormap);
+    XCloseDisplay(luna_x11.display);
+    return 0;
+}
+
+#endif /* LUNA_UI_IMPLEMENTATION */
+#endif /* LUNA_UI_PLATFORM_BODY */
