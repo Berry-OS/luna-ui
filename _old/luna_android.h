@@ -44,7 +44,7 @@ ANativeWindow* luna_android_window(void);
 #endif
 #endif
 
-#if defined(LUNA_UI_PLATFORM_BODY) && defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_ANDROID_IMPLEMENTATION_INCLUDED)
+#if defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_ANDROID_IMPLEMENTATION_INCLUDED)
 #define LUNA_ANDROID_IMPLEMENTATION_INCLUDED
 
 #ifndef LUNA_ANDROID_APP_CONFIG
@@ -180,13 +180,6 @@ static void luna_android_close(void){pthread_mutex_lock(&luna_android.mutex);lun
 static void luna_android_redraw(void){}
 static float luna_android_scale(void){ return 1.0f; }
 static void luna_android_text_input(int enabled,float x,float y,float w,float h){(void)x;(void)y;(void)w;(void)h;if(!luna_android.activity)return;if(enabled)ANativeActivity_showSoftInput(luna_android.activity,ANATIVEACTIVITY_SHOW_SOFT_INPUT_FORCED);else ANativeActivity_hideSoftInput(luna_android.activity,ANATIVEACTIVITY_HIDE_SOFT_INPUT_NOT_ALWAYS);}
-static void luna_android_begin_move(void){}
-static void luna_android_begin_resize(int edge){(void)edge;}
-static void luna_android_set_title(const char* title){(void)title;}
-static int luna_android_system_notify(const char* app_name,int kind,const char* title,const char* message){
-    (void)app_name;(void)kind;(void)title;(void)message;
-    return 0; /* luna-window falls back to its in-app notification surface. */
-}
 
 static int luna_android_egl_init(ANativeWindow*window){
     EGLint major,minor,num;EGLConfig config;EGLint cfg[]={EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8,EGL_NONE};EGLint ctx[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};
@@ -199,7 +192,7 @@ static int luna_android_egl_init(ANativeWindow*window){
 }
 static void luna_android_egl_shutdown(void){if(luna_android.display!=EGL_NO_DISPLAY){eglMakeCurrent(luna_android.display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(luna_android.surface!=EGL_NO_SURFACE)eglDestroySurface(luna_android.display,luna_android.surface);if(luna_android.context!=EGL_NO_CONTEXT)eglDestroyContext(luna_android.display,luna_android.context);eglTerminate(luna_android.display);}luna_android.display=EGL_NO_DISPLAY;luna_android.surface=EGL_NO_SURFACE;luna_android.context=EGL_NO_CONTEXT;}
 
-static int luna_android_core_init(void){LunaPlatform p;LunaInitConfig i;memset(&p,0,sizeof(p));p.struct_size=sizeof(p);p.api_version=LUNA_UI_API_VERSION;p.get_time=luna_android_time_impl;p.get_proc=luna_android_get_proc;p.set_cursor=luna_android_set_cursor;p.request_close=luna_android_close;p.iconify=luna_android_iconify;p.maximize_toggle=luna_android_maximize;p.request_redraw=luna_android_redraw;p.read_resource=luna_android_read_resource;p.load_font=luna_android_load_font;p.set_clipboard=luna_android_set_clipboard;p.get_clipboard=luna_android_get_clipboard;p.text_input=luna_android_text_input;p.get_scale=luna_android_scale;p.begin_move=luna_android_begin_move;p.begin_resize=luna_android_begin_resize;p.set_title=luna_android_set_title;p.system_notify=luna_android_system_notify;luna_set_platform(&p);memset(&i,0,sizeof(i));i.width=(float)luna_android.fb_width;i.height=(float)luna_android.fb_height;i.get_proc=luna_android_get_proc;i.frameless=1;if(!luna_init(&i))return 0;if(luna_android.config.html)luna_parse_html(luna_android.config.html);else if(luna_android.config.html_path)luna_load_html_file(luna_android.config.html_path);if(luna_android.config.css)luna_parse_css(luna_android.config.css);else if(luna_android.config.css_path)luna_load_css_file(luna_android.config.css_path);luna_inject_body_background();if(luna_android.config.on_init)luna_android.config.on_init(luna_android.config.userdata);luna_wire_onclick_handlers();luna_android.core_initialized=1;return 1;}
+static int luna_android_core_init(void){LunaPlatform p;LunaInitConfig i;memset(&p,0,sizeof(p));p.struct_size=sizeof(p);p.api_version=LUNA_UI_API_VERSION;p.get_time=luna_android_time_impl;p.get_proc=luna_android_get_proc;p.set_cursor=luna_android_set_cursor;p.request_close=luna_android_close;p.iconify=luna_android_iconify;p.maximize_toggle=luna_android_maximize;p.request_redraw=luna_android_redraw;p.read_resource=luna_android_read_resource;p.load_font=luna_android_load_font;p.set_clipboard=luna_android_set_clipboard;p.get_clipboard=luna_android_get_clipboard;p.text_input=luna_android_text_input;p.get_scale=luna_android_scale;luna_set_platform(&p);memset(&i,0,sizeof(i));i.width=(float)luna_android.fb_width;i.height=(float)luna_android.fb_height;i.get_proc=luna_android_get_proc;i.frameless=1;if(!luna_init(&i))return 0;if(luna_android.config.html)luna_parse_html(luna_android.config.html);else if(luna_android.config.html_path)luna_load_html_file(luna_android.config.html_path);if(luna_android.config.css)luna_parse_css(luna_android.config.css);else if(luna_android.config.css_path)luna_load_css_file(luna_android.config.css_path);luna_inject_body_background();if(luna_android.config.on_init)luna_android.config.on_init(luna_android.config.userdata);luna_wire_onclick_handlers();luna_android.core_initialized=1;return 1;}
 
 static int luna_android_process_input(AInputEvent*e){int type=AInputEvent_getType(e);if(type==AINPUT_EVENT_TYPE_MOTION){int action=AMotionEvent_getAction(e),masked=action&AMOTION_EVENT_ACTION_MASK;float x=AMotionEvent_getX(e,0),y=AMotionEvent_getY(e,0);luna_mouse_move(x,y);if(masked==AMOTION_EVENT_ACTION_DOWN||masked==AMOTION_EVENT_ACTION_POINTER_DOWN)luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_PRESS,0,x,y);else if(masked==AMOTION_EVENT_ACTION_UP||masked==AMOTION_EVENT_ACTION_POINTER_UP||masked==AMOTION_EVENT_ACTION_CANCEL)luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_RELEASE,0,x,y);else if(masked==AMOTION_EVENT_ACTION_SCROLL)luna_scroll(AMotionEvent_getAxisValue(e,AMOTION_EVENT_AXIS_HSCROLL,0),AMotionEvent_getAxisValue(e,AMOTION_EVENT_AXIS_VSCROLL,0));return 1;}if(type==AINPUT_EVENT_TYPE_KEY){int act=AKeyEvent_getAction(e),key=AKeyEvent_getKeyCode(e),meta=AKeyEvent_getMetaState(e);int la=act==AKEY_EVENT_ACTION_DOWN?(AKeyEvent_getRepeatCount(e)?LUNA_REPEAT:LUNA_PRESS):LUNA_RELEASE;luna_key(luna_android_keycode(key),AKeyEvent_getScanCode(e),la,luna_android_mods(meta));if(la==LUNA_PRESS){int cp=luna_android_unicode_char(key,meta);if(cp>0)luna_char((unsigned)cp);}return 1;}return 0;}
 

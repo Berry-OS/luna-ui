@@ -15,8 +15,6 @@ Header-only multiplatform HTML/CSS → OpenGL UI host.
 
 There is no `luna_platform.h`. Platform selection is performed inside `luna-ui.h`.
 
-[![Sponsor](https://img.shields.io/badge/Sponsor%20this%20project-%E2%9D%A4%EF%B8%8F-white?logo=githubsponsors&logoColor=EA4AAA&labelColor=EA4AAA)](https://github.com/sponsors/yui0)
-
 ---
 
 ## 📦 Basic use

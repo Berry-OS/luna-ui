@@ -116,10 +116,9 @@ typedef struct LunaElement LunaElement;
 typedef struct LunaContext LunaContext;
 typedef void (*LunaEventHandler)(LunaElement* e);
 typedef void (*LunaTrapDismissFn)(int trap_idx);
-typedef void (*LunaMousePressHook)(int hit, int button, int mods);
 typedef void (*LunaMouseReleaseHook)(int hit, int drag_moved);
 
-#define LUNA_UI_API_VERSION 0x00020000u
+#define LUNA_UI_API_VERSION 0x00010000u
 
 enum {
     LUNA_FONT_REGULAR = 0,
@@ -128,25 +127,6 @@ enum {
     LUNA_FONT_MONO,
     LUNA_FONT_SYMBOLS,
     LUNA_FONT_BRANDS
-};
-
-enum {
-    LUNA_RESIZE_EDGE_NONE         = 0,
-    LUNA_RESIZE_EDGE_LEFT         = 1 << 0,
-    LUNA_RESIZE_EDGE_RIGHT        = 1 << 1,
-    LUNA_RESIZE_EDGE_TOP          = 1 << 2,
-    LUNA_RESIZE_EDGE_BOTTOM       = 1 << 3,
-    LUNA_RESIZE_EDGE_TOP_LEFT     = LUNA_RESIZE_EDGE_TOP | LUNA_RESIZE_EDGE_LEFT,
-    LUNA_RESIZE_EDGE_TOP_RIGHT    = LUNA_RESIZE_EDGE_TOP | LUNA_RESIZE_EDGE_RIGHT,
-    LUNA_RESIZE_EDGE_BOTTOM_LEFT  = LUNA_RESIZE_EDGE_BOTTOM | LUNA_RESIZE_EDGE_LEFT,
-    LUNA_RESIZE_EDGE_BOTTOM_RIGHT = LUNA_RESIZE_EDGE_BOTTOM | LUNA_RESIZE_EDGE_RIGHT
-};
-
-enum {
-    LUNA_NOTIFY_INFO = 0,
-    LUNA_NOTIFY_SUCCESS,
-    LUNA_NOTIFY_WARNING,
-    LUNA_NOTIFY_ERROR
 };
 
 typedef void* (*LunaGetProcFn)(const char* name);
@@ -165,14 +145,9 @@ typedef void (*LunaSetClipboardFn)(const char* utf8);
 typedef char* (*LunaGetClipboardFn)(void); /* malloc-compatible result */
 typedef void (*LunaTextInputFn)(int enabled, float x, float y, float w, float h);
 typedef float (*LunaGetScaleFn)(void);
-typedef void (*LunaBeginMoveFn)(void);
-typedef void (*LunaBeginResizeFn)(int edge);
-typedef void (*LunaSetTitleFn)(const char* title);
-typedef int (*LunaSystemNotifyFn)(const char* app_name, int kind,
-                                  const char* title, const char* message);
 
 typedef struct LunaPlatform {
-    /* Host ABI v2. All built-in hosts populate this complete layout. */
+    /* Original fields stay first for source compatibility with existing hosts. */
     LunaGetTimeFn          get_time;
     LunaGetProcFn          get_proc;
     LunaSetCursorFn        set_cursor;
@@ -187,10 +162,6 @@ typedef struct LunaPlatform {
     LunaGetClipboardFn     get_clipboard;
     LunaTextInputFn        text_input;
     LunaGetScaleFn         get_scale;
-    LunaBeginMoveFn        begin_move;
-    LunaBeginResizeFn      begin_resize;
-    LunaSetTitleFn         set_title;
-    LunaSystemNotifyFn     system_notify;
     uint32_t               struct_size;
     uint32_t               api_version;
 } LunaPlatform;
@@ -230,15 +201,6 @@ void  luna_clipboard_set(const char* utf8);
 char* luna_clipboard_get(void); /* free with luna_clipboard_free() */
 void  luna_clipboard_free(char* utf8);
 float luna_platform_scale(void);
-double luna_platform_time(void);
-void luna_platform_request_close(void);
-void luna_platform_iconify(void);
-void luna_platform_maximize_toggle(void);
-void luna_platform_begin_move(void);
-void luna_platform_begin_resize(int edge);
-void luna_platform_set_title(const char* title);
-int  luna_platform_system_notify(const char* app_name, int kind,
-                                 const char* title, const char* message);
 
 /*
  * Host-neutral input constants. Values intentionally match GLFW so existing
@@ -290,7 +252,6 @@ void luna_inject_body_background(void);
 void luna_wire_onclick_handlers(void);
 void luna_push_focus_trap(int idx, LunaTrapDismissFn on_dismiss, int backdrop_dismiss);
 void luna_pop_focus_trap(int idx);
-void luna_set_mouse_press_hook(LunaMousePressHook fn);
 void luna_set_mouse_release_hook(LunaMouseReleaseHook fn);
 /* Button that triggered the most recent on_click (LUNA_MOUSE_BUTTON_*). */
 int  luna_last_click_button(void);
@@ -360,7 +321,6 @@ void luna_context_mouse_button(LunaContext* ctx, int button, int action,
 void luna_context_scroll(LunaContext* ctx, double xoffset, double yoffset);
 int  luna_element_count(void);
 LunaElement* luna_element_at(int idx);
-int  luna_element_parent(int idx);
 /* 1 when no display:none anywhere between idx and the root — i.e. changing
  * this element's text or style can actually change pixels. */
 int  luna_element_visible(int idx);
@@ -503,35 +463,11 @@ static double luna_now(void) {
 
 void luna_set_platform(const LunaPlatform* p) {
     memset(&g_luna_platform, 0, sizeof(g_luna_platform));
-    if (!p) return;
-    g_luna_platform = *p;
-}
-
-double luna_platform_time(void) { return luna_now(); }
-void luna_platform_request_close(void) {
-    if (g_luna_platform.request_close) g_luna_platform.request_close();
-}
-void luna_platform_iconify(void) {
-    if (g_luna_platform.iconify) g_luna_platform.iconify();
-}
-void luna_platform_maximize_toggle(void) {
-    if (g_luna_platform.maximize_toggle) g_luna_platform.maximize_toggle();
-}
-void luna_platform_begin_move(void) {
-    if (g_luna_platform.begin_move) g_luna_platform.begin_move();
-}
-void luna_platform_begin_resize(int edge) {
-    if (g_luna_platform.begin_resize) g_luna_platform.begin_resize(edge);
-}
-void luna_platform_set_title(const char* title) {
-    if (title) snprintf(luna_doc_title, sizeof(luna_doc_title), "%s", title);
-    if (g_luna_platform.set_title) g_luna_platform.set_title(title ? title : "");
-}
-int luna_platform_system_notify(const char* app_name, int kind,
-                                const char* title, const char* message) {
-    if (!g_luna_platform.system_notify) return 0;
-    return g_luna_platform.system_notify(app_name ? app_name : "Luna", kind,
-                                         title ? title : "", message ? message : "");
+    if (p) {
+        size_t n = p->struct_size ? p->struct_size : sizeof(*p);
+        if (n > sizeof(g_luna_platform)) n = sizeof(g_luna_platform);
+        memcpy(&g_luna_platform, p, n);
+    }
 }
 
 float luna_window_width = 1024.0f;
@@ -1943,7 +1879,6 @@ typedef struct {
 } LunaFocusTrapEntry;
 static LunaFocusTrapEntry g_focus_traps[LUNA_MAX_FOCUS_TRAPS];
 static int g_focus_trap_count = 0;
-static LunaMousePressHook g_mouse_press_hook = NULL;
 static LunaMouseReleaseHook g_mouse_release_hook = NULL;
 static int g_luna_last_click_button = LUNA_MOUSE_BUTTON_LEFT;
 static int g_luna_last_click_mods = 0;
@@ -12114,7 +12049,6 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
         }
 
         int hit = hit_test_at(mx, my);
-        if (g_mouse_press_hook) g_mouse_press_hook(hit, button, mods);
         if (hit != -1) {
             LunaElement* e = &elements[hit];
             if (g_focused_element_idx != -1 && g_focused_element_idx != hit)
@@ -12759,7 +12693,6 @@ static int load_gl_functions() {
 /* ── Public wrappers ── */
 int luna_element_count(void) { return elem_count; }
 LunaElement* luna_element_at(int i) { return (i >= 0 && i < elem_count) ? &elements[i] : NULL; }
-int luna_element_parent(int i) { return (i >= 0 && i < elem_count) ? elements[i].parent_idx : -1; }
 int luna_get_element_by_id(const char* id) { return get_element_by_id(id); }
 int luna_focused_element(void) { return g_focused_element_idx; }
 void luna_focus_element(int idx) { if (idx == -1 || (idx >= 0 && idx < elem_count)) focus_element(idx); }
@@ -12854,7 +12787,6 @@ void luna_pop_focus_trap(int idx) {
     }
 }
 
-void luna_set_mouse_press_hook(LunaMousePressHook fn) { g_mouse_press_hook = fn; }
 void luna_set_mouse_release_hook(LunaMouseReleaseHook fn) { g_mouse_release_hook = fn; }
 int luna_last_click_button(void) { return g_luna_last_click_button; }
 int luna_last_click_mods(void) { return g_luna_last_click_mods; }

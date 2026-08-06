@@ -28,7 +28,7 @@ EMSCRIPTEN_WEBGL_CONTEXT_HANDLE luna_web_context(void);
 #endif
 #endif
 
-#if defined(LUNA_UI_PLATFORM_BODY) && defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_WEB_IMPLEMENTATION_INCLUDED)
+#if defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_WEB_IMPLEMENTATION_INCLUDED)
 #define LUNA_WEB_IMPLEMENTATION_INCLUDED
 
 typedef struct LunaWebState {
@@ -64,11 +64,6 @@ EM_JS(void,luna_web_js_install_ime,(),{
     input.addEventListener('input',()=>{if(input.value){const n=lengthBytesUTF8(input.value)+1;const p=_malloc(n);stringToUTF8(input.value,p,n);_luna_web_commit_utf8(p);_free(p);input.value=String();}});
 });
 EM_JS(void,luna_web_js_text_input,(int enabled),{const i=Module.lunaHiddenInput;if(!i)return;if(enabled)i.focus({preventScroll:true});else i.blur();});
-EM_JS(void,luna_web_js_set_title,(const char*title),{document.title=UTF8ToString(title);});
-EM_JS(int,luna_web_js_notify,(const char*title,const char*message),{
-    if(!('Notification' in window)||Notification.permission!=='granted')return 0;
-    new Notification(UTF8ToString(title),{body:UTF8ToString(message)});return 1;
-});
 
 static void luna_web_set_cursor(int type){luna_web_js_set_cursor2(type);}
 static void luna_web_close(void){luna_web.running=0;emscripten_cancel_main_loop();}
@@ -77,9 +72,6 @@ static float luna_web_scale(void){return(float)luna_web_js_scale();}
 static void luna_web_set_clipboard(const char*text){free(luna_web.clipboard_cache);luna_web.clipboard_cache=luna_strdup_local(text?text:"");luna_web_js_clipboard_set(text?text:"");}
 static char*luna_web_get_clipboard(void){return luna_web.clipboard_cache?luna_strdup_local(luna_web.clipboard_cache):NULL;}
 static void luna_web_text_input(int enabled,float x,float y,float w,float h){(void)x;(void)y;(void)w;(void)h;luna_web_js_text_input(enabled);}
-static void luna_web_begin_move(void){}static void luna_web_begin_resize(int edge){(void)edge;}
-static void luna_web_set_title(const char*title){luna_web_js_set_title(title?title:"");}
-static int luna_web_system_notify(const char*app_name,int kind,const char*title,const char*message){(void)app_name;(void)kind;return luna_web_js_notify(title?title:"",message?message:"");}
 
 static int luna_web_mods(EM_BOOL shift,EM_BOOL ctrl,EM_BOOL alt,EM_BOOL meta){int m=0;if(shift)m|=LUNA_MOD_SHIFT;if(ctrl)m|=LUNA_MOD_CONTROL;if(alt)m|=LUNA_MOD_ALT;if(meta)m|=LUNA_MOD_SUPER;return m;}
 static int luna_web_keycode(const EmscriptenKeyboardEvent*e){int k=e->keyCode;switch(k){case 32:return LUNA_KEY_SPACE;case 27:return LUNA_KEY_ESCAPE;case 13:return LUNA_KEY_ENTER;case 9:return LUNA_KEY_TAB;case 8:return LUNA_KEY_BACKSPACE;case 46:return LUNA_KEY_DELETE;case 39:return LUNA_KEY_RIGHT;case 37:return LUNA_KEY_LEFT;case 40:return LUNA_KEY_DOWN;case 38:return LUNA_KEY_UP;case 33:return LUNA_KEY_PAGE_UP;case 34:return LUNA_KEY_PAGE_DOWN;case 36:return LUNA_KEY_HOME;case 35:return LUNA_KEY_END;case 123:return LUNA_KEY_F12;default:return k;}}
@@ -99,7 +91,7 @@ EMSCRIPTEN_WEBGL_CONTEXT_HANDLE luna_web_context(void){return luna_web.context;}
 int luna_app_run(const LunaAppConfig*user_cfg){LunaAppConfig cfg;EmscriptenWebGLContextAttributes a;LunaPlatform p;LunaInitConfig i;memset(&cfg,0,sizeof(cfg));if(user_cfg)cfg=*user_cfg;if(!cfg.title)cfg.title="Luna UI";if(cfg.width<=0)cfg.width=1024;if(cfg.height<=0)cfg.height=768;memset(&luna_web,0,sizeof(luna_web));luna_web.config=cfg;
     emscripten_webgl_init_context_attributes(&a);a.alpha=cfg.transparent?EM_TRUE:EM_FALSE;a.depth=EM_FALSE;a.stencil=EM_FALSE;a.antialias=EM_TRUE;a.majorVersion=2;a.minorVersion=0;a.enableExtensionsByDefault=EM_TRUE;
     luna_web.context=emscripten_webgl_create_context(LUNA_WEB_CANVAS,&a);if(luna_web.context<=0)return 1;if(emscripten_webgl_make_context_current(luna_web.context)!=EMSCRIPTEN_RESULT_SUCCESS)return 1;
-    memset(&p,0,sizeof(p));p.struct_size=sizeof(p);p.api_version=LUNA_UI_API_VERSION;p.get_time=luna_web_time_impl;p.get_proc=luna_web_get_proc;p.set_cursor=luna_web_set_cursor;p.request_close=luna_web_close;p.iconify=luna_web_iconify;p.maximize_toggle=luna_web_maximize;p.request_redraw=luna_web_redraw;p.read_resource=luna_web_read_resource;p.load_font=luna_web_load_font;p.set_clipboard=luna_web_set_clipboard;p.get_clipboard=NULL;p.text_input=luna_web_text_input;p.get_scale=luna_web_scale;p.begin_move=luna_web_begin_move;p.begin_resize=luna_web_begin_resize;p.set_title=luna_web_set_title;p.system_notify=luna_web_system_notify;luna_set_platform(&p);
+    memset(&p,0,sizeof(p));p.struct_size=sizeof(p);p.api_version=LUNA_UI_API_VERSION;p.get_time=luna_web_time_impl;p.get_proc=luna_web_get_proc;p.set_cursor=luna_web_set_cursor;p.request_close=luna_web_close;p.iconify=luna_web_iconify;p.maximize_toggle=luna_web_maximize;p.request_redraw=luna_web_redraw;p.read_resource=luna_web_read_resource;p.load_font=luna_web_load_font;p.set_clipboard=luna_web_set_clipboard;p.get_clipboard=NULL;p.text_input=luna_web_text_input;p.get_scale=luna_web_scale;luna_set_platform(&p);
     luna_web_resize(0,NULL,NULL);memset(&i,0,sizeof(i));i.width=(float)luna_web.css_width;i.height=(float)luna_web.css_height;i.get_proc=luna_web_get_proc;i.frameless=1;if(!luna_init(&i))return 1;if(cfg.html)luna_parse_html(cfg.html);else if(cfg.html_path)luna_load_html_file(cfg.html_path);if(cfg.css)luna_parse_css(cfg.css);else if(cfg.css_path)luna_load_css_file(cfg.css_path);luna_inject_body_background();if(cfg.on_init)cfg.on_init(cfg.userdata);luna_wire_onclick_handlers();
     emscripten_set_mousedown_callback(LUNA_WEB_CANVAS,NULL,EM_TRUE,luna_web_mouse);emscripten_set_mouseup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW,NULL,EM_TRUE,luna_web_mouse);emscripten_set_mousemove_callback(LUNA_WEB_CANVAS,NULL,EM_TRUE,luna_web_mouse);emscripten_set_wheel_callback(LUNA_WEB_CANVAS,NULL,EM_TRUE,luna_web_wheel);emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW,NULL,EM_TRUE,luna_web_key);emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW,NULL,EM_TRUE,luna_web_key);emscripten_set_touchstart_callback(LUNA_WEB_CANVAS,NULL,EM_TRUE,luna_web_touch);emscripten_set_touchmove_callback(LUNA_WEB_CANVAS,NULL,EM_TRUE,luna_web_touch);emscripten_set_touchend_callback(LUNA_WEB_CANVAS,NULL,EM_TRUE,luna_web_touch);emscripten_set_touchcancel_callback(LUNA_WEB_CANVAS,NULL,EM_TRUE,luna_web_touch);emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW,NULL,EM_TRUE,luna_web_resize);luna_web_js_install_ime();luna_web.running=1;luna_web.previous=luna_web_time_impl();emscripten_set_main_loop_arg(luna_web_frame,NULL,0,cfg.vsync?1:0);return 0;}
 

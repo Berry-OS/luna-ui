@@ -12,11 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <math.h>
-#include <errno.h>
 
 #define LUNA_UI_PLATFORM_GL_INCLUDED 1
 #endif
@@ -44,7 +39,7 @@ GLFWwindow* luna_linux_window(void);
 #endif
 #endif /* LUNA_LINUX_BODY_INCLUDED */
 
-#if defined(LUNA_UI_PLATFORM_BODY) && defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_LINUX_IMPLEMENTATION_INCLUDED)
+#if defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_LINUX_IMPLEMENTATION_INCLUDED)
 #define LUNA_LINUX_IMPLEMENTATION_INCLUDED
 
 typedef struct LunaLinuxState {
@@ -55,10 +50,6 @@ typedef struct LunaLinuxState {
     int framebuffer_width;
     int framebuffer_height;
     int glfw_initialized;
-    int window_drag_mode;
-    int window_resize_edges;
-    double drag_anchor_x, drag_anchor_y;
-    double drag_last_x, drag_last_y;
     LunaLinuxOptions options;
     LunaAppConfig config;
 } LunaLinuxState;
@@ -146,49 +137,6 @@ static void luna_linux_maximize_impl(void) {
 #endif
 }
 
-static void luna_linux_begin_move_impl(void) {
-    if (!luna_linux_state.window) return;
-    glfwGetCursorPos(luna_linux_state.window, &luna_linux_state.drag_anchor_x,
-                     &luna_linux_state.drag_anchor_y);
-    luna_linux_state.drag_last_x = luna_linux_state.drag_anchor_x;
-    luna_linux_state.drag_last_y = luna_linux_state.drag_anchor_y;
-    luna_linux_state.window_drag_mode = 1;
-    luna_linux_state.window_resize_edges = LUNA_RESIZE_EDGE_NONE;
-}
-
-static void luna_linux_begin_resize_impl(int edge) {
-    if (!luna_linux_state.window || edge == LUNA_RESIZE_EDGE_NONE) return;
-    glfwGetCursorPos(luna_linux_state.window, &luna_linux_state.drag_anchor_x,
-                     &luna_linux_state.drag_anchor_y);
-    luna_linux_state.drag_last_x = luna_linux_state.drag_anchor_x;
-    luna_linux_state.drag_last_y = luna_linux_state.drag_anchor_y;
-    luna_linux_state.window_drag_mode = 2;
-    luna_linux_state.window_resize_edges = edge;
-}
-
-static void luna_linux_set_title_impl(const char* title) {
-    if (luna_linux_state.window)
-        glfwSetWindowTitle(luna_linux_state.window, title ? title : "");
-}
-
-static int luna_linux_system_notify_impl(const char* app_name, int kind,
-                                         const char* title, const char* message) {
-    pid_t pid;
-    const char* urgency = kind == LUNA_NOTIFY_ERROR ? "critical" :
-                          kind == LUNA_NOTIFY_WARNING ? "normal" : "low";
-    pid = fork();
-    if (pid < 0) return 0;
-    if (pid == 0) {
-        execlp("notify-send", "notify-send", "-a", app_name ? app_name : "Luna",
-               "-u", urgency, title ? title : "", message ? message : "",
-               (char*)NULL);
-        _exit(127);
-    }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-}
-
 static void luna_linux_set_clipboard_impl(const char* utf8) {
     if (luna_linux_state.window)
         glfwSetClipboardString(luna_linux_state.window, utf8 ? utf8 : "");
@@ -217,36 +165,8 @@ static float luna_linux_scale_impl(void) {
 }
 
 static void luna_linux_cursor_position_callback(GLFWwindow* window,
-                                                 double x, double y) {
-    if (luna_linux_state.window_drag_mode &&
-        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
-        int wx, wy, ww, wh;
-        int min_w = 160, min_h = 120;
-        glfwGetWindowPos(window, &wx, &wy);
-        glfwGetWindowSize(window, &ww, &wh);
-        if (luna_linux_state.window_drag_mode == 1) {
-            int dx = (int)llround(x - luna_linux_state.drag_anchor_x);
-            int dy = (int)llround(y - luna_linux_state.drag_anchor_y);
-            if (dx || dy) glfwSetWindowPos(window, wx + dx, wy + dy);
-        } else {
-            int edge = luna_linux_state.window_resize_edges;
-            int dx_left = (int)llround(x - luna_linux_state.drag_anchor_x);
-            int dy_top = (int)llround(y - luna_linux_state.drag_anchor_y);
-            int dx_right = (int)llround(x - luna_linux_state.drag_last_x);
-            int dy_bottom = (int)llround(y - luna_linux_state.drag_last_y);
-            int nx = wx, ny = wy, nw = ww, nh = wh;
-            if (edge & LUNA_RESIZE_EDGE_LEFT) { nx += dx_left; nw -= dx_left; }
-            if (edge & LUNA_RESIZE_EDGE_TOP) { ny += dy_top; nh -= dy_top; }
-            if (edge & LUNA_RESIZE_EDGE_RIGHT) nw += dx_right;
-            if (edge & LUNA_RESIZE_EDGE_BOTTOM) nh += dy_bottom;
-            if (nw < min_w) { if (edge & LUNA_RESIZE_EDGE_LEFT) nx -= min_w - nw; nw = min_w; }
-            if (nh < min_h) { if (edge & LUNA_RESIZE_EDGE_TOP) ny -= min_h - nh; nh = min_h; }
-            if (nx != wx || ny != wy) glfwSetWindowPos(window, nx, ny);
-            if (nw != ww || nh != wh) glfwSetWindowSize(window, nw, nh);
-            if (edge & LUNA_RESIZE_EDGE_RIGHT) luna_linux_state.drag_last_x = x;
-            if (edge & LUNA_RESIZE_EDGE_BOTTOM) luna_linux_state.drag_last_y = y;
-        }
-    }
+                                                double x, double y) {
+    (void)window;
     luna_mouse_move(x, y);
 }
 
@@ -256,10 +176,6 @@ static void luna_linux_mouse_button_callback(GLFWwindow* window,
     double y = 0.0;
     glfwGetCursorPos(window, &x, &y);
     luna_mouse_button(button, action, mods, x, y);
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE) {
-        luna_linux_state.window_drag_mode = 0;
-        luna_linux_state.window_resize_edges = LUNA_RESIZE_EDGE_NONE;
-    }
 }
 
 static void luna_linux_scroll_callback(GLFWwindow* window,
@@ -438,10 +354,6 @@ int luna_app_run(const LunaAppConfig* user_config) {
     platform.set_clipboard = luna_linux_set_clipboard_impl;
     platform.get_clipboard = luna_linux_get_clipboard_impl;
     platform.get_scale = luna_linux_scale_impl;
-    platform.begin_move = luna_linux_begin_move_impl;
-    platform.begin_resize = luna_linux_begin_resize_impl;
-    platform.set_title = luna_linux_set_title_impl;
-    platform.system_notify = luna_linux_system_notify_impl;
     luna_set_platform(&platform);
 
     memset(&init, 0, sizeof(init));

@@ -31,7 +31,7 @@ UIView* luna_ios_view(void);
 #endif
 #endif
 
-#if defined(LUNA_UI_PLATFORM_BODY) && defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_IOS_IMPLEMENTATION_INCLUDED)
+#if defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_IOS_IMPLEMENTATION_INCLUDED)
 #define LUNA_IOS_IMPLEMENTATION_INCLUDED
 
 @interface LunaIOSView : UIView <UIKeyInput>
@@ -109,15 +109,6 @@ static float luna_ios_scale(void){return (float)[UIScreen mainScreen].scale;}
 static void luna_ios_set_clipboard(const char* text){[UIPasteboard generalPasteboard].string=[NSString stringWithUTF8String:text?text:""];}
 static char* luna_ios_get_clipboard(void){NSString*s=[UIPasteboard generalPasteboard].string;if(!s)return NULL;const char*u=s.UTF8String;size_t n=strlen(u)+1;char*p=(char*)malloc(n);if(p)memcpy(p,u,n);return p;}
 static void luna_ios_text_input(int enabled,float x,float y,float w,float h){(void)x;(void)y;(void)w;(void)h;if(enabled)[luna_ios.view becomeFirstResponder];else[luna_ios.view resignFirstResponder];}
-static void luna_ios_begin_move(void){}
-static void luna_ios_begin_resize(int edge){(void)edge;}
-static void luna_ios_set_title(const char* title){
-    UIViewController* c=luna_ios.window.rootViewController;
-    if(c)c.title=[NSString stringWithUTF8String:title?title:""];
-}
-static int luna_ios_system_notify(const char* app_name,int kind,const char* title,const char* message){
-    (void)app_name;(void)kind;(void)title;(void)message;return 0;
-}
 
 static int luna_ios_setup_core(LunaIOSView* view){
     LunaPlatform p; LunaInitConfig init; LunaAppConfig*cfg=&luna_ios.config;
@@ -126,7 +117,6 @@ static int luna_ios_setup_core(LunaIOSView* view){
     p.request_close=luna_ios_close;p.iconify=luna_ios_iconify;p.maximize_toggle=luna_ios_maximize;
     p.request_redraw=luna_ios_redraw;p.read_resource=luna_ios_read_resource;p.load_font=luna_ios_load_font;
     p.set_clipboard=luna_ios_set_clipboard;p.get_clipboard=luna_ios_get_clipboard;p.text_input=luna_ios_text_input;p.get_scale=luna_ios_scale;
-    p.begin_move=luna_ios_begin_move;p.begin_resize=luna_ios_begin_resize;p.set_title=luna_ios_set_title;p.system_notify=luna_ios_system_notify;
     luna_set_platform(&p);
     memset(&init,0,sizeof(init));init.width=(float)view.bounds.size.width;init.height=(float)view.bounds.size.height;init.get_proc=luna_ios_get_proc;init.frameless=1;
     if(!luna_init(&init))return 0;

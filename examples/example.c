@@ -1,4 +1,4 @@
-// gcc -o example example.c -lGL -lm -lglfw -lX11
+// gcc -o example example.c -lGL -lm -lglfw
 #include <stdio.h>
 
 #define LUNA_UI_IMPLEMENTATION

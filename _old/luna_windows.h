@@ -39,7 +39,7 @@ HWND luna_windows_hwnd(void);
 #endif
 #endif /* LUNA_WINDOWS_BODY_INCLUDED */
 
-#if defined(LUNA_UI_PLATFORM_BODY) && defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_WINDOWS_IMPLEMENTATION_INCLUDED)
+#if defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_WINDOWS_IMPLEMENTATION_INCLUDED)
 #define LUNA_WINDOWS_IMPLEMENTATION_INCLUDED
 
 #if defined(_MSC_VER)
@@ -71,7 +71,6 @@ typedef struct LunaWindowsState {
     int running;
     int redraw;
     int mouse_captured;
-    int notify_icon_added;
     wchar_t pending_high_surrogate;
     LunaAppConfig config;
     LunaWindowsOptions options;
@@ -306,62 +305,6 @@ static void luna_win_iconify(void) {
 static void luna_win_maximize_toggle(void) {
     if (!luna_win.hwnd) return;
     ShowWindow(luna_win.hwnd, IsZoomed(luna_win.hwnd) ? SW_RESTORE : SW_MAXIMIZE);
-}
-
-static void luna_win_begin_move(void) {
-    if (!luna_win.hwnd) return;
-    ReleaseCapture();
-    SendMessageW(luna_win.hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-}
-
-static void luna_win_begin_resize(int edge) {
-    WPARAM hit = 0;
-    if (!luna_win.hwnd) return;
-    switch (edge) {
-        case LUNA_RESIZE_EDGE_LEFT: hit = HTLEFT; break;
-        case LUNA_RESIZE_EDGE_RIGHT: hit = HTRIGHT; break;
-        case LUNA_RESIZE_EDGE_TOP: hit = HTTOP; break;
-        case LUNA_RESIZE_EDGE_BOTTOM: hit = HTBOTTOM; break;
-        case LUNA_RESIZE_EDGE_TOP_LEFT: hit = HTTOPLEFT; break;
-        case LUNA_RESIZE_EDGE_TOP_RIGHT: hit = HTTOPRIGHT; break;
-        case LUNA_RESIZE_EDGE_BOTTOM_LEFT: hit = HTBOTTOMLEFT; break;
-        case LUNA_RESIZE_EDGE_BOTTOM_RIGHT: hit = HTBOTTOMRIGHT; break;
-        default: return;
-    }
-    ReleaseCapture();
-    SendMessageW(luna_win.hwnd, WM_NCLBUTTONDOWN, hit, 0);
-}
-
-static void luna_win_set_title(const char* title) {
-    wchar_t* w = luna_win_utf8_to_wide(title ? title : "");
-    if (w && luna_win.hwnd) SetWindowTextW(luna_win.hwnd, w);
-    free(w);
-}
-
-static int luna_win_system_notify(const char* app_name, int kind,
-                                  const char* title, const char* message) {
-    NOTIFYICONDATAW data;
-    wchar_t* wt = luna_win_utf8_to_wide(title ? title : "");
-    wchar_t* wm = luna_win_utf8_to_wide(message ? message : "");
-    wchar_t* wa = luna_win_utf8_to_wide(app_name ? app_name : "Luna");
-    if (!luna_win.hwnd || !wt || !wm || !wa) { free(wt); free(wm); free(wa); return 0; }
-    memset(&data, 0, sizeof(data));
-    data.cbSize = sizeof(data);
-    data.hWnd = luna_win.hwnd;
-    data.uID = 1;
-    data.uFlags = NIF_ICON | NIF_TIP | NIF_INFO;
-    data.hIcon = luna_win.options.icon ? luna_win.options.icon : LoadIcon(NULL, IDI_APPLICATION);
-    wcsncpy(data.szTip, wa, sizeof(data.szTip)/sizeof(data.szTip[0]) - 1);
-    wcsncpy(data.szInfoTitle, wt, sizeof(data.szInfoTitle)/sizeof(data.szInfoTitle[0]) - 1);
-    wcsncpy(data.szInfo, wm, sizeof(data.szInfo)/sizeof(data.szInfo[0]) - 1);
-    data.dwInfoFlags = kind == LUNA_NOTIFY_ERROR ? NIIF_ERROR :
-                       kind == LUNA_NOTIFY_WARNING ? NIIF_WARNING : NIIF_INFO;
-    if (!luna_win.notify_icon_added) {
-        luna_win.notify_icon_added = Shell_NotifyIconW(NIM_ADD, &data) ? 1 : 0;
-    }
-    if (luna_win.notify_icon_added) Shell_NotifyIconW(NIM_MODIFY, &data);
-    free(wt); free(wm); free(wa);
-    return luna_win.notify_icon_added;
 }
 
 static void luna_win_request_redraw_impl(void) {
@@ -644,10 +587,6 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
     platform.get_clipboard = luna_win_get_clipboard;
     platform.text_input = luna_win_text_input;
     platform.get_scale = luna_win_scale;
-    platform.begin_move = luna_win_begin_move;
-    platform.begin_resize = luna_win_begin_resize;
-    platform.set_title = luna_win_set_title;
-    platform.system_notify = luna_win_system_notify;
     luna_set_platform(&platform);
 
     memset(&init, 0, sizeof(init));
@@ -698,12 +637,6 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
     }
 
     if (cfg.on_shutdown) cfg.on_shutdown(cfg.userdata);
-    if (luna_win.notify_icon_added && luna_win.hwnd) {
-        NOTIFYICONDATAW data; memset(&data, 0, sizeof(data));
-        data.cbSize = sizeof(data); data.hWnd = luna_win.hwnd; data.uID = 1;
-        Shell_NotifyIconW(NIM_DELETE, &data);
-        luna_win.notify_icon_added = 0;
-    }
     luna_shutdown();
     if (luna_win.glrc) { wglMakeCurrent(NULL, NULL); wglDeleteContext(luna_win.glrc); }
     if (luna_win.dc && luna_win.hwnd) ReleaseDC(luna_win.hwnd, luna_win.dc);

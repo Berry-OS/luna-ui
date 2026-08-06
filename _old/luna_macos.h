@@ -29,7 +29,7 @@ NSView* luna_macos_view(void);
 #endif
 #endif
 
-#if defined(LUNA_UI_PLATFORM_BODY) && defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_MACOS_IMPLEMENTATION_INCLUDED)
+#if defined(LUNA_UI_IMPLEMENTATION) && !defined(LUNA_MACOS_IMPLEMENTATION_INCLUDED)
 #define LUNA_MACOS_IMPLEMENTATION_INCLUDED
 
 @interface LunaMacView : NSOpenGLView <NSTextInputClient>
@@ -208,26 +208,6 @@ static void luna_mac_close(void) {
 static void luna_mac_iconify(void) { [luna_mac.window miniaturize:nil]; }
 static void luna_mac_maximize(void) { [luna_mac.window zoom:nil]; }
 static void luna_mac_redraw(void) { [luna_mac.view setNeedsDisplay:YES]; }
-static void luna_mac_begin_move(void) {
-    NSEvent* event = [NSApp currentEvent];
-    if (luna_mac.window && event) [luna_mac.window performWindowDragWithEvent:event];
-}
-static void luna_mac_begin_resize(int edge) { (void)edge; }
-static void luna_mac_set_title(const char* title) {
-    if (luna_mac.window) luna_mac.window.title = [NSString stringWithUTF8String:title ? title : ""];
-}
-static int luna_mac_system_notify(const char* app_name, int kind,
-                                  const char* title, const char* message) {
-    (void)app_name; (void)kind;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    NSUserNotification* n = [NSUserNotification new];
-    n.title = [NSString stringWithUTF8String:title ? title : ""];
-    n.informativeText = [NSString stringWithUTF8String:message ? message : ""];
-    [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:n];
-#pragma clang diagnostic pop
-    return 1;
-}
 
 static void luna_mac_set_clipboard(const char* utf8) {
     NSPasteboard* pb = [NSPasteboard generalPasteboard];
@@ -430,10 +410,6 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
     platform.get_clipboard=luna_mac_get_clipboard;
     platform.text_input=luna_mac_text_input;
     platform.get_scale=luna_mac_scale;
-    platform.begin_move=luna_mac_begin_move;
-    platform.begin_resize=luna_mac_begin_resize;
-    platform.set_title=luna_mac_set_title;
-    platform.system_notify=luna_mac_system_notify;
     luna_set_platform(&platform);
 
     memset(&init,0,sizeof(init));
