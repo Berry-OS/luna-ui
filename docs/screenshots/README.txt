@@ -1,0 +1,1 @@
+capture-only screenshots generated from the real examples/example.c application using a minimal GLFW compatibility layer backed by off-screen Mesa/EGL OpenGL. This directory is documentation-only.
