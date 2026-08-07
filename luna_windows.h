@@ -691,6 +691,8 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
             GetClientRect(luna_win.hwnd, &r);
             if (r.right > r.left && r.bottom > r.top) {
                 luna_render(r.right-r.left, r.bottom-r.top);
+                if (cfg.on_render)
+                    cfg.on_render(r.right-r.left, r.bottom-r.top, cfg.userdata);
                 SwapBuffers(luna_win.dc);
             }
         }

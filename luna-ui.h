@@ -211,6 +211,14 @@ typedef struct LunaAppConfig {
     void (*on_frame)(double dt, void* userdata);
     void (*on_shutdown)(void* userdata);
     void* userdata;
+    /* Optional custom paint pass invoked after luna_render() and before the
+     * native host swaps buffers. Useful for applications that mix Luna DOM
+     * chrome with a specialized OpenGL surface (editor, canvas, viewport). */
+    void (*on_render)(int framebuffer_width, int framebuffer_height, void* userdata);
+    /* on_frame historically means continuous animation. Keep 0 for that
+     * behavior. A positive value makes the native host sleep between idle
+     * ticks while still waking immediately for input/redraw events. */
+    double frame_interval;
 } LunaAppConfig;
 
 typedef struct LunaInitConfig {
@@ -565,7 +573,7 @@ int   luna_css_from_document = 0;
 #define g_doc_title   luna_doc_title
 #define g_css_from_document luna_css_from_document
 
-typedef void (*LunaPFNGLCREATEVERTEXARRAYSPROC)(GLsizei n, GLuint* arrays);
+typedef void (*LunaPFNGLGENVERTEXARRAYSPROC)(GLsizei n, GLuint* arrays);
 typedef void (*LunaPFNGLDELETEVERTEXARRAYSPROC)(GLsizei n, const GLuint* arrays);
 typedef void (*LunaPFNGLGENBUFFERSPROC)(GLsizei n, GLuint* buffers);
 typedef void (*LunaPFNGLBINDBUFFERPROC)(GLenum target, GLuint buffer);
@@ -642,7 +650,7 @@ typedef void (*LUNA_PFNGLREADPIXELSPROC)(GLint x, GLint y, GLsizei width, GLsize
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 #endif
 
-LunaPFNGLCREATEVERTEXARRAYSPROC luna_glCreateVertexArrays;
+LunaPFNGLGENVERTEXARRAYSPROC luna_glGenVertexArrays;
 LunaPFNGLDELETEVERTEXARRAYSPROC luna_glDeleteVertexArrays;
 LunaPFNGLGENBUFFERSPROC luna_glGenBuffers;
 LunaPFNGLBINDBUFFERPROC luna_glBindBuffer;
@@ -669,7 +677,7 @@ LunaPFNGLGETUNIFORMLOCATIONPROC luna_glGetUniformLocation;
 LunaPFNGLUNIFORM4FPROC luna_glUniform4f;
 LunaPFNGLUNIFORM2FPROC luna_glUniform2f;
 LunaPFNGLUNIFORM1FPROC luna_glUniform1f;
-#define glCreateVertexArrays luna_glCreateVertexArrays
+#define glGenVertexArrays luna_glGenVertexArrays
 #define glDeleteVertexArrays luna_glDeleteVertexArrays
 #define glGenBuffers luna_glGenBuffers
 #define glBindBuffer luna_glBindBuffer
@@ -1410,6 +1418,10 @@ struct LunaElement {
     int css_positioned; // 1=left/right set, 2=top/bottom set
 
     int z_index;
+    /* Runtime stacking override (window activation).  CSS restyles must not
+     * erase host-managed front/back ordering. */
+    int z_override_valid;
+    int z_override;
     int visibility_hidden;
     float transform_scale;
     float transform_tx, transform_ty;
@@ -1775,6 +1787,9 @@ static void rebuild_activity_registries(void) {
     g_activity_registry_dirty = 0;
 }
 StyleRule  css_rules[MAX_RULES];   int rule_count = 0;
+/* parse_html only needs a final whole-document restyle when sibling-dependent
+ * selectors exist.  Most application stylesheets do not use them. */
+static int g_has_structural_selectors = 0;
 CssKeyframe g_keyframes[MAX_KF_ANIMS];
 int g_keyframe_count = 0;
 JsHandlerEntry g_js_handlers[MAX_JS_HANDLERS];
@@ -2106,6 +2121,10 @@ typedef struct {
 static unsigned char g_dyn_pixels[LUNA_DYN_ATLAS_W * LUNA_DYN_ATLAS_H];
 static GLuint g_dyn_tex = 0;
 static int    g_dyn_dirty = 0;
+/* Incremented whenever packing is reset.  Text preparation uses this to detect
+ * eviction that happened halfway through a string and re-walk that string
+ * before issuing any draw calls. */
+static unsigned g_dyn_generation = 1;
 /* Rows of the atlas that changed since the last upload, as a half-open range.
  * Baking one new glyph used to re-upload the whole 1 MB atlas; a CJK label or
  * a font-size the shell had not drawn before therefore cost a megabyte of PCIe
@@ -2277,6 +2296,7 @@ static int font_path_score_brands(const char* path) {
 }
 
 static void dyn_atlas_reset(void) {
+    if (++g_dyn_generation == 0) g_dyn_generation = 1;
     memset(g_dyn_pixels, 0, sizeof(g_dyn_pixels));
     g_dyn_pack_x = 1; g_dyn_pack_y = 1; g_dyn_pack_row_h = 0;
     g_dyn_glyph_count = 0;
@@ -4211,18 +4231,20 @@ int element_has_class(LunaElement* e, const char* cls) {
 }
 
 void update_element_style(LunaElement* e);
+static int restyle_element_checked(LunaElement* e);
 
 /* Class changes on an ancestor invalidate descendant selectors such as
  * `#app.ts-2 .skin-list-row`.  Restyle the node and every descendant. */
 static void restyle_element_and_descendants(LunaElement* e) {
     int root = (int)(e - elements);
     if (root < 0 || root >= elem_count) return;
-    update_element_style(e);
+
+    (void)restyle_element_checked(e);
     for (int i = 0; i < elem_count; i++) {
         if (i == root) continue;
         for (int p = elements[i].parent_idx; p != -1; p = elements[p].parent_idx) {
             if (p == root) {
-                update_element_style(&elements[i]);
+                (void)restyle_element_checked(&elements[i]);
                 break;
             }
         }
@@ -4337,9 +4359,16 @@ static int element_overflow_visible(int idx) {
     return 1;
 }
 
+static int is_paint_visible(int idx) {
+    while (idx != -1) {
+        if (elements[idx].display_none || elements[idx].visibility_hidden) return 0;
+        idx = elements[idx].parent_idx;
+    }
+    return 1;
+}
+
 int is_rendered(int idx) {
-    if (!is_visible(idx)) return 0;
-    if (elements[idx].visibility_hidden) return 0;
+    if (!is_paint_visible(idx)) return 0;
     if (!element_overflow_visible(idx)) return 0;
     return 1;
 }
@@ -4521,10 +4550,24 @@ void parse_declarations(char* declarations, StyleRule* rule);
    Wraps parse_declarations so all property logic stays in one place. */
 static void apply_one_declaration(const char* key, const char* val, StyleRule* rule) {
     /* Skip CSS custom properties (--name: value) — resolved by cssparser.h */
-    if (strncmp(key, "--", 2) == 0) return;
-    char buf[CSS_MAX_VALUE + CSS_MAX_STR + 4];
-    snprintf(buf, sizeof(buf), "%s: %s;", key, val);
+    if (!key || !val || strncmp(key, "--", 2) == 0) return;
+
+    size_t key_len = strlen(key);
+    size_t val_len = strlen(val);
+    if (key_len > SIZE_MAX - 4 || val_len > SIZE_MAX - 4 - key_len) return;
+
+    size_t len = key_len + val_len + 4; /* ": " + ';' + NUL */
+    char* buf = (char*)malloc(len);
+    if (!buf) return;
+
+    memcpy(buf, key, key_len);
+    buf[key_len] = ':';
+    buf[key_len + 1] = ' ';
+    memcpy(buf + key_len + 2, val, val_len);
+    buf[key_len + 2 + val_len] = ';';
+    buf[key_len + 3 + val_len] = 0;
     parse_declarations(buf, rule);
+    free(buf);
 }
 
 /* Map the CSS family stack to one of Luna UI's loaded font roles.
@@ -5968,6 +6011,13 @@ static void ingest_parsed_rule(const CSSRule *pr) {
         snprintf(rule.selector, sizeof(rule.selector) - 1,
                  "[sel%d]", si);
 
+        if (rule.target.is_first_child || rule.target.is_last_child || rule.target.has_nth)
+            g_has_structural_selectors = 1;
+        for (int a = 0; a < rule.ancestor_count; a++)
+            if (rule.ancestors[a].is_first_child || rule.ancestors[a].is_last_child ||
+                rule.ancestors[a].has_nth)
+                g_has_structural_selectors = 1;
+
         rule.source_order = rule_count;
         css_rules[rule_count++] = rule;
     }
@@ -6152,7 +6202,7 @@ static int element_contains_focus(int idx) {
 
 static void update_focus_within_styles(int idx) {
     while (idx != -1) {
-        update_element_style(&elements[idx]);
+        (void)restyle_element_checked(&elements[idx]);
         idx = elements[idx].parent_idx;
     }
 }
@@ -6204,7 +6254,6 @@ void update_element_style(LunaElement* e) {
     e->has_flex_basis = 0;
     e->flex_basis = 0.0f;
     e->flex_basis_auto = 1;
-    e->flex_child = 0;
     /* Browser UA styles size form controls with border-box semantics.  Keep
        ordinary elements content-box unless author CSS overrides box-sizing. */
     e->box_sizing = (strcmp(e->type, "button") == 0 ||
@@ -6253,13 +6302,6 @@ void update_element_style(LunaElement* e) {
     e->sticky_left = 0.0f;
     e->sticky_use_right = 0;
     e->sticky_right = 0.0f;
-    e->inert = 0;
-    e->tabindex = -2;
-    e->aria_label[0] = '\0';
-    e->role[0] = '\0';
-    e->aria_live = 0;
-    e->aria_hidden = 0;
-    e->aria_expanded = -1;
     e->scroll_margin_top = e->scroll_margin_right = 0.0f;
     e->scroll_margin_bottom = e->scroll_margin_left = 0.0f;
     e->scroll_padding_top = e->scroll_padding_right = 0.0f;
@@ -6271,7 +6313,6 @@ void update_element_style(LunaElement* e) {
     e->has_grid_col = e->has_grid_row = 0;
     e->has_grid_area = 0;
     e->grid_area_name[0] = '\0';
-    e->grid_child = 0;
     e->css_positioned = 0;
     e->cursor_type = 0; e->position_fixed = 0;
     e->has_bottom = 0; e->has_right = 0;
@@ -6811,8 +6852,105 @@ void update_element_style(LunaElement* e) {
     if (e->is_input && !e->input_multiline) e->white_space = 1;
     /* ::before/::after must not steal clicks; style reset clears the flag. */
     if (e->generated_pseudo) e->pointer_events_none = 1;
+    if (e->z_override_valid) e->z_index = e->z_override;
     g_activity_registry_dirty = 1;
     visual_activate_idx((int)(e - elements));
+}
+
+
+/* Computed CSS and runtime layout state used to be mixed together.  A hover or
+ * class restyle could therefore require a layout but there was no reliable way
+ * to know it.  Compare only geometry/intrinsic-size inputs: visual-only state
+ * (colors, opacity, shadows, transforms) stays on the cheap paint path. */
+static int layout_style_changed(const LunaElement* a, const LunaElement* b) {
+#define LUNA_LAYOUT_DIFF(f) do { if (a->f != b->f) return 1; } while (0)
+#define LUNA_LAYOUT_MEM(f)  do { if (memcmp(&a->f, &b->f, sizeof(a->f)) != 0) return 1; } while (0)
+    LUNA_LAYOUT_DIFF(display_none); LUNA_LAYOUT_DIFF(display_mode);
+    LUNA_LAYOUT_DIFF(position_fixed); LUNA_LAYOUT_DIFF(position_sticky);
+    LUNA_LAYOUT_DIFF(position_mode); LUNA_LAYOUT_DIFF(css_positioned);
+    LUNA_LAYOUT_DIFF(has_left); LUNA_LAYOUT_DIFF(has_right);
+    LUNA_LAYOUT_DIFF(has_top); LUNA_LAYOUT_DIFF(has_bottom);
+    LUNA_LAYOUT_DIFF(pct_left); LUNA_LAYOUT_DIFF(pct_right);
+    LUNA_LAYOUT_DIFF(pct_top); LUNA_LAYOUT_DIFF(pct_bottom);
+    LUNA_LAYOUT_DIFF(raw_left); LUNA_LAYOUT_DIFF(raw_right);
+    LUNA_LAYOUT_DIFF(raw_top); LUNA_LAYOUT_DIFF(raw_bottom);
+    LUNA_LAYOUT_DIFF(raw_left_off); LUNA_LAYOUT_DIFF(raw_right_off);
+    LUNA_LAYOUT_DIFF(raw_top_off); LUNA_LAYOUT_DIFF(raw_bottom_off);
+    LUNA_LAYOUT_DIFF(bottom_val); LUNA_LAYOUT_DIFF(right_val);
+    LUNA_LAYOUT_DIFF(sticky_use_top); LUNA_LAYOUT_DIFF(sticky_use_bottom);
+    LUNA_LAYOUT_DIFF(sticky_use_left); LUNA_LAYOUT_DIFF(sticky_use_right);
+    LUNA_LAYOUT_DIFF(sticky_top); LUNA_LAYOUT_DIFF(sticky_bottom);
+    LUNA_LAYOUT_DIFF(sticky_left); LUNA_LAYOUT_DIFF(sticky_right);
+
+    LUNA_LAYOUT_DIFF(has_css_width); LUNA_LAYOUT_DIFF(has_css_height);
+    LUNA_LAYOUT_DIFF(css_width); LUNA_LAYOUT_DIFF(css_height);
+    LUNA_LAYOUT_DIFF(pct_w); LUNA_LAYOUT_DIFF(pct_h);
+    LUNA_LAYOUT_DIFF(raw_w); LUNA_LAYOUT_DIFF(raw_h);
+    LUNA_LAYOUT_DIFF(raw_w_off); LUNA_LAYOUT_DIFF(raw_h_off);
+    LUNA_LAYOUT_DIFF(has_min_width); LUNA_LAYOUT_DIFF(has_min_height);
+    LUNA_LAYOUT_DIFF(css_min_width); LUNA_LAYOUT_DIFF(css_min_height);
+    LUNA_LAYOUT_DIFF(has_max_width); LUNA_LAYOUT_DIFF(has_max_height);
+    LUNA_LAYOUT_DIFF(css_max_width); LUNA_LAYOUT_DIFF(css_max_height);
+    LUNA_LAYOUT_DIFF(max_width_pct); LUNA_LAYOUT_DIFF(max_height_pct);
+    LUNA_LAYOUT_DIFF(raw_max_width); LUNA_LAYOUT_DIFF(raw_max_height);
+    LUNA_LAYOUT_DIFF(raw_max_width_off); LUNA_LAYOUT_DIFF(raw_max_height_off);
+    LUNA_LAYOUT_DIFF(has_aspect_ratio); LUNA_LAYOUT_DIFF(aspect_ratio);
+    LUNA_LAYOUT_DIFF(box_sizing); LUNA_LAYOUT_DIFF(border_width);
+    LUNA_LAYOUT_DIFF(pad_t); LUNA_LAYOUT_DIFF(pad_r);
+    LUNA_LAYOUT_DIFF(pad_b); LUNA_LAYOUT_DIFF(pad_l);
+    LUNA_LAYOUT_DIFF(margin_top); LUNA_LAYOUT_DIFF(margin_right);
+    LUNA_LAYOUT_DIFF(margin_bottom); LUNA_LAYOUT_DIFF(margin_left);
+    LUNA_LAYOUT_DIFF(margin_top_auto); LUNA_LAYOUT_DIFF(margin_right_auto);
+    LUNA_LAYOUT_DIFF(margin_bottom_auto); LUNA_LAYOUT_DIFF(margin_left_auto);
+
+    LUNA_LAYOUT_DIFF(flex_direction); LUNA_LAYOUT_DIFF(justify_content);
+    LUNA_LAYOUT_DIFF(align_items); LUNA_LAYOUT_DIFF(justify_items);
+    LUNA_LAYOUT_DIFF(align_content); LUNA_LAYOUT_DIFF(flex_wrap);
+    LUNA_LAYOUT_DIFF(align_self); LUNA_LAYOUT_DIFF(justify_self);
+    LUNA_LAYOUT_DIFF(flex_gap); LUNA_LAYOUT_DIFF(flex_grow);
+    LUNA_LAYOUT_DIFF(flex_shrink); LUNA_LAYOUT_DIFF(flex_basis);
+    LUNA_LAYOUT_DIFF(has_flex_basis); LUNA_LAYOUT_DIFF(flex_basis_auto);
+
+    LUNA_LAYOUT_DIFF(grid_col_count); LUNA_LAYOUT_DIFF(grid_row_count);
+    LUNA_LAYOUT_MEM(grid_col_track); LUNA_LAYOUT_MEM(grid_col_type); LUNA_LAYOUT_MEM(grid_col_min);
+    LUNA_LAYOUT_MEM(grid_row_track); LUNA_LAYOUT_MEM(grid_row_type); LUNA_LAYOUT_MEM(grid_row_min);
+    LUNA_LAYOUT_DIFF(grid_col_gap); LUNA_LAYOUT_DIFF(grid_row_gap);
+    LUNA_LAYOUT_DIFF(grid_auto_flow);
+    LUNA_LAYOUT_DIFF(grid_auto_row_track); LUNA_LAYOUT_DIFF(grid_auto_col_track);
+    LUNA_LAYOUT_DIFF(grid_auto_row_type); LUNA_LAYOUT_DIFF(grid_auto_col_type);
+    LUNA_LAYOUT_DIFF(grid_auto_row_min); LUNA_LAYOUT_DIFF(grid_auto_col_min);
+    LUNA_LAYOUT_DIFF(has_grid_auto_rows); LUNA_LAYOUT_DIFF(has_grid_auto_columns);
+    LUNA_LAYOUT_DIFF(grid_area_rows); LUNA_LAYOUT_DIFF(grid_area_cols);
+    LUNA_LAYOUT_MEM(grid_area_cell);
+    LUNA_LAYOUT_DIFF(grid_col); LUNA_LAYOUT_DIFF(grid_row);
+    LUNA_LAYOUT_DIFF(grid_col_span); LUNA_LAYOUT_DIFF(grid_row_span);
+    LUNA_LAYOUT_DIFF(has_grid_col); LUNA_LAYOUT_DIFF(has_grid_row);
+    LUNA_LAYOUT_DIFF(has_grid_area); LUNA_LAYOUT_MEM(grid_area_name);
+
+    LUNA_LAYOUT_DIFF(overflow_x); LUNA_LAYOUT_DIFF(overflow_y);
+    LUNA_LAYOUT_DIFF(scrollbar_width); LUNA_LAYOUT_DIFF(has_scrollbar_width);
+    LUNA_LAYOUT_DIFF(font_size); LUNA_LAYOUT_DIFF(font_bold); LUNA_LAYOUT_DIFF(font_face);
+    LUNA_LAYOUT_DIFF(font_italic); LUNA_LAYOUT_DIFF(line_height);
+    LUNA_LAYOUT_DIFF(white_space); LUNA_LAYOUT_DIFF(text_overflow);
+    LUNA_LAYOUT_DIFF(overflow_wrap); LUNA_LAYOUT_DIFF(letter_spacing);
+    LUNA_LAYOUT_DIFF(line_clamp); LUNA_LAYOUT_DIFF(text_transform);
+#undef LUNA_LAYOUT_MEM
+#undef LUNA_LAYOUT_DIFF
+    return 0;
+}
+
+static int restyle_element_checked(LunaElement* e) {
+    if (!e) return 0;
+    LunaElement before = *e;
+    update_element_style(e);
+    int layout_changed = layout_style_changed(&before, e);
+    if (layout_changed) {
+        memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
+        g_layout_dirty = 1;
+    }
+    if (before.z_index != e->z_index)
+        g_render_order_dirty = 1;
+    return layout_changed;
 }
 
 // ============================================================
@@ -6864,6 +7002,8 @@ static void generate_pseudo_elements(void) {
             int ni = elem_count++;
             LunaElement* pe = &elements[ni];
             memset(pe, 0, sizeof(*pe));
+            pe->tabindex = -2;
+            pe->aria_expanded = -1;
             pe->id_idx = ni;
             pe->parent_idx = ei;
             pe->generated_pseudo = r->pseudo_elem;
@@ -7181,6 +7321,8 @@ void parse_html(const char* html) {
             if (existing == -1 && elem_count < MAX_ELEMENTS) {
                 int bi = elem_count++;
                 memset(&elements[bi], 0, sizeof(LunaElement));
+                elements[bi].tabindex = -2;
+                elements[bi].aria_expanded = -1;
                 strncpy(elements[bi].type, "body", sizeof(elements[bi].type) - 1);
                 char bcls[96] = {0};
                 char* battr = strstr(tag_buf, "class=\"");
@@ -7374,16 +7516,18 @@ void parse_html(const char* html) {
         p = tag_end + 1;
     }
 
-    /* Structural pseudo-classes (:first-child, :last-child, :nth-child) depend
-       on the FINAL sibling set — per-element resolution above ran while the
-       tree was still growing, so re-resolve every element now. */
-    for (int i = 0; i < elem_count; i++) {
-        LunaElement* e = &elements[i];
-        if (e->luna_internal) continue;
-        update_element_style(e);
-        e->cur_r = e->r; e->cur_g = e->g; e->cur_b = e->b; e->cur_a = e->a;
-        e->cur_bd_r = e->bd_r; e->cur_bd_g = e->bd_g;
-        e->cur_bd_b = e->bd_b; e->cur_bd_a = e->bd_a;
+    /* Structural pseudo-classes depend on the FINAL sibling set.  Skip this
+       O(elements) second restyle for the common case where the stylesheet has
+       none; parent-before-child parsing already produced final computed style. */
+    if (g_has_structural_selectors) {
+        for (int i = 0; i < elem_count; i++) {
+            LunaElement* e = &elements[i];
+            if (e->luna_internal) continue;
+            update_element_style(e);
+            e->cur_r = e->r; e->cur_g = e->g; e->cur_b = e->b; e->cur_a = e->a;
+            e->cur_bd_r = e->bd_r; e->cur_bd_g = e->bd_g;
+            e->cur_bd_b = e->bd_b; e->cur_bd_a = e->bd_a;
+        }
     }
     /* Generate ::before / ::after pseudo-element nodes */
     generate_pseudo_elements();
@@ -9327,6 +9471,8 @@ static int ensure_overlay_element(const char* id, const char* classes, int host,
         if (elem_count >= MAX_ELEMENTS) return -1;
         idx = elem_count++;
         memset(&elements[idx], 0, sizeof(LunaElement));
+        elements[idx].tabindex = -2;
+        elements[idx].aria_expanded = -1;
         strncpy(elements[idx].id, id, sizeof(elements[idx].id) - 1);
         strncpy(elements[idx].class_name, classes, sizeof(elements[idx].class_name) - 1);
         strncpy(elements[idx].type, "div", sizeof(elements[idx].type) - 1);
@@ -9413,6 +9559,8 @@ static void sync_css_overlay_elements(void) {
     if (a11y == -1 && elem_count < MAX_ELEMENTS) {
         a11y = elem_count++;
         memset(&elements[a11y], 0, sizeof(LunaElement));
+        elements[a11y].tabindex = -2;
+        elements[a11y].aria_expanded = -1;
         strncpy(elements[a11y].id, "luna_a11y_bar", sizeof(elements[a11y].id) - 1);
         strncpy(elements[a11y].class_name, "luna_a11y hidden", sizeof(elements[a11y].class_name) - 1);
         strncpy(elements[a11y].type, "div", sizeof(elements[a11y].type) - 1);
@@ -9444,7 +9592,7 @@ static void sync_css_overlay_elements(void) {
             else if (fe->role[0] && fe->text[0])
                 snprintf(buf, sizeof(buf), "%.64s: %.180s", fe->role, fe->text);
             else if (fe->text[0])
-                snprintf(buf, sizeof(buf), "%s", fe->text);
+                snprintf(buf, sizeof(buf), "%.*s", (int)sizeof(buf) - 1, fe->text);
             if (buf[0]) show = 1;
             strncpy(elements[a11y].class_name, "luna_a11y", sizeof(elements[a11y].class_name) - 1);
         }
@@ -9904,7 +10052,7 @@ static void rc_fill_slow(int i) {
     c->eff_op = element_effective_opacity(i);
     accum_ancestor_transform(i, &c->anc_tx, &c->anc_ty);
     c->clip_anc = find_rounded_clip_ancestor(i);
-    c->vis = (unsigned char)is_visible(i);
+    c->vis = (unsigned char)is_paint_visible(i);
     c->in_root = (unsigned char)(g_render_root < 0 || elem_is_self_or_descendant(i, g_render_root));
     c->clipped = 0;
     rc_rect_init(&c->cx, &c->cy, &c->cw, &c->ch);
@@ -9945,7 +10093,7 @@ static void rc_build(void) {
             c->anc_tx  = 0.0f;
             c->anc_ty  = 0.0f;
             c->clip_anc = -1;
-            c->vis     = (unsigned char)!e->display_none;
+            c->vis     = (unsigned char)(!e->display_none && !e->visibility_hidden);
             c->clipped = 0;
             c->in_root = (unsigned char)(g_render_root < 0 || i == g_render_root);
             rc_rect_init(&c->cx, &c->cy, &c->cw, &c->ch);
@@ -9957,7 +10105,7 @@ static void rc_build(void) {
         c->eff_op  = pc->eff_op * e->opacity;
         c->anc_tx  = pc->anc_tx + par->cur_tx;
         c->anc_ty  = pc->anc_ty + par->cur_ty;
-        c->vis     = (unsigned char)(pc->vis && !e->display_none);
+        c->vis     = (unsigned char)(pc->vis && !e->display_none && !e->visibility_hidden);
         c->in_root = (unsigned char)(g_render_root < 0 || i == g_render_root || pc->in_root);
         int cx_on = overflow_clips(par->overflow_x);
         int cy_on = overflow_clips(par->overflow_y);
@@ -11056,7 +11204,7 @@ void init_font() {
     fpl_free(&reg);
     fpl_free(&bold_list);
 
-    glCreateVertexArrays(1, &text_vao);
+    glGenVertexArrays(1, &text_vao);
     glGenBuffers(1, &text_vbo);
     glBindVertexArray(text_vao); g_current_vao = text_vao;
     glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
@@ -11176,7 +11324,7 @@ static int fit_text_chars(FontAtlas* atlas, const char* text, int len, float max
 
 void init_rect_geometry() {
     float vertices[] = { 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
-    glCreateVertexArrays(1, &g_rect_vao);
+    glGenVertexArrays(1, &g_rect_vao);
     glGenBuffers(1, &g_rect_vbo);
     /* Setup path: bind unconditionally, then tell the tracker what is current. */
     glBindVertexArray(g_rect_vao);
@@ -11498,15 +11646,21 @@ void render_text_pass(FontAtlas* atlas, const char* text,
     }
     if (g_text_css_px > 0.0f) css_px = g_text_css_px;
 
-    /* Pre-bake every glyph that uses the exact-size/device-scale atlas so the
-     * texture upload happens once per string rather than once per character. */
-    {
+    /* Pre-bake every dynamic glyph before drawing.  Packing can reset the
+     * atlas when it fills.  If that happens halfway through this string, glyphs
+     * visited before the reset have been evicted; drawing them would re-bake
+     * into CPU memory after the single upload below, so they would be blank
+     * until a later frame.  Re-walk only on that rare reset path.  Normal text
+     * still takes exactly one pass and one (usually partial) atlas upload. */
+    for (int retry = 0; retry < 3; ++retry) {
+        unsigned generation = g_dyn_generation;
         const char* q = text;
         while (*q) {
             int cp = utf8_decode(&q);
             if (cp >= 128 || g_text_dynamic_ascii)
                 (void)dyn_bake_glyph(cp, css_px);
         }
+        if (generation == g_dyn_generation) break;
     }
     dyn_flush_atlas();
     luna_use_program(text_program);
@@ -12029,12 +12183,12 @@ static void bring_window_ptr_to_front(int idx) {
     int old_focus = g_focused_idx;
     if (old_focus != -1 && old_focus != win)
         remove_class(&elements[old_focus], "focused");
-    elements[win].z_index = ++g_top_z;
     g_focused_idx = win;
     add_class(&elements[win], "focused");
-    update_element_style(&elements[win]);
-    if (old_focus != -1 && old_focus != win)
-        update_element_style(&elements[old_focus]);
+    elements[win].z_override_valid = 1;
+    elements[win].z_override = ++g_top_z;
+    elements[win].z_index = elements[win].z_override;
+    g_render_order_dirty = 1;
 }
 
 static int hit_test_at(double xpos, double ypos) {
@@ -12092,7 +12246,7 @@ void recompute_hover(void* window, double xpos, double ypos) {
         int should_hover = g_hover_mark[i] == g_hover_epoch;
         if (should_hover != e->is_hovered) {
             e->is_hovered = should_hover;
-            update_element_style(e);
+            (void)restyle_element_checked(e);
             g_pointer_visual_revision++;
         }
         if (should_hover && e->cursor_type > best_cursor)
@@ -12236,7 +12390,7 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
         if (hit != -1) {
             LunaElement* e = &elements[hit];
             if (g_focused_element_idx != -1 && g_focused_element_idx != hit)
-                update_element_style(&elements[g_focused_element_idx]);
+                (void)restyle_element_checked(&elements[g_focused_element_idx]);
             /* A pointer target is necessarily already visible. Scrolling it
                into view here can move a scroll container between press and
                release, causing the release to activate a different row. */
@@ -12248,7 +12402,7 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
                 input_set_caret_from_x(e, (float)mx - bx - e->pad_l);
             }
             e->is_active = 1;
-            update_element_style(e);
+            (void)restyle_element_checked(e);
             if (e->is_draggable) {
                 g_drag_mode = e->drag_mode;
                 if (e->drag_mode == 2) {
@@ -12278,7 +12432,7 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
                     g_luna_last_click_button = LUNA_MOUSE_BUTTON_LEFT;
                     elements[i].on_click(&elements[i]);
                 }
-                update_element_style(&elements[i]);
+                (void)restyle_element_checked(&elements[i]);
             }
         }
 
@@ -12364,7 +12518,7 @@ static void focus_element_ex(int idx, int via_keyboard, int scroll_view) {
     int old = g_focused_element_idx;
     if (idx == g_focused_element_idx) {
         g_focus_via_keyboard = via_keyboard ? 1 : 0;
-        if (idx != -1) update_element_style(&elements[idx]);
+        if (idx != -1) (void)restyle_element_checked(&elements[idx]);
         platform_sync_text_input(idx);
         return;
     }
@@ -12793,11 +12947,7 @@ static GLuint create_shader_program(const char* vertex_src, const char* fragment
 
 static int load_gl_functions() {
 #define LOAD(T, name) name = (T)g_luna_platform.get_proc(#name)
-    LOAD(LunaPFNGLCREATEVERTEXARRAYSPROC, glCreateVertexArrays);
-    /* GL 4.5 DSA fallback: glGenVertexArrays has identical signature */
-    if (!glCreateVertexArrays)
-        glCreateVertexArrays = (LunaPFNGLCREATEVERTEXARRAYSPROC)
-            g_luna_platform.get_proc("glGenVertexArrays");
+    LOAD(LunaPFNGLGENVERTEXARRAYSPROC, glGenVertexArrays);
     LOAD(LunaPFNGLDELETEVERTEXARRAYSPROC, glDeleteVertexArrays);
     LOAD(LunaPFNGLGENBUFFERSPROC,         glGenBuffers);
     LOAD(LunaPFNGLBINDBUFFERPROC,         glBindBuffer);
@@ -12863,11 +13013,12 @@ static int load_gl_functions() {
         !glCreateProgram || !glAttachShader || !glLinkProgram ||
         !glGetProgramiv_ || !glGetProgramInfoLog_ || !glDeleteProgram_ || !glUseProgram ||
         !glGenBuffers || !glBindBuffer || !glBufferData ||
-        !glCreateVertexArrays || !glBindVertexArray ||
-        !luna_p_glClear || !luna_p_glViewport || !luna_p_glTexImage2D ||
-        !luna_p_glGenTextures || !luna_p_glDrawArrays ||
+        !glGenVertexArrays || !glBindVertexArray ||
+        !luna_p_glClear || !luna_p_glClearColor || !luna_p_glViewport ||
+        !luna_p_glEnable || !luna_p_glDisable || !luna_p_glScissor ||
+        !luna_p_glTexImage2D || !luna_p_glGenTextures || !luna_p_glDrawArrays ||
         !luna_p_glBlendFuncSeparate) {
-        fprintf(stderr, "[luna-ui] fatal: could not resolve core GL 1.x entry points "
+        fprintf(stderr, "[luna-ui] fatal: could not resolve required OpenGL 3.3 entry points "
                         "via get_proc(); the GL/EGL library stack is inconsistent\n");
         return 0;
     }
@@ -12910,7 +13061,7 @@ void luna_mark_visual_dirty(int i) {
     g_probe_prepared = 0;
     visual_activate_idx(i);
 }
-void luna_update_element_style(int i) { g_probe_prepared = 0; if (i >= 0 && i < elem_count) update_element_style(&elements[i]); }
+void luna_update_element_style(int i) { g_probe_prepared = 0; if (i >= 0 && i < elem_count) (void)restyle_element_checked(&elements[i]); }
 void luna_register_js_handler(const char* n, LunaEventHandler fn) { register_js_handler(n, fn); }
 void luna_set_on_click(int i, LunaEventHandler fn) { set_on_click(i, fn); }
 void luna_set_html_base_dir(const char* p) { set_html_base_dir(p); }
@@ -12918,11 +13069,13 @@ int luna_load_html_file(const char* p) { char* s = read_file(p); if (!s) return 
 int luna_load_css_file(const char* p) {
     char* s = read_file(p);
     if (!s) return 0;
+    int old_rules = rule_count, old_keyframes = g_keyframe_count;
     parse_css(s);
     free(s);
-    if (elem_count > 0) {
+    if (elem_count > 0 && (rule_count != old_rules || g_keyframe_count != old_keyframes)) {
         for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
         generate_pseudo_elements();
+        memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
         g_layout_dirty = 1; g_render_order_dirty = 1;
     }
     return 1;
@@ -12934,14 +13087,17 @@ void luna_reset_css(void) {
     memset(css_rules, 0, sizeof(css_rules));
     memset(g_keyframes, 0, sizeof(g_keyframes));
     g_rule_index_ready = 0;
+    g_has_structural_selectors = 0;
 }
 void luna_parse_html(const char* h) { g_probe_prepared = 0; parse_html(h); }
 void luna_parse_css(const char* c) {
     g_probe_prepared = 0;
+    int old_rules = rule_count, old_keyframes = g_keyframe_count;
     parse_css(c);
-    if (elem_count > 0) {
+    if (elem_count > 0 && (rule_count != old_rules || g_keyframe_count != old_keyframes)) {
         for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
         generate_pseudo_elements();
+        memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
         g_layout_dirty = 1; g_render_order_dirty = 1;
     }
 }
@@ -13013,7 +13169,11 @@ void luna_inject_body_background(void) {
         if (strcmp(elements[i].type, "body") != 0) continue;
         LunaElement* body = &elements[i];
         body->parent_idx = -1;
-        body->z_index = -9999;
+        /* Body is an engine-managed backdrop.  Keep its stacking role across
+         * later CSS restyles (themes call luna_parse_css() at runtime). */
+        body->z_override_valid = 1;
+        body->z_override = -9999;
+        body->z_index = body->z_override;
         body->pct_w = 1; body->raw_w = 1.0f; body->raw_w_off = 0.0f;
         body->pct_h = 1; body->raw_h = 1.0f; body->raw_h_off = 0.0f;
         body->x = body->y = body->rel_x = body->rel_y = 0.0f;
@@ -13026,10 +13186,17 @@ void luna_inject_body_background(void) {
     }
     LunaElement body_e;
     memset(&body_e, 0, sizeof(body_e));
+    body_e.tabindex = -2;
+    body_e.aria_expanded = -1;
     strncpy(body_e.type, "body", 31);
     body_e.id_idx = elem_count;
     body_e.parent_idx = -1;
-    body_e.z_index = -9999;
+    /* update_element_style() preserves runtime z overrides.  Without this, a
+     * later luna_parse_css() resets the appended body to z=0 and it paints over
+     * the application because it is last in DOM order. */
+    body_e.z_override_valid = 1;
+    body_e.z_override = -9999;
+    body_e.z_index = body_e.z_override;
     body_e.pct_w = 1; body_e.raw_w = 1.0f;
     body_e.pct_h = 1; body_e.raw_h = 1.0f;
     body_e.w = luna_window_width; body_e.h = luna_window_height;
@@ -13043,13 +13210,8 @@ void luna_inject_body_background(void) {
     /* update_element_style resets engine fields — restore backdrop role. */
     elements[elem_count].pct_w = 1; elements[elem_count].raw_w = 1.0f;
     elements[elem_count].pct_h = 1; elements[elem_count].raw_h = 1.0f;
-    elements[elem_count].z_index = -9999;
     elements[elem_count].pointer_events_none = 1;
     LunaElement* ne = &elements[elem_count];
-    /* update_element_style resets z_index to 0, which would paint the body
-       OVER earlier-parsed root elements (body is appended last). Keep it
-       behind everything. */
-    ne->z_index = -9999;
     ne->cur_r = ne->r; ne->cur_g = ne->g; ne->cur_b = ne->b; ne->cur_a = ne->a;
     elem_count++;
     g_render_order_dirty = 1;
@@ -13060,6 +13222,9 @@ static void luna_update_prepare(double now, double dt) {
     rebuild_activity_registries();
     tick_smooth_scroll(dt);
     if (g_layout_dirty) {
+        /* update_layout_pass() already resolves normal flow, flex/grid wrapping,
+         * auto-positioned containers and scroll metrics.  A second whole pass
+         * for display changes only repeated the same O(elements) work. */
         update_layout_pass();
         g_layout_dirty = 0;
         g_visual_scan_needed = 1;
@@ -13389,6 +13554,19 @@ void luna_render(int fbw, int fbh) {
      * viewport here instead of relying on backdrop-filter/FBO code to set it
      * as a side effect. */
     glViewport(0, 0, fbw, fbh);
+
+    /* A swapped back buffer has undefined contents.  The old standalone editor
+     * cleared it explicitly before every full DOM paint; the native-host path
+     * lost that step, so a frame could start from the compositor/driver's blank
+     * buffer and remain white.  Clear exactly once for a full document render.
+     * Region/subtree passes intentionally keep the existing pixels because they
+     * are used to restore dialogs above the custom editor surface.  Transparent
+     * black is correct for both transparent windows and normal opaque windows;
+     * the document background is painted immediately afterwards. */
+    if (g_render_root == -1 && g_render_res_x <= 0.0f && g_render_res_y <= 0.0f) {
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
     /* The backdrop-blur capture textures are allocated by the first element
      * that actually uses backdrop-filter — see apply_backdrop_blur().  Sizing
      * them here forced a full reallocation every time a differently sized layer
@@ -13872,6 +14050,10 @@ int luna_init(const LunaInitConfig* cfg) {
                         GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     init_rect_geometry();
     init_font();
+    if (!g_rect_vao || !g_rect_vbo || !text_vao || !text_vbo) {
+        fprintf(stderr, "[luna-ui] fatal: VAO/VBO initialization failed\n");
+        return 0;
+    }
     return 1;
 }
 void luna_shutdown(void) {
@@ -13942,7 +14124,7 @@ LunaContext* luna_context_create(void) {
     ctx->root_idx = -1;
     /* g_rect_vbo belongs to the GL share group.  VAOs are context-local, so
      * reproduce only the attribute binding in each native GL context. */
-    glCreateVertexArrays(1, &ctx->rect_vao);
+    glGenVertexArrays(1, &ctx->rect_vao);
     if (!ctx->rect_vao) {
         free(ctx);
         return NULL;
@@ -13951,7 +14133,7 @@ LunaContext* luna_context_create(void) {
     glBindBuffer(GL_ARRAY_BUFFER, g_rect_vbo);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
-    glCreateVertexArrays(1, &ctx->text_vao);
+    glGenVertexArrays(1, &ctx->text_vao);
     if (!ctx->text_vao) {
         glDeleteVertexArrays(1, &ctx->rect_vao);
         free(ctx);
@@ -14026,7 +14208,7 @@ void luna_context_scroll(LunaContext* ctx, double xoffset, double yoffset) {
 /* Do not leak the core GL dispatch aliases into the selected native host or
  * into application code following this include. Native hosts use their API
  * headers directly for context/bootstrap calls. */
-#undef glCreateVertexArrays
+#undef glGenVertexArrays
 #undef glDeleteVertexArrays
 #undef glGenBuffers
 #undef glBindBuffer

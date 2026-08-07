@@ -55,6 +55,7 @@ typedef struct LunaLinuxState {
     int framebuffer_width;
     int framebuffer_height;
     int glfw_initialized;
+    int redraw;
     int window_drag_mode;
     int window_resize_edges;
     double drag_anchor_x, drag_anchor_y;
@@ -127,7 +128,11 @@ static void luna_linux_close_impl(void) {
 }
 
 static void luna_linux_redraw_impl(void) {
-    /* luna_app_run currently paints continuously, so no wake-up is required. */
+    int was_redraw = luna_linux_state.redraw;
+    luna_linux_state.redraw = 1;
+    /* Wake an event-driven host when redraw is requested outside a GLFW
+     * callback.  Avoid posting duplicate empty events while already dirty. */
+    if (!was_redraw && luna_linux_state.glfw_initialized) glfwPostEmptyEvent();
 }
 
 static void luna_linux_iconify_impl(void) {
@@ -247,7 +252,7 @@ static void luna_linux_cursor_position_callback(GLFWwindow* window,
             if (edge & LUNA_RESIZE_EDGE_BOTTOM) luna_linux_state.drag_last_y = y;
         }
     }
-    luna_mouse_move(x, y);
+    if (luna_mouse_move_changed(x, y)) luna_linux_state.redraw = 1;
 }
 
 static void luna_linux_mouse_button_callback(GLFWwindow* window,
@@ -256,6 +261,7 @@ static void luna_linux_mouse_button_callback(GLFWwindow* window,
     double y = 0.0;
     glfwGetCursorPos(window, &x, &y);
     luna_mouse_button(button, action, mods, x, y);
+    luna_linux_state.redraw = 1;
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE) {
         luna_linux_state.window_drag_mode = 0;
         luna_linux_state.window_resize_edges = LUNA_RESIZE_EDGE_NONE;
@@ -266,17 +272,20 @@ static void luna_linux_scroll_callback(GLFWwindow* window,
                                        double xoffset, double yoffset) {
     (void)window;
     luna_scroll(xoffset, yoffset);
+    luna_linux_state.redraw = 1;
 }
 
 static void luna_linux_key_callback(GLFWwindow* window, int key, int scancode,
                                     int action, int mods) {
     (void)window;
     luna_key(key, scancode, action, mods);
+    luna_linux_state.redraw = 1;
 }
 
 static void luna_linux_char_callback(GLFWwindow* window, unsigned int codepoint) {
     (void)window;
     luna_char(codepoint);
+    luna_linux_state.redraw = 1;
 }
 
 static void luna_linux_window_size_callback(GLFWwindow* window,
@@ -286,6 +295,7 @@ static void luna_linux_window_size_callback(GLFWwindow* window,
     luna_linux_state.window_height = height;
     if (width > 0 && height > 0)
         luna_resize((float)width, (float)height);
+    luna_linux_state.redraw = 1;
 }
 
 static void luna_linux_framebuffer_size_callback(GLFWwindow* window,
@@ -294,6 +304,7 @@ static void luna_linux_framebuffer_size_callback(GLFWwindow* window,
     luna_linux_state.framebuffer_width = width;
     luna_linux_state.framebuffer_height = height;
     luna_framebuffer_resized();
+    luna_linux_state.redraw = 1;
 }
 
 #if GLFW_VERSION_MAJOR > 3 || \
@@ -308,6 +319,11 @@ static void luna_linux_content_scale_callback(GLFWwindow* window,
 }
 #endif
 
+static void luna_linux_window_refresh_callback(GLFWwindow* window) {
+    (void)window;
+    luna_linux_state.redraw = 1;
+}
+
 static void luna_linux_install_callbacks(GLFWwindow* window) {
     glfwSetCursorPosCallback(window, luna_linux_cursor_position_callback);
     glfwSetMouseButtonCallback(window, luna_linux_mouse_button_callback);
@@ -316,6 +332,7 @@ static void luna_linux_install_callbacks(GLFWwindow* window) {
     glfwSetCharCallback(window, luna_linux_char_callback);
     glfwSetWindowSizeCallback(window, luna_linux_window_size_callback);
     glfwSetFramebufferSizeCallback(window, luna_linux_framebuffer_size_callback);
+    glfwSetWindowRefreshCallback(window, luna_linux_window_refresh_callback);
 #if GLFW_VERSION_MAJOR > 3 || \
     (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 3)
     glfwSetWindowContentScaleCallback(window, luna_linux_content_scale_callback);
@@ -362,6 +379,26 @@ void luna_app_quit(void) {
 
 void luna_app_request_redraw(void) {
     luna_linux_redraw_impl();
+}
+
+/* Paint and present one complete framebuffer.  Keep this in one place so
+ * startup and the event loop cannot drift into subtly different render paths. */
+static int luna_linux_present_frame(void) {
+    GLFWwindow* window = luna_linux_state.window;
+    int framebuffer_width, framebuffer_height;
+    if (!window) return 0;
+
+    glfwGetFramebufferSize(window, &framebuffer_width, &framebuffer_height);
+    luna_linux_state.framebuffer_width = framebuffer_width;
+    luna_linux_state.framebuffer_height = framebuffer_height;
+    if (framebuffer_width <= 0 || framebuffer_height <= 0) return 0;
+
+    luna_render(framebuffer_width, framebuffer_height);
+    if (luna_linux_state.config.on_render)
+        luna_linux_state.config.on_render(framebuffer_width, framebuffer_height,
+                                          luna_linux_state.config.userdata);
+    glfwSwapBuffers(window);
+    return 1;
 }
 
 int luna_app_run(const LunaAppConfig* user_config) {
@@ -467,33 +504,71 @@ int luna_app_run(const LunaAppConfig* user_config) {
     if (config.on_init) config.on_init(config.userdata);
     luna_wire_onclick_handlers();
 
-    glfwShowWindow(window);
+    /* Prime the renderer once while hidden.  This builds layout, shaders and
+     * glyph state without exposing an unfinished framebuffer. */
     previous = glfwGetTime();
+    luna_update(previous, 0.0);
+    luna_linux_state.redraw = 0;
+    (void)luna_linux_present_frame();
+
+    /* Some X11/Wayland compositors replace or reconfigure the drawable when a
+     * hidden GLFW window is mapped.  The known-good editor repainted after
+     * glfwShowWindow(); retain that correctness property, but only once. */
+    glfwShowWindow(window);
+    glfwPollEvents();
+
+    double mapped_now = glfwGetTime();
+    double mapped_dt = mapped_now - previous;
+    if (mapped_dt <= 0.0 || mapped_dt > 0.25) mapped_dt = 1.0 / 60.0;
+    previous = mapped_now;
+    int settling = luna_update_settling(mapped_now, mapped_dt);
+    luna_linux_state.redraw = 0;
+    (void)luna_linux_present_frame();
+
+    /* One final mapped follow-up fills the other back buffer / absorbs a late
+     * map-time resize. This replaces the old editor's several startup frames. */
+    int startup_frames = 1;
 
     while (!glfwWindowShouldClose(window)) {
         double now;
         double dt;
-        int framebuffer_width;
-        int framebuffer_height;
+        int continuous = config.on_frame != NULL && config.frame_interval <= 0.0;
+        int periodic = config.on_frame != NULL && config.frame_interval > 0.0;
+        int css_animating = luna_css_anim_running_under(-1);
 
-        glfwPollEvents();
+        /* Static applications block indefinitely. Continuous applications poll
+         * every frame. Periodic applications (for example an editor caret) sleep
+         * between idle ticks but still wake immediately for native events. */
+        if (!continuous && !luna_linux_state.redraw && !settling && !css_animating &&
+            startup_frames <= 0) {
+            if (periodic) glfwWaitEventsTimeout(config.frame_interval);
+            else glfwWaitEvents();
+        } else {
+            glfwPollEvents();
+        }
+
         now = glfwGetTime();
         dt = now - previous;
         previous = now;
         if (dt < 0.0 || dt > 0.25) dt = 1.0 / 60.0;
 
+        int requested = luna_linux_state.redraw;
+        luna_linux_state.redraw = 0;
         if (config.on_frame) config.on_frame(dt, config.userdata);
-        luna_update(now, dt);
+        settling = luna_update_settling(now, dt);
+        css_animating = luna_css_anim_running_under(-1);
 
-        glfwGetFramebufferSize(window, &framebuffer_width, &framebuffer_height);
-        luna_linux_state.framebuffer_width = framebuffer_width;
-        luna_linux_state.framebuffer_height = framebuffer_height;
-        if (framebuffer_width > 0 && framebuffer_height > 0) {
-            luna_render(framebuffer_width, framebuffer_height);
-            glfwSwapBuffers(window);
+        if (continuous || requested || luna_linux_state.redraw || settling || css_animating ||
+            startup_frames > 0) {
+            /* Consume redraw requests that caused this paint before rendering.
+             * A new request raised from luna_render()/on_render then survives
+             * for the next iteration instead of being cleared after the swap. */
+            luna_linux_state.redraw = 0;
+            (void)luna_linux_present_frame();
+            if (startup_frames > 0) startup_frames--;
         }
 
-        if (!config.vsync) luna_linux_sleep_millis(1);
+        if (continuous && !config.vsync) luna_linux_sleep_millis(1);
     }
 
     result = 0;

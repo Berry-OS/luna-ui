@@ -347,6 +347,9 @@ static void luna_mac_frame(NSTimer* timer) {
         backing = [luna_mac.view convertRectToBacking:luna_mac.view.bounds];
         if (backing.size.width > 0 && backing.size.height > 0) {
             luna_render((int)backing.size.width, (int)backing.size.height);
+            if (luna_mac.config.on_render)
+                luna_mac.config.on_render((int)backing.size.width, (int)backing.size.height,
+                                          luna_mac.config.userdata);
             [[luna_mac.view openGLContext] flushBuffer];
         }
     }

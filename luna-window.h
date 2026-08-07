@@ -7,12 +7,40 @@
  *   #include "luna-window.h"
  *
  * To compile the reusable desktop file dialog implementation in the same TU:
+ *   #define LUNA_UI_IMPLEMENTATION
+ *   #define LUNA_WINDOW_IMPLEMENTATION
  *   #define LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION
+ *   #include "luna-window.h"
+ *
+ * luna-window.h will raise LUNA_UI_MAX_ELEMENTS to 2048 for this case.
  *
  * Copyright © 2026 Yuichiro Nakada / Project Luna (Vespera) — MPL 2.0
  */
 #ifndef LUNA_WINDOW_H
 #define LUNA_WINDOW_H
+
+/*
+ * The built-in Luna file dialog preallocates 384 item slots (four UI
+ * elements per slot) plus its chrome, menus and modals.  The default Luna UI
+ * capacity is therefore not large enough when the full dialog implementation
+ * is compiled into this translation unit.
+ *
+ * Keep the larger capacity local to users of the file dialog rather than
+ * increasing Luna UI's global default for every application.
+ */
+#if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION)
+#  if defined(LUNA_UI_H)
+#    if LUNA_UI_MAX_ELEMENTS < 2048
+#      error "Luna file dialog requires LUNA_UI_MAX_ELEMENTS >= 2048; include luna-window.h before luna-ui.h or increase LUNA_UI_MAX_ELEMENTS"
+#    endif
+#  else
+#    ifndef LUNA_UI_MAX_ELEMENTS
+#      define LUNA_UI_MAX_ELEMENTS 2048
+#    elif LUNA_UI_MAX_ELEMENTS < 2048
+#      error "Luna file dialog requires LUNA_UI_MAX_ELEMENTS >= 2048"
+#    endif
+#  endif
+#endif
 
 #ifndef LUNA_UI_H
 #include "luna-ui.h"
@@ -149,7 +177,7 @@ typedef enum LunaFileDialogMode {
 } LunaFileDialogMode;
 
 typedef enum LunaFileDialogBackend {
-    /* AUTO prefers the Luna standard dialog, then tries desktop helpers. */
+    /* AUTO means the Luna standard dialog. Desktop helpers are explicit opt-ins. */
     LUNA_FILE_DIALOG_BACKEND_AUTO = 0,
     LUNA_FILE_DIALOG_BACKEND_LUNA,
     LUNA_FILE_DIALOG_BACKEND_ZENITY,
@@ -167,8 +195,8 @@ typedef struct LunaFileDialogConfig {
     /* Optional desktop-helper filter, e.g. "Images" and "*.png *.jpg". */
     const char* filter_name;
     const char* filter_patterns;
-    /* Optional path to luna-fm. AUTO also checks LUNA_FILE_DIALOG_COMMAND,
-       PATH and a luna-fm executable beside the running application. */
+    /* Deprecated compatibility field. The built-in Luna backend no longer
+       launches luna-fm, so this value is ignored. */
     const char* luna_fm_path;
     int width;
     int height;
@@ -187,10 +215,10 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config,
                          LunaFileDialogResult* result);
 
 /* Opens a separate dialog process, so it is safe to call from an already
- * running Luna UI application. AUTO uses luna-fm first; set either
- * config.backend or LUNA_FILE_DIALOG_BACKEND=zenity|kdialog|yad|luna to
- * switch implementations at runtime. Returns 0 for Accept or Cancel and a
- * negative value only when no requested backend could be launched. */
+ * running Luna UI application. AUTO/LUNA use the file-dialog implementation
+ * compiled into the current executable; no luna-fm executable is required.
+ * zenity/kdialog/yad are explicit opt-ins. Returns 0 for Accept or Cancel and
+ * a negative value only when the requested backend could not be launched. */
 int luna_file_dialog_show(const LunaFileDialogConfig* config,
                           LunaFileDialogResult* result);
 LunaFileDialogBackend luna_file_dialog_backend_from_string(const char* name);
@@ -679,7 +707,7 @@ void luna_window_toast(LunaWindowDialogKind kind,const char*title,const char*mes
 int luna_window_notify(const char*app_name,LunaWindowDialogKind kind,const char*title,const char*message,double fallback_seconds){if(luna_platform_system_notify(app_name,luna_window_notify_kind(kind),title,message))return 1;luna_window_toast(kind,title,message,fallback_seconds);return 0;}
 
 /* ------------------------------------------------------------------------- */
-/* External standard file-dialog launcher                                    */
+/* Standard file-dialog launcher                                             */
 /* ------------------------------------------------------------------------- */
 
 #if defined(_WIN32)
@@ -780,60 +808,102 @@ static void luna_window_join_initial(char* out,size_t cap,
     } else snprintf(out,cap,"%s",initial);
 }
 
-static int luna_window_find_luna_fm(const LunaFileDialogConfig* c,
-                                    char* out,size_t cap) {
-    const char* explicit_path=(c&&c->luna_fm_path&&*c->luna_fm_path)?
-        c->luna_fm_path:getenv("LUNA_FILE_DIALOG_COMMAND");
-    if (explicit_path && *explicit_path && luna_window_command_exists(explicit_path)) {
-        snprintf(out,cap,"%s",explicit_path); return 1;
-    }
-    if (luna_window_command_exists("luna-fm")) {
-        snprintf(out,cap,"luna-fm"); return 1;
-    }
-#if defined(__linux__)
-    char exe[LUNA_WINDOW_PATH_MAX];
-    ssize_t n=readlink("/proc/self/exe",exe,sizeof(exe)-1);
-    if (n>0) {
-        exe[n]=0;
-        char* slash=strrchr(exe,'/');
-        if (slash) {
-            slash[1]=0;
-            if (strlen(exe)+strlen("luna-fm")+1<cap) {
-                snprintf(out,cap,"%sluna-fm",exe);
-                if (access(out,X_OK)==0) return 1;
-            }
-        }
-    }
-#endif
-    out[0]=0; return 0;
-}
-
 static LunaFileDialogBackend luna_window_choose_file_backend(
-    const LunaFileDialogConfig* c,char* luna_path,size_t luna_path_cap) {
+    const LunaFileDialogConfig* c) {
     LunaFileDialogBackend backend=c?c->backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
     if (backend==LUNA_FILE_DIALOG_BACKEND_AUTO) {
         const char* env=getenv("LUNA_FILE_DIALOG_BACKEND");
         if (env && *env) backend=luna_file_dialog_backend_from_string(env);
     }
-    if (backend==LUNA_FILE_DIALOG_BACKEND_LUNA)
-        return luna_window_find_luna_fm(c,luna_path,luna_path_cap)?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
+    if (backend==LUNA_FILE_DIALOG_BACKEND_AUTO ||
+        backend==LUNA_FILE_DIALOG_BACKEND_LUNA) {
+#if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION) && defined(__linux__)
+        return LUNA_FILE_DIALOG_BACKEND_LUNA;
+#else
+        return LUNA_FILE_DIALOG_BACKEND_AUTO;
+#endif
+    }
     if (backend==LUNA_FILE_DIALOG_BACKEND_ZENITY)
         return luna_window_command_exists("zenity")?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
     if (backend==LUNA_FILE_DIALOG_BACKEND_KDIALOG)
         return luna_window_command_exists("kdialog")?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
     if (backend==LUNA_FILE_DIALOG_BACKEND_YAD)
         return luna_window_command_exists("yad")?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
-    if (luna_window_find_luna_fm(c,luna_path,luna_path_cap))
-        return LUNA_FILE_DIALOG_BACKEND_LUNA;
-    if (luna_window_command_exists("zenity")) return LUNA_FILE_DIALOG_BACKEND_ZENITY;
-    if (luna_window_command_exists("kdialog")) return LUNA_FILE_DIALOG_BACKEND_KDIALOG;
-    if (luna_window_command_exists("yad")) return LUNA_FILE_DIALOG_BACKEND_YAD;
     return LUNA_FILE_DIALOG_BACKEND_AUTO;
 }
 
+#if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION) && defined(__linux__)
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <errno.h>
+
+static void luna_window_internal_env(const char* name,const char* value) {
+    if (value && *value) setenv(name,value,1);
+    else unsetenv(name);
+}
+
+static void luna_window_internal_env_int(const char* name,int value) {
+    char buf[32];
+    snprintf(buf,sizeof(buf),"%d",value);
+    setenv(name,buf,1);
+}
+
+static int luna_window_show_internal_luna(const LunaFileDialogConfig* c,
+                                          LunaFileDialogResult* result) {
+    int fd[2];
+    if (pipe(fd)!=0) return -2;
+    pid_t pid=fork();
+    if (pid<0) { close(fd[0]); close(fd[1]); return -2; }
+    if (pid==0) {
+        close(fd[0]);
+        if (dup2(fd[1],STDOUT_FILENO)<0) _exit(126);
+        close(fd[1]);
+        luna_window_internal_env("LUNA_WINDOW_INTERNAL_FILE_DIALOG_CHILD","1");
+        luna_window_internal_env_int("LUNA_WINDOW_FD_MODE",c?c->mode:LUNA_FILE_DIALOG_OPEN_FILE);
+        luna_window_internal_env("LUNA_WINDOW_FD_TITLE",c?c->title:NULL);
+        luna_window_internal_env("LUNA_WINDOW_FD_INITIAL",c?c->initial_path:NULL);
+        luna_window_internal_env("LUNA_WINDOW_FD_NAME",c?c->suggested_name:NULL);
+        luna_window_internal_env("LUNA_WINDOW_FD_ACCEPT",c?c->accept_label:NULL);
+        luna_window_internal_env("LUNA_WINDOW_FD_FILTER_NAME",c?c->filter_name:NULL);
+        luna_window_internal_env("LUNA_WINDOW_FD_FILTER",c?c->filter_patterns:NULL);
+        luna_window_internal_env_int("LUNA_WINDOW_FD_WIDTH",c?c->width:0);
+        luna_window_internal_env_int("LUNA_WINDOW_FD_HEIGHT",c?c->height:0);
+        luna_window_internal_env_int("LUNA_WINDOW_FD_CLIENT_CHROME",c?c->client_chrome:0);
+        char exe[LUNA_WINDOW_PATH_MAX];
+        ssize_t n=readlink("/proc/self/exe",exe,sizeof(exe)-1);
+        if (n<=0 || (size_t)n>=sizeof(exe)-1) _exit(127);
+        exe[n]=0;
+        execl(exe,exe,(char*)NULL);
+        _exit(127);
+    }
+    close(fd[1]);
+    FILE* pipe=fdopen(fd[0],"r");
+    if (!pipe) { close(fd[0]); while(waitpid(pid,NULL,0)<0&&errno==EINTR){} return -2; }
+    char line[LUNA_WINDOW_PATH_MAX];
+    int count=0;
+    while (fgets(line,sizeof(line),pipe)) {
+        size_t n=strlen(line);
+        while(n && (line[n-1]=='\n'||line[n-1]=='\r')) line[--n]=0;
+        if (!line[0]) continue;
+        if (result && count<LUNA_FILE_DIALOG_MAX_RESULTS)
+            snprintf(result->paths[count],sizeof(result->paths[count]),"%s",line);
+        count++;
+        if (!c || c->mode!=LUNA_FILE_DIALOG_OPEN_FILES) break;
+    }
+    fclose(pipe);
+    int status=0;
+    while(waitpid(pid,&status,0)<0&&errno==EINTR){}
+    if (!WIFEXITED(status) || WEXITSTATUS(status)!=0) return -2;
+    if (result && count>0) {
+        result->accepted=1;
+        result->count=count>LUNA_FILE_DIALOG_MAX_RESULTS?LUNA_FILE_DIALOG_MAX_RESULTS:count;
+    }
+    return 0;
+}
+#endif
+
 static int luna_window_build_file_command(char* cmd,size_t cap,
-    const LunaFileDialogConfig* c,LunaFileDialogBackend backend,
-    const char* luna_path) {
+    const LunaFileDialogConfig* c,LunaFileDialogBackend backend) {
     size_t len=0; cmd[0]=0;
     const char* title=(c&&c->title&&*c->title)?c->title:"ファイルを選択";
     const char* patterns=(c&&c->filter_patterns&&*c->filter_patterns)?c->filter_patterns:"*";
@@ -841,30 +911,7 @@ static int luna_window_build_file_command(char* cmd,size_t cap,
     char initial[LUNA_WINDOW_PATH_MAX];
     luna_window_join_initial(initial,sizeof(initial),c);
 
-    if (backend==LUNA_FILE_DIALOG_BACKEND_LUNA) {
-        if (!luna_window_cmd_quote(cmd,cap,&len,luna_path)) return 0;
-        switch (c?c->mode:LUNA_FILE_DIALOG_OPEN_FILE) {
-            case LUNA_FILE_DIALOG_OPEN_FILES: if(!luna_window_cmd_raw(cmd,cap,&len," --open-multiple"))return 0; break;
-            case LUNA_FILE_DIALOG_SELECT_FOLDER: if(!luna_window_cmd_raw(cmd,cap,&len," --folder"))return 0; break;
-            case LUNA_FILE_DIALOG_SAVE_FILE: if(!luna_window_cmd_raw(cmd,cap,&len," --save"))return 0; break;
-            default: if(!luna_window_cmd_raw(cmd,cap,&len," --open"))return 0; break;
-        }
-        if (c && c->client_chrome && !luna_window_cmd_raw(cmd,cap,&len," --client-chrome")) return 0;
-        if (c && c->suggested_name && *c->suggested_name) {
-            if(!luna_window_cmd_raw(cmd,cap,&len," --name") ||
-               !luna_window_cmd_arg(cmd,cap,&len,c->suggested_name)) return 0;
-        }
-        if (c && c->filter_name && *c->filter_name) {
-            if(!luna_window_cmd_raw(cmd,cap,&len," --filter-name") ||
-               !luna_window_cmd_arg(cmd,cap,&len,c->filter_name)) return 0;
-        }
-        if (c && c->filter_patterns && *c->filter_patterns) {
-            if(!luna_window_cmd_raw(cmd,cap,&len," --filter") ||
-               !luna_window_cmd_arg(cmd,cap,&len,c->filter_patterns)) return 0;
-        }
-        if (!luna_window_cmd_arg(cmd,cap,&len,
-                (c&&c->initial_path&&*c->initial_path)?c->initial_path:".")) return 0;
-    } else if (backend==LUNA_FILE_DIALOG_BACKEND_ZENITY ||
+    if (backend==LUNA_FILE_DIALOG_BACKEND_ZENITY ||
                backend==LUNA_FILE_DIALOG_BACKEND_YAD) {
         if (!luna_window_cmd_raw(cmd,cap,&len,
                 backend==LUNA_FILE_DIALOG_BACKEND_ZENITY?"zenity --file-selection":"yad --file-selection")) return 0;
@@ -910,11 +957,14 @@ int luna_file_dialog_show(const LunaFileDialogConfig* config,
     if (config) c=*config;
     if (c.mode==LUNA_FILE_DIALOG_MANAGER) c.mode=LUNA_FILE_DIALOG_OPEN_FILE;
     if (result) memset(result,0,sizeof(*result));
-    char luna_path[LUNA_WINDOW_PATH_MAX];
-    LunaFileDialogBackend backend=luna_window_choose_file_backend(&c,luna_path,sizeof(luna_path));
+    LunaFileDialogBackend backend=luna_window_choose_file_backend(&c);
     if (backend==LUNA_FILE_DIALOG_BACKEND_AUTO) return -1;
+#if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION) && defined(__linux__)
+    if (backend==LUNA_FILE_DIALOG_BACKEND_LUNA)
+        return luna_window_show_internal_luna(&c,result);
+#endif
     char command[LUNA_WINDOW_PATH_MAX*3];
-    if (!luna_window_build_file_command(command,sizeof(command),&c,backend,luna_path)) return -2;
+    if (!luna_window_build_file_command(command,sizeof(command),&c,backend)) return -2;
     FILE* pipe=LUNA_WINDOW_POPEN(command,"r");
     if (!pipe) return -2;
     char line[LUNA_WINDOW_PATH_MAX];
@@ -995,7 +1045,7 @@ int luna_file_dialog_show(const LunaFileDialogConfig* config,
 #define MIN_WINDOW_H     400
 #define DEFAULT_WINDOW_W 700
 #define DEFAULT_WINDOW_H 460
-#define MODAL_INFO_PARTS 64
+#define MODAL_INFO_PARTS 28
 
 typedef enum {
     SORT_NAME = 0,
@@ -1059,7 +1109,6 @@ typedef struct {
     int pending_window_width;
     int pending_window_height;
     int resize_redraw_frames;
-    int overlay_redraw_frames;
 
     /* Saved only when the file grid actually scrolls.  Every other path only
        reads these values when laying out or drawing the grid. */
@@ -1086,6 +1135,7 @@ typedef struct {
     int modal_kind; /* 0 none, 1 new folder, 2 rename, 3 properties, 4 XDG app, 5 terminal, 6 font, 7 permanent delete */
     int modal_return_settings;
     int modal_target;
+    int properties_layout_warmed;
     double toast_until;
 
     int id_app;
@@ -1159,6 +1209,7 @@ static double g_window_drag_last_x, g_window_drag_last_y;
 static void file_dialog_accept(void);
 
 static void request_redraw(void) { g.redraw = 1; }
+static void platform_redraw(void) { request_redraw(); }
 static void refresh_sidebar_visibility(void);
 static void save_settings(void);
 static void show_toast(const char *fmt, ...);
@@ -1228,16 +1279,17 @@ static const char *UI_CSS =
 ".menu-sep { height:1px; min-height:1px; max-height:1px; flex:0 0 1px; margin:3px 4px; background:rgba(71,85,105,.13); }\n"
 ".modal-wrap { position:fixed; left:0; top:0; width:100%; height:100%; display:flex; align-items:center; justify-content:center; padding:14px; background:rgba(15,23,42,.24); z-index:100; }\n"
 ".modal-wrap.hidden { display:none; }\n"
+".modal-wrap.overlay-idle { visibility:hidden; }\n"
 ".modal { width:90%; max-width:520px; max-height:88%; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px; border:1px solid rgba(255,255,255,.65); border-radius:14px; background:rgba(248,250,253,.97); box-shadow:0 22px 60px rgba(15,23,42,.30); }\n"
 ".modal-title { font-size:15px; font-weight:700; color:#263548; }\n"
 ".modal-info { color:#617085; line-height:1.45; white-space:pre-line; overflow-wrap:anywhere; }\n"
 ".modal-info.hidden { display:none; }\n"
 ".modal-info-stack { width:100%; min-height:1px; display:flex; flex-direction:column; gap:0; }\n"
-".modal-wrap.properties-dialog .modal { width:94%; max-width:720px; height:82%; max-height:680px; padding:0; gap:0; overflow:hidden; }\n"
-".modal-wrap.properties-dialog .modal-title { flex:0 0 auto; padding:16px 18px 13px; border-bottom:1px solid rgba(71,85,105,.12); background:rgba(248,250,253,.98); font-size:16px; }\n"
-".modal-wrap.properties-dialog .modal-info-stack { flex:1 1 auto; min-height:140px; overflow-y:auto; padding:16px 20px 20px; background:rgba(255,255,255,.72); scrollbar-width:thin; }\n"
-".modal-wrap.properties-dialog .modal-info { width:100%; min-height:1px; display:block; flex:0 0 auto; color:#455468; font-size:12px; line-height:1.72; white-space:pre-wrap; overflow-wrap:anywhere; }\n"
-".modal-wrap.properties-dialog .modal-actions { flex:0 0 auto; padding:11px 14px; border-top:1px solid rgba(71,85,105,.12); background:rgba(248,250,253,.98); }\n"
+".modal-wrap.properties-dialog .modal { width:94%; max-width:720px; max-height:82%; padding:0; gap:0; overflow-y:auto; scrollbar-width:thin; }\n"
+".modal-wrap.properties-dialog .modal-title { padding:16px 18px 13px; border-bottom:1px solid rgba(71,85,105,.12); background:rgba(248,250,253,.98); font-size:16px; }\n"
+".modal-wrap.properties-dialog .modal-info-stack { min-height:0; display:block; overflow:visible; padding:16px 20px 20px; background:rgba(255,255,255,.72); }\n"
+".modal-wrap.properties-dialog .modal-info { width:100%; min-height:0; display:block; color:#455468; font-size:12px; line-height:1.72; white-space:pre-wrap; overflow-wrap:anywhere; }\n"
+".modal-wrap.properties-dialog .modal-actions { padding:11px 14px; border-top:1px solid rgba(71,85,105,.12); background:rgba(248,250,253,.98); }\n"
 ".open-with-modal { width:92%; max-width:470px; max-height:88%; }\n"
 ".open-app-list { min-height:0; max-height:380px; display:flex; flex-direction:column; gap:4px; overflow-y:auto; padding:2px; scrollbar-width:thin; }\n"
 ".app-choice { min-height:43px; flex:0 0 auto; display:flex; align-items:center; padding:7px 10px; border:1px solid rgba(100,116,139,.13); border-radius:9px; background:rgba(255,255,255,.72); color:#334155; cursor:pointer; line-height:1.35; white-space:pre-line; overflow-wrap:anywhere; }\n"
@@ -1432,7 +1484,11 @@ static const char *home_dir(void) {
 
 static void safe_copy(char *dst, size_t cap, const char *src) {
     if (!dst || cap == 0) return;
-    snprintf(dst, cap, "%s", src ? src : "");
+    if (!src) { dst[0] = 0; return; }
+    size_t n = strlen(src);
+    if (n >= cap) n = cap - 1;
+    if (n) memmove(dst, src, n);
+    dst[n] = 0;
 }
 
 static float clamp_grid_scroll(float value, float content, float viewport) {
@@ -1477,7 +1533,6 @@ static void reset_grid_scroll(void) {
 
 static void request_overlay_layout(void) {
     luna_mark_layout_dirty();
-    if (g.overlay_redraw_frames < 3) g.overlay_redraw_frames = 3;
     request_redraw();
 }
 
@@ -1503,20 +1558,22 @@ static void set_modal_info_text(const char *text) {
         if (id < 0) continue;
         if (*p) {
             /* Keep each text node below Luna UI's compact text-buffer range.
-               Large property strings are distributed over multiple blocks. */
-            char chunk[225];
+               Empty blocks have zero auto-height, so all chunks can stay in
+               flow.  Avoiding hidden-class churn removes dozens of subtree
+               restyles from the first Properties open. */
+            /* 511 payload bytes fit LunaElement::text exactly.  With the
+               line-boundary heuristic, 28 nodes still cover the full 12 KiB
+               Properties buffer while reducing DOM/layout work. */
+            char chunk[512];
             size_t n = modal_text_chunk_size(p, sizeof(chunk) - 1);
             memcpy(chunk, p, n);
             chunk[n] = 0;
-            luna_remove_class(id, "hidden");
             luna_set_text(id, chunk);
             p += n;
         } else {
             luna_set_text(id, "");
-            luna_add_class(id, "hidden");
         }
     }
-    request_overlay_layout();
 }
 
 static int path_join(char *out, size_t cap, const char *a, const char *b) {
@@ -1852,7 +1909,29 @@ static int unique_destination(const char *dir, const char *name, char *out, size
     if (dot && dot != stem) { safe_copy(ext,sizeof(ext),dot); *dot=0; }
     for (int i=2;i<10000;i++) {
         char candidate[NAME_MAX+1];
-        snprintf(candidate,sizeof(candidate),"%s（コピー %d）%s",stem,i,ext);
+        char suffix[32];
+        int suffix_n = snprintf(suffix,sizeof(suffix),"（コピー %d）",i);
+        if (suffix_n < 0 || (size_t)suffix_n >= sizeof(suffix)) return 0;
+
+        size_t suffix_len = (size_t)suffix_n;
+        size_t ext_len = strlen(ext);
+        if (suffix_len + ext_len >= sizeof(candidate)) return 0;
+
+        size_t stem_len = strlen(stem);
+        size_t max_stem = sizeof(candidate) - 1 - suffix_len - ext_len;
+        if (stem_len > max_stem) {
+            stem_len = max_stem;
+            /* Do not cut a UTF-8 sequence in the middle. */
+            while (stem_len && (((unsigned char)stem[stem_len] & 0xc0u) == 0x80u))
+                stem_len--;
+        }
+
+        char *q = candidate;
+        if (stem_len) { memcpy(q,stem,stem_len); q += stem_len; }
+        memcpy(q,suffix,suffix_len); q += suffix_len;
+        if (ext_len) { memcpy(q,ext,ext_len); q += ext_len; }
+        *q = 0;
+
         if (!path_join(out,cap,dir,candidate)) return 0;
         if (access(out,F_OK)!=0) return 1;
     }
@@ -1882,7 +1961,15 @@ static int move_to_trash(const char *path) {
         if (!copy_tree(path,dst) || !remove_tree(path)) return 0;
     }
     char infopath[PATH_MAX];
-    snprintf(infopath,sizeof(infopath),"%s/%s.trashinfo",info,base_name(dst));
+    char info_name[NAME_MAX + sizeof(".trashinfo")];
+    const char *dst_name = base_name(dst);
+    size_t dst_name_len = strlen(dst_name);
+    static const char trashinfo_suffix[] = ".trashinfo";
+    size_t trashinfo_suffix_len = sizeof(trashinfo_suffix) - 1;
+    if (dst_name_len + trashinfo_suffix_len >= sizeof(info_name)) return 1;
+    memcpy(info_name,dst_name,dst_name_len);
+    memcpy(info_name+dst_name_len,trashinfo_suffix,trashinfo_suffix_len+1);
+    if (!path_join(infopath,sizeof(infopath),info,info_name)) return 1;
     FILE *fp=fopen(infopath,"w");
     if (fp) {
         char escaped[PATH_MAX*3]; url_escape_path(path,escaped,sizeof(escaped));
@@ -2970,11 +3057,12 @@ static void open_modal(int kind, int target) {
         query_xdg_default_app(mime,current,sizeof(current));
     }
     g.modal_kind=kind;g.modal_target=target;
-    luna_remove_class(g.id_modal,"properties-dialog");
-    luna_remove_class(g.id_modal_cancel,"hidden");
+    /* Keep the overlay paint-hidden until its final contents and geometry are
+       ready.  Do not toggle controls through an intermediate visible state: it
+       creates needless display transitions and makes the first Properties
+       frame depend on a later settling pass. */
     luna_set_text(g.id_modal_cancel,"キャンセル");
     luna_set_text(g.id_modal_ok,"OK");
-    luna_remove_class(g.id_modal_input,"hidden");
     if(kind==1){luna_set_text(g.id_modal_title,"新しいフォルダー");luna_set_value(g.id_modal_input,"名称未設定フォルダー");set_modal_info_text("現在の場所にフォルダーを作成します。");}
     else if(kind==2&&target>=0){luna_set_text(g.id_modal_title,"名前を変更");luna_set_value(g.id_modal_input,g.entries[target].name);set_modal_info_text("新しい名前を入力してください。");}
     else if(kind==3&&target>=0){
@@ -2982,16 +3070,13 @@ static void open_modal(int kind, int target) {
         build_properties_info(&g.entries[target],info,sizeof(info));
         snprintf(title,sizeof(title),"プロパティ — %s",g.entries[target].name);
         luna_set_text(g.id_modal_title,title);
-        luna_add_class(g.id_modal,"properties-dialog");
         set_modal_info_text(info);
-        luna_add_class(g.id_modal_input,"hidden");
-        luna_add_class(g.id_modal_cancel,"hidden");
         luna_set_text(g.id_modal_ok,"閉じる");
     } else if(kind==7){
         char info[3072]="";int n=selected_count();append_text(info,sizeof(info),"選択した %d 件を完全に削除します。\nこの操作は元に戻せません。\n\n",n);
         int shown=0;for(int i=0;i<g.entry_count&&shown<12;i++)if(g.entries[i].selected){append_text(info,sizeof(info),"• %s\n",g.entries[i].name);shown++;}
         if(n>shown)append_text(info,sizeof(info),"ほか %d 件\n",n-shown);
-        luna_set_text(g.id_modal_title,"完全に削除しますか？");set_modal_info_text(info);luna_add_class(g.id_modal_input,"hidden");
+        luna_set_text(g.id_modal_title,"完全に削除しますか？");set_modal_info_text(info);
     } else if(kind==4){
         char info[768];safe_copy(g.modal_mime,sizeof(g.modal_mime),mime);
         snprintf(info,sizeof(info),"MIMEタイプ: %s\n現在の既定: %s\n\nXDGの .desktop ID を入力してください。例: org.gnome.TextEditor.desktop\nこの種類のファイルに対するデスクトップ全体の既定アプリが変更されます。",mime,*current?current:"未設定");
@@ -3005,7 +3090,24 @@ static void open_modal(int kind, int target) {
         set_modal_info_text("フォントファミリー名、または .ttf / .otf / .ttc ファイルのパスを入力してください。fontconfigで解決できる名前も使用できます。変更は次回起動から反映されます。");
         luna_set_value(g.id_modal_input,g.custom_font);
     }
-    luna_remove_class(g.id_modal,"hidden");
+    luna_update_classes(g.id_modal_input, "hidden", (kind==3||kind==7)?"hidden":"");
+    luna_update_classes(g.id_modal_cancel, "hidden", kind==3?"hidden":"");
+
+    if(kind==3&&!g.properties_layout_warmed){
+        /* Properties is the only modal that changes both its geometry and its
+           scroll root substantially.  Lay it out once while visibility:hidden
+           so the first visible frame already has final clips/scroll metrics.
+           This is CPU-only, happens once per process, and avoids a second
+           rendered frame or any steady-state repaint cost. */
+        luna_update_classes(g.id_modal, "properties-dialog", "properties-dialog");
+        luna_update(luna_platform_time(),0.0);
+        g.properties_layout_warmed=1;
+        luna_remove_class(g.id_modal,"overlay-idle");
+    }else{
+        /* Normal opens keep the fast single-restyle path. */
+        luna_update_classes(g.id_modal, "overlay-idle properties-dialog",
+                            kind==3?"properties-dialog":"");
+    }
     luna_push_focus_trap(g.id_modal,NULL,0);
     if(kind!=3&&kind!=7)luna_focus_element(g.id_modal_input);
     request_overlay_layout();
@@ -3015,8 +3117,10 @@ static void close_modal(void) {
     if(!g.modal_kind)return;
     int reopen=g.modal_return_settings;
     g.modal_return_settings=0;
-    luna_pop_focus_trap(g.id_modal);luna_add_class(g.id_modal,"hidden");luna_remove_class(g.id_modal,"properties-dialog");g.modal_kind=0;g.modal_target=-1;
-    request_overlay_layout();
+    luna_pop_focus_trap(g.id_modal);
+    luna_update_classes(g.id_modal,"properties-dialog","overlay-idle");
+    g.modal_kind=0;g.modal_target=-1;
+    request_redraw();
     if(reopen)open_settings_dialog();
 }
 
@@ -3264,9 +3368,9 @@ static void apply_basic_preferences(void) {
 static void open_settings_dialog(void) {
     if(g.settings_open)return;
     hide_context();
-    sync_settings_dialog();
     g.settings_open=1;
-    luna_remove_class(g.id_settings,"hidden");
+    sync_settings_dialog();
+    luna_remove_class(g.id_settings,"overlay-idle");
     luna_push_focus_trap(g.id_settings,NULL,0);
     request_overlay_layout();
 }
@@ -3274,10 +3378,10 @@ static void open_settings_dialog(void) {
 static void close_settings_dialog(void) {
     if(!g.settings_open)return;
     luna_pop_focus_trap(g.id_settings);
-    luna_add_class(g.id_settings,"hidden");
+    luna_add_class(g.id_settings,"overlay-idle");
     g.settings_open=0;
     save_settings();
-    request_overlay_layout();
+    request_redraw();
 }
 
 static void open_modal_from_settings(int kind) {
@@ -3394,14 +3498,14 @@ static char *build_html(void) {
         APPEND("<div class=\"button\" onclick=\"onFileDialogCancel()\">キャンセル</div><div id=\"file-dialog-accept\" class=\"button primary\" onclick=\"onFileDialogAccept()\">開く</div></div>");
     }
     APPEND("<div id=\"context\" class=\"context hidden\"><div class=\"menu-item\" onclick=\"onOpen()\">開く</div><div class=\"menu-item\" onclick=\"onOpenWith()\">アプリケーションで開く…</div><div class=\"menu-item\" onclick=\"onSetDefaultApp()\">この種類の既定アプリを設定…</div><div class=\"menu-item\" onclick=\"onTerminal()\">ここでターミナルを開く　F4</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onCopy()\">コピー　Ctrl+C</div><div class=\"menu-item\" onclick=\"onCut()\">切り取り　Ctrl+X</div><div class=\"menu-item\" onclick=\"onPaste()\">貼り付け　Ctrl+V</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onRename()\">名前を変更　F2</div><div class=\"menu-item danger\" onclick=\"onDelete()\">ごみ箱へ移動　Delete</div><div class=\"menu-item danger\" onclick=\"onPermanentDelete()\">完全に削除…　Shift+Delete</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onProperties()\">プロパティ</div></div>"
-      "<div id=\"modal-wrap\" class=\"modal-wrap hidden\"><div class=\"modal\"><div id=\"modal-title\" class=\"modal-title\"></div><div class=\"modal-info-stack\">");
+      "<div id=\"modal-wrap\" class=\"modal-wrap overlay-idle\"><div class=\"modal\"><div id=\"modal-title\" class=\"modal-title\"></div><div class=\"modal-info-stack\">");
     for(int i=0;i<MODAL_INFO_PARTS;i++)
-        APPEND("<div id=\"modal-info%d\" class=\"modal-info%s\"></div>",i,i?" hidden":"");
+        APPEND("<div id=\"modal-info%d\" class=\"modal-info\"></div>",i);
     APPEND("</div><input id=\"modal-input\" class=\"modal-input\" type=\"text\"><div class=\"modal-actions\"><div id=\"modal-cancel\" class=\"button\" onclick=\"onModalCancel()\">キャンセル</div><div id=\"modal-ok\" class=\"button primary\" onclick=\"onModalOk()\">OK</div></div></div></div>"
       "<div id=\"open-with-wrap\" class=\"modal-wrap hidden\"><div class=\"modal open-with-modal\"><div class=\"modal-title\">アプリケーションで開く</div><div id=\"open-with-info\" class=\"modal-info\"></div><div id=\"open-app-list\" class=\"open-app-list\">");
     for(int i=0;i<MAX_OPEN_APPS;i++) APPEND("<div id=\"openapp%02d\" class=\"app-choice hidden\" onclick=\"onOpenApp()\"></div>",i);
     APPEND("</div><div class=\"modal-actions\"><div class=\"button\" onclick=\"onOpenWithCancel()\">キャンセル</div><div class=\"button primary\" onclick=\"onOpenWithDefault()\">既定で開く</div></div></div></div>"
-      "<div id=\"settings-wrap\" class=\"modal-wrap hidden\"><div class=\"settings-panel\">"
+      "<div id=\"settings-wrap\" class=\"modal-wrap overlay-idle\"><div class=\"settings-panel\">"
       "<div class=\"settings-header\"><div class=\"modal-title\">設定</div><div class=\"settings-shortcut\">Ctrl+,</div></div>"
       "<div id=\"settings-scroll\" class=\"settings-scroll\"><div class=\"settings-note\">外観と動作をここで変更できます。フォントの種類とカスタムフォントは、次回起動時に読み込まれます。</div>"
       "<div class=\"settings-section\">外観</div>"
@@ -3562,12 +3666,8 @@ static void apply_pending_resize(void) {
         apply_display_classes();
     }
 
-    /* OpenGL does not resize the viewport automatically.  Keeping the old
-       viewport is what makes the UI appear clipped or stretched after a
-       window-size change. */
-    int fbw=0,fbh=0;
-    glfwGetFramebufferSize(g.window,&fbw,&fbh);
-    if(fbw>0&&fbh>0)glViewport(0,0,fbw,fbh);
+    /* luna_render() binds the current framebuffer-sized viewport itself.
+       Keep resize handling GL-free here; the next redraw applies it once. */
 
     luna_framebuffer_resized();
     luna_mark_layout_dirty();
@@ -3696,6 +3796,10 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResul
     apply_font_environment();
     if(!glfwInit()){log_error("GLFW initialization failed");return 1;}
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
+    /* Do not expose the platform's blank back buffer while fonts, DOM and the
+       first directory are still being prepared.  Show only after the first
+       complete Luna frame has been swapped. */
+    glfwWindowHint(GLFW_VISIBLE,GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED,g_file_dialog_config.client_chrome?GLFW_FALSE:GLFW_TRUE);
     g.window=glfwCreateWindow(g.window_width,g.window_height,g_file_dialog_config.title,NULL,NULL);
     if(!g.window){log_error("window creation failed");glfwTerminate();return 1;}
@@ -3703,7 +3807,7 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResul
     glfwMakeContextCurrent(g.window);glfwSwapInterval(1);
     g_hand_cursor=glfwCreateStandardCursor(GLFW_HAND_CURSOR);g_cursor_ibeam=glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
     g_cursor_crosshair=glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR);g_cursor_hresize=glfwCreateStandardCursor(GLFW_HRESIZE_CURSOR);g_cursor_vresize=glfwCreateStandardCursor(GLFW_VRESIZE_CURSOR);
-    LunaPlatform p={0};p.get_time=glfwGetTime;p.get_proc=(LunaGetProcFn)glfwGetProcAddress;p.set_cursor=platform_cursor;p.request_close=platform_close;p.iconify=platform_iconify;p.maximize_toggle=platform_maximize;p.begin_move=platform_begin_move;p.begin_resize=platform_begin_resize;p.set_title=platform_set_title;p.system_notify=platform_notify;p.struct_size=sizeof(p);p.api_version=LUNA_UI_API_VERSION;luna_set_platform(&p);
+    LunaPlatform p={0};p.get_time=glfwGetTime;p.get_proc=(LunaGetProcFn)glfwGetProcAddress;p.set_cursor=platform_cursor;p.request_close=platform_close;p.iconify=platform_iconify;p.maximize_toggle=platform_maximize;p.request_redraw=platform_redraw;p.begin_move=platform_begin_move;p.begin_resize=platform_begin_resize;p.set_title=platform_set_title;p.system_notify=platform_notify;p.struct_size=sizeof(p);p.api_version=LUNA_UI_API_VERSION;luna_set_platform(&p);
     LunaInitConfig cfg={(float)g.window_width,(float)g.window_height,(LunaGetProcFn)glfwGetProcAddress,g_file_dialog_config.client_chrome};
     if(!luna_init(&cfg)){log_error("Luna UI initialization failed");glfwDestroyWindow(g.window);glfwTerminate();return 1;}
     register_handlers();luna_parse_css(luna_window_standard_css());luna_parse_css(UI_CSS);char *html=build_html();if(!html){log_error("UI allocation failed");luna_shutdown();glfwDestroyWindow(g.window);glfwTerminate();return 1;}luna_parse_html(html);free(html);{LunaWindowConfig wc={0};wc.root_id="app";wc.title=g_file_dialog_config.title;wc.chrome=g_file_dialog_config.client_chrome?LUNA_WINDOW_CHROME_CLIENT:LUNA_WINDOW_CHROME_NATIVE;wc.theme=g_file_dialog_config.mode==LUNA_FILE_DIALOG_MANAGER?(g.theme?LUNA_WINDOW_THEME_DARK:LUNA_WINDOW_THEME_LIGHT):LUNA_WINDOW_THEME_SYSTEM;luna_window_bind(&wc);}luna_wire_onclick_handlers();cache_ids();
@@ -3716,6 +3820,7 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResul
     const char *start=g_file_dialog_config.initial_path&&g_file_dialog_config.initial_path[0]?g_file_dialog_config.initial_path:home_dir();
     navigate(start,1);clipboard_import();update_toolbar_state();
     g.redraw=1;
+    int window_shown=0;
     double prev=glfwGetTime();char old_search[MAX_SEARCH]="";
     while(!glfwWindowShouldClose(g.window)){
         double before=glfwGetTime();
@@ -3733,12 +3838,24 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResul
         apply_grid_scroll();
         settling=luna_update_settling(now,dt);
         apply_grid_scroll();
-        if(g.redraw||settling||g.resize_redraw_frames>0||g.overlay_redraw_frames>0){
+        if(g.redraw||settling||g.resize_redraw_frames>0){
             int fbw,fbh;glfwGetFramebufferSize(g.window,&fbw,&fbh);
-            if(fbw>0&&fbh>0){glViewport(0,0,fbw,fbh);apply_grid_scroll();luna_render(fbw,fbh);glfwSwapBuffers(g.window);}
-            g.redraw=0;
-            if(g.resize_redraw_frames>0){g.resize_redraw_frames--;if(g.resize_redraw_frames>0)g.redraw=1;}
-            if(g.overlay_redraw_frames>0){g.overlay_redraw_frames--;if(g.overlay_redraw_frames>0)g.redraw=1;}
+            int presented=0;
+            if(fbw>0&&fbh>0){
+                apply_grid_scroll();luna_render(fbw,fbh);glfwSwapBuffers(g.window);
+                presented=1;
+                if(!window_shown){glfwShowWindow(g.window);window_shown=1;}
+            } else if(!window_shown) {
+                /* Some Wayland compositors do not allocate a framebuffer for
+                   an unmapped window.  Map it once, but keep redraw pending so
+                   the first configure immediately produces the Luna frame. */
+                glfwShowWindow(g.window);
+                window_shown=1;
+            }
+            /* Never consume the only redraw while the native framebuffer is
+               temporarily 0x0 (common during initial Wayland/HiDPI mapping). */
+            g.redraw=presented?0:1;
+            if(g.resize_redraw_frames>0&&presented){g.resize_redraw_frames--;if(g.resize_redraw_frames>0)g.redraw=1;}
         }
     }
     save_settings();
@@ -3752,6 +3869,53 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResul
     glfwDestroyWindow(g.window);glfwTerminate();
     return 0;
 }
+
+#if defined(__linux__) && (defined(__GNUC__) || defined(__clang__))
+static const char* luna_window_file_dialog_env_copy(const char* name,
+                                                     char* out,size_t cap) {
+    const char* value=getenv(name);
+    if (!value || !*value || !out || cap==0) return NULL;
+    snprintf(out,cap,"%s",value);
+    return out;
+}
+
+__attribute__((constructor))
+static void luna_window_file_dialog_child_entry(void) {
+    const char* marker=getenv("LUNA_WINDOW_INTERNAL_FILE_DIALOG_CHILD");
+    if (!marker || strcmp(marker,"1")!=0) return;
+    unsetenv("LUNA_WINDOW_INTERNAL_FILE_DIALOG_CHILD");
+
+    LunaFileDialogConfig c;
+    LunaFileDialogResult r;
+    char title[512],initial[LUNA_WINDOW_PATH_MAX],suggested[LUNA_WINDOW_PATH_MAX];
+    char accept[128],filter_name[256],filter_patterns[LUNA_WINDOW_PATH_MAX];
+    memset(&c,0,sizeof(c));
+    memset(&r,0,sizeof(r));
+    const char* v;
+    v=getenv("LUNA_WINDOW_FD_MODE"); c.mode=v?(LunaFileDialogMode)atoi(v):LUNA_FILE_DIALOG_OPEN_FILE;
+    c.backend=LUNA_FILE_DIALOG_BACKEND_LUNA;
+    c.title=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_TITLE",title,sizeof(title));
+    c.initial_path=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_INITIAL",initial,sizeof(initial));
+    c.suggested_name=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_NAME",suggested,sizeof(suggested));
+    c.accept_label=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_ACCEPT",accept,sizeof(accept));
+    c.filter_name=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_FILTER_NAME",filter_name,sizeof(filter_name));
+    c.filter_patterns=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_FILTER",filter_patterns,sizeof(filter_patterns));
+    v=getenv("LUNA_WINDOW_FD_WIDTH"); c.width=v?atoi(v):0;
+    v=getenv("LUNA_WINDOW_FD_HEIGHT"); c.height=v?atoi(v):0;
+    v=getenv("LUNA_WINDOW_FD_CLIENT_CHROME"); c.client_chrome=v?atoi(v):0;
+
+    int rc=luna_file_dialog_run(&c,&r);
+    if (rc==0 && r.accepted) {
+        for (int i=0;i<r.count;i++) {
+            if (!r.paths[i][0]) continue;
+            fputs(r.paths[i],stdout);
+            fputc('\n',stdout);
+        }
+        fflush(stdout);
+    }
+    _exit(rc==0?0:2);
+}
+#endif
 
 #undef MAX_ITEMS
 #undef MAX_CLIP_ITEMS
