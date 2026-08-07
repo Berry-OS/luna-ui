@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define LUNA_WINDOW_API_VERSION 0x00010000u
+#define LUNA_WINDOW_API_VERSION 0x00020000u
 #define LUNA_FILE_DIALOG_MAX_RESULTS 32
 #if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION) && !defined(LUNA_WINDOW_IMPLEMENTATION)
 #error "LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION requires LUNA_WINDOW_IMPLEMENTATION in the same translation unit"
@@ -148,12 +148,28 @@ typedef enum LunaFileDialogMode {
     LUNA_FILE_DIALOG_SAVE_FILE
 } LunaFileDialogMode;
 
+typedef enum LunaFileDialogBackend {
+    /* AUTO prefers the Luna standard dialog, then tries desktop helpers. */
+    LUNA_FILE_DIALOG_BACKEND_AUTO = 0,
+    LUNA_FILE_DIALOG_BACKEND_LUNA,
+    LUNA_FILE_DIALOG_BACKEND_ZENITY,
+    LUNA_FILE_DIALOG_BACKEND_KDIALOG,
+    LUNA_FILE_DIALOG_BACKEND_YAD
+} LunaFileDialogBackend;
+
 typedef struct LunaFileDialogConfig {
     LunaFileDialogMode mode;
+    LunaFileDialogBackend backend;
     const char* title;
     const char* initial_path;
     const char* suggested_name;
     const char* accept_label;
+    /* Optional desktop-helper filter, e.g. "Images" and "*.png *.jpg". */
+    const char* filter_name;
+    const char* filter_patterns;
+    /* Optional path to luna-fm. AUTO also checks LUNA_FILE_DIALOG_COMMAND,
+       PATH and a luna-fm executable beside the running application. */
+    const char* luna_fm_path;
     int width;
     int height;
     int client_chrome;
@@ -169,6 +185,16 @@ typedef struct LunaFileDialogResult {
  * Inspect result->accepted to distinguish Accept from Cancel. */
 int luna_file_dialog_run(const LunaFileDialogConfig* config,
                          LunaFileDialogResult* result);
+
+/* Opens a separate dialog process, so it is safe to call from an already
+ * running Luna UI application. AUTO uses luna-fm first; set either
+ * config.backend or LUNA_FILE_DIALOG_BACKEND=zenity|kdialog|yad|luna to
+ * switch implementations at runtime. Returns 0 for Accept or Cancel and a
+ * negative value only when no requested backend could be launched. */
+int luna_file_dialog_show(const LunaFileDialogConfig* config,
+                          LunaFileDialogResult* result);
+LunaFileDialogBackend luna_file_dialog_backend_from_string(const char* name);
+const char* luna_file_dialog_backend_name(LunaFileDialogBackend backend);
 
 #ifdef __cplusplus
 }
@@ -314,11 +340,11 @@ static void luna_window_dialog_finish(LunaWindowDialogResult result) {
     luna_window_state.dialog_userdata = NULL;
     luna_window_state.prompt_active = 0;
     if (callback) callback(result, input_copy, userdata);
-    luna_app_request_redraw();
+    luna_platform_request_redraw();
 }
 static void luna_window_dialog_ok_handler(LunaElement* e) { (void)e; luna_window_dialog_finish(LUNA_WINDOW_RESULT_OK); }
 static void luna_window_dialog_cancel_handler(LunaElement* e) { (void)e; luna_window_dialog_finish(LUNA_WINDOW_RESULT_CANCEL); }
-static void luna_window_toast_close_handler(LunaElement* e) { (void)e; if (luna_window_state.toast >= 0) luna_add_class(luna_window_state.toast, "hidden"); luna_window_state.toast_remaining = 0; luna_app_request_redraw(); }
+static void luna_window_toast_close_handler(LunaElement* e) { (void)e; if (luna_window_state.toast >= 0) luna_add_class(luna_window_state.toast, "hidden"); luna_window_state.toast_remaining = 0; luna_platform_request_redraw(); }
 
 static void luna_window_press_hook(int hit, int button, int mods) {
     (void)mods;
@@ -544,7 +570,7 @@ void luna_window_theme_apply(const LunaWindowTheme* theme) {
         secondary,border,accent,accent_hover,danger,theme->corner_radius);
     luna_parse_css(css);
     luna_mark_layout_dirty();
-    luna_app_request_redraw();
+    luna_platform_request_redraw();
 }
 
 void luna_window_bind(const LunaWindowConfig* config) {
@@ -626,14 +652,14 @@ void luna_window_tick(double dt) {
         if (luna_window_state.toast_remaining <= 0 && luna_window_state.toast >= 0) {
             luna_add_class(luna_window_state.toast,"hidden");
             luna_window_state.toast_remaining=0;
-            luna_app_request_redraw();
+            luna_platform_request_redraw();
         }
     }
 }
 void luna_window_set_title(const char* title) {
     if (luna_window_state.title >= 0) luna_set_text(luna_window_state.title,title?title:"");
     luna_platform_set_title(title?title:"");
-    luna_app_request_redraw();
+    luna_platform_request_redraw();
 }
 static void luna_window_show_dialog(LunaWindowDialogKind kind,const char* title,const char* message,const char* initial,LunaWindowDialogCallback cb,void*ud,int prompt,int cancel) {
     if (!luna_window_state.bound || luna_window_state.dialog_overlay < 0) return;
@@ -643,14 +669,284 @@ static void luna_window_show_dialog(LunaWindowDialogKind kind,const char* title,
     if(luna_window_state.dialog_input>=0){if(prompt){luna_remove_class(luna_window_state.dialog_input,"hidden");luna_set_value(luna_window_state.dialog_input,initial?initial:"");}else luna_add_class(luna_window_state.dialog_input,"hidden");}
     if(luna_window_state.dialog_cancel>=0){if(cancel)luna_remove_class(luna_window_state.dialog_cancel,"hidden");else luna_add_class(luna_window_state.dialog_cancel,"hidden");}
     if(luna_window_state.dialog_ok>=0){luna_set_text(luna_window_state.dialog_ok,"OK");luna_update_classes(luna_window_state.dialog_ok,"danger",kind==LUNA_WINDOW_DIALOG_ERROR?"danger":"");}
-    luna_remove_class(luna_window_state.dialog_overlay,"hidden");luna_push_focus_trap(luna_window_state.dialog_overlay,NULL,0);if(prompt&&luna_window_state.dialog_input>=0)luna_focus_element(luna_window_state.dialog_input);luna_mark_layout_dirty();luna_app_request_redraw();
+    luna_remove_class(luna_window_state.dialog_overlay,"hidden");luna_push_focus_trap(luna_window_state.dialog_overlay,NULL,0);if(prompt&&luna_window_state.dialog_input>=0)luna_focus_element(luna_window_state.dialog_input);luna_mark_layout_dirty();luna_platform_request_redraw();
 }
 void luna_window_alert(LunaWindowDialogKind kind,const char*title,const char*message){luna_window_show_dialog(kind,title,message,NULL,NULL,NULL,0,0);}
 void luna_window_confirm(LunaWindowDialogKind kind,const char*title,const char*message,LunaWindowDialogCallback cb,void*ud){luna_window_show_dialog(kind,title,message,NULL,cb,ud,0,1);}
 void luna_window_prompt(const char*title,const char*message,const char*initial,LunaWindowDialogCallback cb,void*ud){luna_window_show_dialog(LUNA_WINDOW_DIALOG_QUESTION,title,message,initial,cb,ud,1,1);}
 void luna_window_dialog_close(void){luna_window_dialog_finish(LUNA_WINDOW_RESULT_CANCEL);}
-void luna_window_toast(LunaWindowDialogKind kind,const char*title,const char*message,double seconds){(void)kind;if(!luna_window_state.bound||luna_window_state.toast<0)return;if(luna_window_state.toast_title>=0)luna_set_text(luna_window_state.toast_title,title?title:"");if(luna_window_state.toast_message>=0)luna_set_text(luna_window_state.toast_message,message?message:"");luna_remove_class(luna_window_state.toast,"hidden");luna_window_state.toast_remaining=seconds>0?seconds:3.0;luna_app_request_redraw();}
+void luna_window_toast(LunaWindowDialogKind kind,const char*title,const char*message,double seconds){(void)kind;if(!luna_window_state.bound||luna_window_state.toast<0)return;if(luna_window_state.toast_title>=0)luna_set_text(luna_window_state.toast_title,title?title:"");if(luna_window_state.toast_message>=0)luna_set_text(luna_window_state.toast_message,message?message:"");luna_remove_class(luna_window_state.toast,"hidden");luna_window_state.toast_remaining=seconds>0?seconds:3.0;luna_platform_request_redraw();}
 int luna_window_notify(const char*app_name,LunaWindowDialogKind kind,const char*title,const char*message,double fallback_seconds){if(luna_platform_system_notify(app_name,luna_window_notify_kind(kind),title,message))return 1;luna_window_toast(kind,title,message,fallback_seconds);return 0;}
+
+/* ------------------------------------------------------------------------- */
+/* External standard file-dialog launcher                                    */
+/* ------------------------------------------------------------------------- */
+
+#if defined(_WIN32)
+#define LUNA_WINDOW_POPEN  _popen
+#define LUNA_WINDOW_PCLOSE _pclose
+#else
+#include <unistd.h>
+#define LUNA_WINDOW_POPEN  popen
+#define LUNA_WINDOW_PCLOSE pclose
+#endif
+
+LunaFileDialogBackend luna_file_dialog_backend_from_string(const char* name) {
+    if (!name || !*name || !strcmp(name,"auto") || !strcmp(name,"system"))
+        return LUNA_FILE_DIALOG_BACKEND_AUTO;
+    if (!strcmp(name,"luna") || !strcmp(name,"luna-fm"))
+        return LUNA_FILE_DIALOG_BACKEND_LUNA;
+    if (!strcmp(name,"zenity")) return LUNA_FILE_DIALOG_BACKEND_ZENITY;
+    if (!strcmp(name,"kdialog")) return LUNA_FILE_DIALOG_BACKEND_KDIALOG;
+    if (!strcmp(name,"yad")) return LUNA_FILE_DIALOG_BACKEND_YAD;
+    return LUNA_FILE_DIALOG_BACKEND_AUTO;
+}
+
+const char* luna_file_dialog_backend_name(LunaFileDialogBackend backend) {
+    switch (backend) {
+        case LUNA_FILE_DIALOG_BACKEND_LUNA: return "luna";
+        case LUNA_FILE_DIALOG_BACKEND_ZENITY: return "zenity";
+        case LUNA_FILE_DIALOG_BACKEND_KDIALOG: return "kdialog";
+        case LUNA_FILE_DIALOG_BACKEND_YAD: return "yad";
+        default: return "auto";
+    }
+}
+
+static int luna_window_command_exists(const char* name) {
+    if (!name || !*name) return 0;
+#if defined(_WIN32)
+    char found[MAX_PATH];
+    if (strchr(name,'\\') || strchr(name,'/'))
+        return GetFileAttributesA(name) != INVALID_FILE_ATTRIBUTES;
+    return SearchPathA(NULL,name,".exe",MAX_PATH,found,NULL) > 0;
+#else
+    if (strchr(name,'/')) return access(name,X_OK)==0;
+    const char* path=getenv("PATH");
+    if (!path) return 0;
+    size_t nl=strlen(name);
+    const char* p=path;
+    while (*p) {
+        const char* end=strchr(p,':');
+        size_t dl=end?(size_t)(end-p):strlen(p);
+        char full[LUNA_WINDOW_PATH_MAX];
+        if (dl==0) {
+            if (nl+3<sizeof(full)) snprintf(full,sizeof(full),"./%s",name);
+            else full[0]=0;
+        } else if (dl+1+nl+1<sizeof(full)) {
+            memcpy(full,p,dl); full[dl]='/'; memcpy(full+dl+1,name,nl+1);
+        } else full[0]=0;
+        if (full[0] && access(full,X_OK)==0) return 1;
+        if (!end) break;
+        p=end+1;
+    }
+    return 0;
+#endif
+}
+
+static int luna_window_cmd_raw(char* out,size_t cap,size_t* len,const char* text) {
+    size_t n=text?strlen(text):0;
+    if (!out || !len || *len+n+1>cap) return 0;
+    if (n) memcpy(out+*len,text,n);
+    *len+=n; out[*len]=0; return 1;
+}
+
+static int luna_window_cmd_quote(char* out,size_t cap,size_t* len,const char* text) {
+    if (!luna_window_cmd_raw(out,cap,len,"'")) return 0;
+    for (const char* p=text?text:""; *p; ++p) {
+        if (*p=='\'') {
+            if (!luna_window_cmd_raw(out,cap,len,"'\\''")) return 0;
+        } else {
+            char ch[2]={*p,0};
+            if (!luna_window_cmd_raw(out,cap,len,ch)) return 0;
+        }
+    }
+    return luna_window_cmd_raw(out,cap,len,"'");
+}
+
+static int luna_window_cmd_arg(char* out,size_t cap,size_t* len,const char* text) {
+    return luna_window_cmd_raw(out,cap,len," ") &&
+           luna_window_cmd_quote(out,cap,len,text?text:"");
+}
+
+static void luna_window_join_initial(char* out,size_t cap,
+                                     const LunaFileDialogConfig* c) {
+    const char* initial=(c&&c->initial_path&&*c->initial_path)?c->initial_path:".";
+    if (c && c->mode==LUNA_FILE_DIALOG_SAVE_FILE &&
+        c->suggested_name && *c->suggested_name) {
+        size_t n=strlen(initial);
+        snprintf(out,cap,"%s%s%s",initial,
+                 (n && (initial[n-1]=='/' || initial[n-1]=='\\'))?"":"/",
+                 c->suggested_name);
+    } else snprintf(out,cap,"%s",initial);
+}
+
+static int luna_window_find_luna_fm(const LunaFileDialogConfig* c,
+                                    char* out,size_t cap) {
+    const char* explicit_path=(c&&c->luna_fm_path&&*c->luna_fm_path)?
+        c->luna_fm_path:getenv("LUNA_FILE_DIALOG_COMMAND");
+    if (explicit_path && *explicit_path && luna_window_command_exists(explicit_path)) {
+        snprintf(out,cap,"%s",explicit_path); return 1;
+    }
+    if (luna_window_command_exists("luna-fm")) {
+        snprintf(out,cap,"luna-fm"); return 1;
+    }
+#if defined(__linux__)
+    char exe[LUNA_WINDOW_PATH_MAX];
+    ssize_t n=readlink("/proc/self/exe",exe,sizeof(exe)-1);
+    if (n>0) {
+        exe[n]=0;
+        char* slash=strrchr(exe,'/');
+        if (slash) {
+            slash[1]=0;
+            if (strlen(exe)+strlen("luna-fm")+1<cap) {
+                snprintf(out,cap,"%sluna-fm",exe);
+                if (access(out,X_OK)==0) return 1;
+            }
+        }
+    }
+#endif
+    out[0]=0; return 0;
+}
+
+static LunaFileDialogBackend luna_window_choose_file_backend(
+    const LunaFileDialogConfig* c,char* luna_path,size_t luna_path_cap) {
+    LunaFileDialogBackend backend=c?c->backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
+    if (backend==LUNA_FILE_DIALOG_BACKEND_AUTO) {
+        const char* env=getenv("LUNA_FILE_DIALOG_BACKEND");
+        if (env && *env) backend=luna_file_dialog_backend_from_string(env);
+    }
+    if (backend==LUNA_FILE_DIALOG_BACKEND_LUNA)
+        return luna_window_find_luna_fm(c,luna_path,luna_path_cap)?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
+    if (backend==LUNA_FILE_DIALOG_BACKEND_ZENITY)
+        return luna_window_command_exists("zenity")?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
+    if (backend==LUNA_FILE_DIALOG_BACKEND_KDIALOG)
+        return luna_window_command_exists("kdialog")?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
+    if (backend==LUNA_FILE_DIALOG_BACKEND_YAD)
+        return luna_window_command_exists("yad")?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
+    if (luna_window_find_luna_fm(c,luna_path,luna_path_cap))
+        return LUNA_FILE_DIALOG_BACKEND_LUNA;
+    if (luna_window_command_exists("zenity")) return LUNA_FILE_DIALOG_BACKEND_ZENITY;
+    if (luna_window_command_exists("kdialog")) return LUNA_FILE_DIALOG_BACKEND_KDIALOG;
+    if (luna_window_command_exists("yad")) return LUNA_FILE_DIALOG_BACKEND_YAD;
+    return LUNA_FILE_DIALOG_BACKEND_AUTO;
+}
+
+static int luna_window_build_file_command(char* cmd,size_t cap,
+    const LunaFileDialogConfig* c,LunaFileDialogBackend backend,
+    const char* luna_path) {
+    size_t len=0; cmd[0]=0;
+    const char* title=(c&&c->title&&*c->title)?c->title:"ファイルを選択";
+    const char* patterns=(c&&c->filter_patterns&&*c->filter_patterns)?c->filter_patterns:"*";
+    const char* filter_name=(c&&c->filter_name&&*c->filter_name)?c->filter_name:"Files";
+    char initial[LUNA_WINDOW_PATH_MAX];
+    luna_window_join_initial(initial,sizeof(initial),c);
+
+    if (backend==LUNA_FILE_DIALOG_BACKEND_LUNA) {
+        if (!luna_window_cmd_quote(cmd,cap,&len,luna_path)) return 0;
+        switch (c?c->mode:LUNA_FILE_DIALOG_OPEN_FILE) {
+            case LUNA_FILE_DIALOG_OPEN_FILES: if(!luna_window_cmd_raw(cmd,cap,&len," --open-multiple"))return 0; break;
+            case LUNA_FILE_DIALOG_SELECT_FOLDER: if(!luna_window_cmd_raw(cmd,cap,&len," --folder"))return 0; break;
+            case LUNA_FILE_DIALOG_SAVE_FILE: if(!luna_window_cmd_raw(cmd,cap,&len," --save"))return 0; break;
+            default: if(!luna_window_cmd_raw(cmd,cap,&len," --open"))return 0; break;
+        }
+        if (c && c->client_chrome && !luna_window_cmd_raw(cmd,cap,&len," --client-chrome")) return 0;
+        if (c && c->suggested_name && *c->suggested_name) {
+            if(!luna_window_cmd_raw(cmd,cap,&len," --name") ||
+               !luna_window_cmd_arg(cmd,cap,&len,c->suggested_name)) return 0;
+        }
+        if (c && c->filter_name && *c->filter_name) {
+            if(!luna_window_cmd_raw(cmd,cap,&len," --filter-name") ||
+               !luna_window_cmd_arg(cmd,cap,&len,c->filter_name)) return 0;
+        }
+        if (c && c->filter_patterns && *c->filter_patterns) {
+            if(!luna_window_cmd_raw(cmd,cap,&len," --filter") ||
+               !luna_window_cmd_arg(cmd,cap,&len,c->filter_patterns)) return 0;
+        }
+        if (!luna_window_cmd_arg(cmd,cap,&len,
+                (c&&c->initial_path&&*c->initial_path)?c->initial_path:".")) return 0;
+    } else if (backend==LUNA_FILE_DIALOG_BACKEND_ZENITY ||
+               backend==LUNA_FILE_DIALOG_BACKEND_YAD) {
+        if (!luna_window_cmd_raw(cmd,cap,&len,
+                backend==LUNA_FILE_DIALOG_BACKEND_ZENITY?"zenity --file-selection":"yad --file-selection")) return 0;
+        if(!luna_window_cmd_raw(cmd,cap,&len," --title=") || !luna_window_cmd_quote(cmd,cap,&len,title))return 0;
+        if(!luna_window_cmd_raw(cmd,cap,&len," --filename=") || !luna_window_cmd_quote(cmd,cap,&len,initial))return 0;
+        if(c && c->mode==LUNA_FILE_DIALOG_OPEN_FILES &&
+           !luna_window_cmd_raw(cmd,cap,&len," --multiple --separator='|'"))return 0;
+        if(c && c->mode==LUNA_FILE_DIALOG_SELECT_FOLDER &&
+           !luna_window_cmd_raw(cmd,cap,&len," --directory"))return 0;
+        if(c && c->mode==LUNA_FILE_DIALOG_SAVE_FILE &&
+           !luna_window_cmd_raw(cmd,cap,&len," --save --confirm-overwrite"))return 0;
+        if(c && c->filter_patterns && *c->filter_patterns) {
+            char filter[LUNA_WINDOW_PATH_MAX];
+            snprintf(filter,sizeof(filter),"%s | %s",filter_name,patterns);
+            if(!luna_window_cmd_raw(cmd,cap,&len," --file-filter=") ||
+               !luna_window_cmd_quote(cmd,cap,&len,filter))return 0;
+        }
+    } else if (backend==LUNA_FILE_DIALOG_BACKEND_KDIALOG) {
+        if (c && c->mode==LUNA_FILE_DIALOG_SELECT_FOLDER)
+            { if(!luna_window_cmd_raw(cmd,cap,&len,"kdialog --getexistingdirectory"))return 0; }
+        else if (c && c->mode==LUNA_FILE_DIALOG_SAVE_FILE)
+            { if(!luna_window_cmd_raw(cmd,cap,&len,"kdialog --getsavefilename"))return 0; }
+        else { if(!luna_window_cmd_raw(cmd,cap,&len,"kdialog --getopenfilename"))return 0; }
+        if(!luna_window_cmd_arg(cmd,cap,&len,initial))return 0;
+        if(c && c->mode!=LUNA_FILE_DIALOG_SELECT_FOLDER &&
+           c->filter_patterns && *c->filter_patterns) {
+            char filter[LUNA_WINDOW_PATH_MAX];
+            snprintf(filter,sizeof(filter),"%s|%s",patterns,filter_name);
+            if(!luna_window_cmd_arg(cmd,cap,&len,filter))return 0;
+        }
+        if(c && c->mode==LUNA_FILE_DIALOG_OPEN_FILES &&
+           !luna_window_cmd_raw(cmd,cap,&len," --multiple --separate-output"))return 0;
+        if(!luna_window_cmd_raw(cmd,cap,&len," --title") ||
+           !luna_window_cmd_arg(cmd,cap,&len,title))return 0;
+    } else return 0;
+    return luna_window_cmd_raw(cmd,cap,&len," 2>/dev/null");
+}
+
+int luna_file_dialog_show(const LunaFileDialogConfig* config,
+                          LunaFileDialogResult* result) {
+    LunaFileDialogConfig c;
+    memset(&c,0,sizeof(c));
+    if (config) c=*config;
+    if (c.mode==LUNA_FILE_DIALOG_MANAGER) c.mode=LUNA_FILE_DIALOG_OPEN_FILE;
+    if (result) memset(result,0,sizeof(*result));
+    char luna_path[LUNA_WINDOW_PATH_MAX];
+    LunaFileDialogBackend backend=luna_window_choose_file_backend(&c,luna_path,sizeof(luna_path));
+    if (backend==LUNA_FILE_DIALOG_BACKEND_AUTO) return -1;
+    char command[LUNA_WINDOW_PATH_MAX*3];
+    if (!luna_window_build_file_command(command,sizeof(command),&c,backend,luna_path)) return -2;
+    FILE* pipe=LUNA_WINDOW_POPEN(command,"r");
+    if (!pipe) return -2;
+    char line[LUNA_WINDOW_PATH_MAX];
+    int count=0;
+    while (fgets(line,sizeof(line),pipe)) {
+        size_t n=strlen(line);
+        while(n && (line[n-1]=='\n'||line[n-1]=='\r')) line[--n]=0;
+        if (!line[0]) continue;
+        char* cursor=line;
+        while (*cursor) {
+            char* separator=(c.mode==LUNA_FILE_DIALOG_OPEN_FILES)?strchr(cursor,'|'):NULL;
+            if (separator) *separator=0;
+            if (*cursor) {
+                if (result && count<LUNA_FILE_DIALOG_MAX_RESULTS)
+                    snprintf(result->paths[count],sizeof(result->paths[count]),"%s",cursor);
+                count++;
+            }
+            if (!separator || c.mode!=LUNA_FILE_DIALOG_OPEN_FILES) break;
+            cursor=separator+1;
+        }
+        if (c.mode!=LUNA_FILE_DIALOG_OPEN_FILES) break;
+    }
+    int status=LUNA_WINDOW_PCLOSE(pipe);
+    if (status==0 && count>0 && result) {
+        result->accepted=1;
+        result->count=count>LUNA_FILE_DIALOG_MAX_RESULTS?LUNA_FILE_DIALOG_MAX_RESULTS:count;
+    }
+    return 0;
+}
+
+#undef LUNA_WINDOW_POPEN
+#undef LUNA_WINDOW_PCLOSE
 
 #endif /* LUNA_WINDOW_IMPLEMENTATION_INCLUDED */
 #endif /* LUNA_WINDOW_IMPLEMENTATION */
@@ -668,6 +964,7 @@ int luna_window_notify(const char*app_name,LunaWindowDialogKind kind,const char*
 #include <strings.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <fnmatch.h>
 #include <unistd.h>
 
 #include <errno.h>
@@ -2214,6 +2511,30 @@ static void render_files(void) {
     request_redraw();
 }
 
+static int file_dialog_filter_matches(const char *name) {
+    if (!name || !*name || !g_file_dialog_config.filter_patterns ||
+        !*g_file_dialog_config.filter_patterns) return 1;
+    char patterns[1024];
+    safe_copy(patterns, sizeof(patterns), g_file_dialog_config.filter_patterns);
+    char *save = NULL;
+    for (char *pattern = strtok_r(patterns, " \t;", &save);
+         pattern; pattern = strtok_r(NULL, " \t;", &save)) {
+        if (!strcmp(pattern, "*") || fnmatch(pattern, name, 0) == 0) return 1;
+        /* Common image/source filters should behave case-insensitively even on
+           a case-sensitive filesystem. */
+        char lower_name[NAME_MAX + 1], lower_pattern[256];
+        size_t ni = 0, pi = 0;
+        for (; name[ni] && ni + 1 < sizeof(lower_name); ++ni)
+            lower_name[ni] = (char)tolower((unsigned char)name[ni]);
+        lower_name[ni] = 0;
+        for (; pattern[pi] && pi + 1 < sizeof(lower_pattern); ++pi)
+            lower_pattern[pi] = (char)tolower((unsigned char)pattern[pi]);
+        lower_pattern[pi] = 0;
+        if (fnmatch(lower_pattern, lower_name, 0) == 0) return 1;
+    }
+    return 0;
+}
+
 static int load_directory(const char *path) {
     char resolved[PATH_MAX];
     if(!realpath(path,resolved)) { show_toast("開けません: %s",strerror(errno)); return 0; }
@@ -2230,6 +2551,8 @@ static int load_directory(const char *path) {
         struct stat fs; if(lstat(f->path,&fs)!=0)continue;
         f->mode=fs.st_mode; f->is_link=S_ISLNK(fs.st_mode); f->is_dir=S_ISDIR(fs.st_mode);
         if(f->is_link){struct stat target;if(stat(f->path,&target)==0&&S_ISDIR(target.st_mode))f->is_dir=1;}
+        if(!f->is_dir && g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER &&
+           !file_dialog_filter_matches(f->name)) continue;
         f->size=fs.st_size; f->mtime=fs.st_mtime; g.entry_count++;
     }
     closedir(d);

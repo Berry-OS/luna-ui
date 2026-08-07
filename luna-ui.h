@@ -234,6 +234,7 @@ double luna_platform_time(void);
 void luna_platform_request_close(void);
 void luna_platform_iconify(void);
 void luna_platform_maximize_toggle(void);
+void luna_platform_request_redraw(void);
 void luna_platform_begin_move(void);
 void luna_platform_begin_resize(int edge);
 void luna_platform_set_title(const char* title);
@@ -516,6 +517,9 @@ void luna_platform_iconify(void) {
 }
 void luna_platform_maximize_toggle(void) {
     if (g_luna_platform.maximize_toggle) g_luna_platform.maximize_toggle();
+}
+void luna_platform_request_redraw(void) {
+    if (g_luna_platform.request_redraw) g_luna_platform.request_redraw();
 }
 void luna_platform_begin_move(void) {
     if (g_luna_platform.begin_move) g_luna_platform.begin_move();
@@ -1776,6 +1780,84 @@ int g_keyframe_count = 0;
 JsHandlerEntry g_js_handlers[MAX_JS_HANDLERS];
 int g_js_handler_count = 0;
 
+/* CSS target prefilter. Rules are still applied in normal cascade order, but
+ * expensive selector-chain matching is skipped when the target's required
+ * id/type/first-class cannot match. Hash collisions only add false positives. */
+#define LUNA_RULE_BUCKETS 64u
+#define LUNA_RULE_WORDS ((MAX_RULES + 63) / 64)
+static uint64_t g_rule_any[LUNA_RULE_WORDS];
+static uint64_t g_rule_id[LUNA_RULE_BUCKETS][LUNA_RULE_WORDS];
+static uint64_t g_rule_type[LUNA_RULE_BUCKETS][LUNA_RULE_WORDS];
+static uint64_t g_rule_class[LUNA_RULE_BUCKETS][LUNA_RULE_WORDS];
+static int g_rule_index_ready = 0;
+
+static unsigned rule_hash_span(const char* s, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 16777619u;
+    }
+    return h & (LUNA_RULE_BUCKETS - 1u);
+}
+
+static unsigned rule_hash_str(const char* s) {
+    return rule_hash_span(s, strlen(s));
+}
+
+static void rule_bit_set(uint64_t* bits, int rule) {
+    bits[(unsigned)rule >> 6] |= UINT64_C(1) << ((unsigned)rule & 63u);
+}
+
+static void rebuild_rule_index(void) {
+    memset(g_rule_any, 0, sizeof(g_rule_any));
+    memset(g_rule_id, 0, sizeof(g_rule_id));
+    memset(g_rule_type, 0, sizeof(g_rule_type));
+    memset(g_rule_class, 0, sizeof(g_rule_class));
+    for (int i = 0; i < rule_count; i++) {
+        const SimpleSelector* t = &css_rules[i].target;
+        if (t->sel_id[0])
+            rule_bit_set(g_rule_id[rule_hash_str(t->sel_id)], i);
+        else if (t->sel_type[0])
+            rule_bit_set(g_rule_type[rule_hash_str(t->sel_type)], i);
+        else if (t->sel_class_count > 0)
+            rule_bit_set(g_rule_class[rule_hash_str(t->sel_classes[0])], i);
+        else
+            rule_bit_set(g_rule_any, i);
+    }
+    g_rule_index_ready = 1;
+}
+
+static void rule_mask_or(uint64_t* dst, const uint64_t* src) {
+    for (int i = 0; i < LUNA_RULE_WORDS; i++) dst[i] |= src[i];
+}
+
+static int rule_ws(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static void build_rule_candidates(const LunaElement* e, uint64_t* out) {
+    if (!g_rule_index_ready) rebuild_rule_index();
+    memcpy(out, g_rule_any, sizeof(g_rule_any));
+
+    /* Pseudo-element selectors target their host, not the synthetic node. */
+    const LunaElement* key = e;
+    if (e->generated_pseudo && e->parent_idx >= 0 && e->parent_idx < elem_count)
+        key = &elements[e->parent_idx];
+
+    if (key->id[0])
+        rule_mask_or(out, g_rule_id[rule_hash_str(key->id)]);
+    if (key->type[0])
+        rule_mask_or(out, g_rule_type[rule_hash_str(key->type)]);
+
+    const char* q = key->class_name;
+    while (*q) {
+        while (*q && rule_ws((unsigned char)*q)) q++;
+        const char* start = q;
+        while (*q && !rule_ws((unsigned char)*q)) q++;
+        if (q > start)
+            rule_mask_or(out, g_rule_class[rule_hash_span(start, (size_t)(q - start))]);
+    }
+}
 
 static int render_order[MAX_ELEMENTS];
 
@@ -1931,6 +2013,8 @@ static int    g_scroll_hover_axis = -1; /* -1=none 0=vertical 1=horizontal */
 static int    g_drag_moved = 0;
 static int    g_drag_mode  = 0;
 static double g_press_x = 0, g_press_y = 0;
+static unsigned g_hover_epoch = 1;
+static unsigned g_hover_mark[MAX_ELEMENTS];
 static int    g_focused_idx = -1;
 static int    g_focused_element_idx = -1;
 static int    g_focus_before_trap = -1;
@@ -6048,6 +6132,7 @@ void parse_css(const char* css_text) {
 
     css_free(sheet);
     qsort(css_rules, rule_count, sizeof(StyleRule), cmp_rules_by_specificity);
+    rebuild_rule_index();
 }
 
 // ============================================================
@@ -6272,7 +6357,11 @@ void update_element_style(LunaElement* e) {
     e->grad_rad_rx = 0.0f;
     e->grad_rad_ry = 0.0f;
 
+    uint64_t rule_candidates[LUNA_RULE_WORDS];
+    build_rule_candidates(e, rule_candidates);
     for (int i = 0; i < rule_count; i++) {
+        if (!(rule_candidates[(unsigned)i >> 6] &
+              (UINT64_C(1) << ((unsigned)i & 63u)))) continue;
         StyleRule* r = &css_rules[i];
         if (!selector_matches(r, e)) continue;
         if (r->is_hover  && !e->is_hovered) continue;
@@ -6740,8 +6829,12 @@ static void generate_pseudo_elements(void) {
         if (host->luna_internal) continue;
         if (host->generated_pseudo) continue;
 
-        /* Check every pseudo-element rule to see if it matches this host */
+        /* Check only rules whose target key can match this host. */
+        uint64_t rule_candidates[LUNA_RULE_WORDS];
+        build_rule_candidates(host, rule_candidates);
         for (int ri = 0; ri < rule_count && elem_count < MAX_ELEMENTS; ri++) {
+            if (!(rule_candidates[(unsigned)ri >> 6] &
+                  (UINT64_C(1) << ((unsigned)ri & 63u)))) continue;
             StyleRule* r = &css_rules[ri];
             if (!r->pseudo_elem) continue; /* not a pseudo-element rule */
             /* Skip hover/focus/active-only pseudo rules for now */
@@ -9079,37 +9172,60 @@ static void apply_sticky_positions(void) {
     }
 }
 
-static float scroll_offset_x(int idx) {
-    float s = 0.0f;
-    int p = elements[idx].parent_idx;
-    while (p != -1) {
-        if (overflow_scrollable(elements[p].overflow_x))
-            s += elements[p].scroll_left;
-        p = elements[p].parent_idx;
-    }
-    return s;
-}
-
-static float scroll_offset_y(int idx) {
-    float s = 0.0f;
-    int p = elements[idx].parent_idx;
-    while (p != -1) {
-        if (overflow_scrollable(elements[p].overflow_y))
-            s += elements[p].scroll_top;
-        p = elements[p].parent_idx;
-    }
-    return s;
-}
-
 static void apply_scroll_offsets(void) {
+    float sx[MAX_ELEMENTS], sy[MAX_ELEMENTS];
     for (int i = 0; i < elem_count; i++) {
-        if (elements[i].position_fixed || elements[i].parent_idx == -1) continue;
-        elements[i].x -= scroll_offset_x(i);
-        elements[i].y -= scroll_offset_y(i);
+        LunaElement* e = &elements[i];
+        int p = e->parent_idx;
+        if (p < 0) {
+            sx[i] = sy[i] = 0.0f;
+        } else if (p < i) {
+            sx[i] = sx[p] + (overflow_scrollable(elements[p].overflow_x) ? elements[p].scroll_left : 0.0f);
+            sy[i] = sy[p] + (overflow_scrollable(elements[p].overflow_y) ? elements[p].scroll_top  : 0.0f);
+        } else {
+            /* Rare out-of-order parent: preserve correctness with a local walk. */
+            sx[i] = sy[i] = 0.0f;
+            for (int a = p; a != -1; a = elements[a].parent_idx) {
+                if (overflow_scrollable(elements[a].overflow_x)) sx[i] += elements[a].scroll_left;
+                if (overflow_scrollable(elements[a].overflow_y)) sy[i] += elements[a].scroll_top;
+            }
+        }
+        if (!e->position_fixed) {
+            e->x -= sx[i];
+            e->y -= sy[i];
+        }
     }
 }
 
 static void apply_scroll_metrics(void) {
+    unsigned char visible[MAX_ELEMENTS];
+
+    /* Parent indices are normally earlier than children, so visibility can be
+     * propagated while clearing each scroll container's measured extent. */
+    for (int i = 0; i < elem_count; i++) {
+        int p = elements[i].parent_idx;
+        visible[i] = (unsigned char)(!elements[i].display_none &&
+                     (p < 0 ? 1 : (p < i ? visible[p] : is_visible(i))));
+        if (overflow_scrollable(elements[i].overflow_y) ||
+            overflow_scrollable(elements[i].overflow_x)) {
+            elements[i].scroll_content_h = 0.0f;
+            elements[i].scroll_content_w = 0.0f;
+        }
+    }
+
+    /* Each direct child contributes to exactly one parent's extent. */
+    for (int i = 0; i < elem_count; i++) {
+        if (!visible[i]) continue;
+        int p = elements[i].parent_idx;
+        if (p < 0) continue;
+        LunaElement* c = &elements[p];
+        if (!overflow_scrollable(c->overflow_y) && !overflow_scrollable(c->overflow_x)) continue;
+        float bottom = elements[i].rel_y + elements[i].h;
+        float right  = elements[i].rel_x + elements[i].w;
+        if (bottom > c->scroll_content_h) c->scroll_content_h = bottom;
+        if (right  > c->scroll_content_w) c->scroll_content_w = right;
+    }
+
     for (int i = 0; i < elem_count; i++) {
         LunaElement* c = &elements[i];
         if (!overflow_scrollable(c->overflow_y) && !overflow_scrollable(c->overflow_x)) continue;
@@ -9117,19 +9233,8 @@ static void apply_scroll_metrics(void) {
         float inner_w = c->w - c->pad_l - c->pad_r;
         if (inner_h < 0.0f) inner_h = 0.0f;
         if (inner_w < 0.0f) inner_w = 0.0f;
-        float content_bottom = 0.0f, content_right = 0.0f;
-        for (int ch = 0; ch < elem_count; ch++) {
-            if (elements[ch].parent_idx != i) continue;
-            if (!is_visible(ch)) continue;
-            float bottom = elements[ch].rel_y + elements[ch].h;
-            float right  = elements[ch].rel_x + elements[ch].w;
-            if (bottom > content_bottom) content_bottom = bottom;
-            if (right > content_right) content_right = right;
-        }
-        c->scroll_content_h = content_bottom;
-        c->scroll_content_w = content_right;
-        float max_scroll_y = content_bottom - inner_h;
-        float max_scroll_x = content_right - inner_w;
+        float max_scroll_y = c->scroll_content_h - inner_h;
+        float max_scroll_x = c->scroll_content_w - inner_w;
         if (max_scroll_y < 0.0f) max_scroll_y = 0.0f;
         if (max_scroll_x < 0.0f) max_scroll_x = 0.0f;
         if (c->scroll_top > max_scroll_y) { c->scroll_top = max_scroll_y; c->scroll_dest_top = max_scroll_y; }
@@ -9177,7 +9282,7 @@ static void scrollbar_geom_y(LunaElement* c, float* tx, float* ty, float* tw, fl
     *th = inner_h;
     *tx = c->x + c->w - c->pad_r - *tw - 2.0f;
     *ty = c->y + c->pad_t;
-    float ratio = inner_h / c->scroll_content_h;
+    float ratio = c->scroll_content_h > inner_h ? inner_h / c->scroll_content_h : 1.0f;
     *uh = *th * ratio;
     if (*uh < 14.0f) *uh = 14.0f;
     float max_scroll = c->scroll_content_h - inner_h;
@@ -9203,7 +9308,7 @@ static void scrollbar_geom_x(LunaElement* c, float* tx, float* ty, float* tw, fl
     *tw = inner_w;
     *tx = c->x + c->pad_l;
     *ty = c->y + c->h - c->pad_b - *th - 2.0f;
-    float ratio = inner_w / c->scroll_content_w;
+    float ratio = c->scroll_content_w > inner_w ? inner_w / c->scroll_content_w : 1.0f;
     *uw = *tw * ratio;
     if (*uw < 14.0f) *uw = 14.0f;
     float max_scroll = c->scroll_content_w - inner_w;
@@ -9231,6 +9336,11 @@ static int ensure_overlay_element(const char* id, const char* classes, int host,
         elements[idx].css_positioned = 1;
         elements[idx].z_index = 9000 + axis;
         elements[idx].pointer_events_none = 1;
+        update_element_style(&elements[idx]);
+        /* Geometry/interaction belong to the engine; visual CSS remains computed. */
+        elements[idx].luna_internal = 1;
+        elements[idx].position_mode = POS_ABSOLUTE;
+        elements[idx].pointer_events_none = 1;
     }
     elements[idx].sb_host_idx = host;
     elements[idx].sb_axis = axis;
@@ -9255,24 +9365,16 @@ static void place_overlay_rect(int idx, float x, float y, float w, float h, int 
     e->rel_y = y;
     e->pos_overridden_x = 1;
     e->pos_overridden_y = 1;
-    update_element_style(e);
-    /* Preserve overlay behavior after style reset. */
-    e->display_none = 0;
     e->pointer_events_none = 1;
     e->luna_internal = 1;
     e->position_mode = POS_ABSOLUTE;
-    e->x = x; e->y = y; e->w = w; e->h = h;
-    e->pos_overridden_x = 1;
-    e->pos_overridden_y = 1;
 }
 
 static int element_aria_hidden(int idx);
+static int g_sb_slots[MAX_ELEMENTS][4];
 
 /* Position scrollbar + a11y overlay nodes from layout geometry (CSS draws them). */
 static void sync_css_overlay_elements(void) {
-    static int sb_slots[MAX_ELEMENTS][4];
-    memset(sb_slots, 0, sizeof(sb_slots));
-
     for (int i = 0; i < elem_count; i++) {
         LunaElement* c = &elements[i];
         if (c->luna_internal || !is_visible(i)) continue;
@@ -9281,26 +9383,30 @@ static void sync_css_overlay_elements(void) {
         int vis = 0;
 
         scrollbar_geom_y(c, &tx, &ty, &tw, &th, &ux, &uy, &uw, &uh, &vis);
-        if (!sb_slots[i][0]) {
+        if (vis && !g_sb_slots[i][0]) {
             char id[48];
             snprintf(id, sizeof(id), "luna_sb_vt_%d", i);
-            sb_slots[i][0] = ensure_overlay_element(id, "luna_sb_track luna_sb_v", i, 0);
+            g_sb_slots[i][0] = ensure_overlay_element(id, "luna_sb_track luna_sb_v", i, 0);
             snprintf(id, sizeof(id), "luna_sb_vh_%d", i);
-            sb_slots[i][1] = ensure_overlay_element(id, "luna_sb_thumb luna_sb_v", i, 1);
+            g_sb_slots[i][1] = ensure_overlay_element(id, "luna_sb_thumb luna_sb_v", i, 1);
         }
-        place_overlay_rect(sb_slots[i][0], tx, ty, tw, th, vis);
-        place_overlay_rect(sb_slots[i][1], ux, uy, uw, uh, vis);
+        if (g_sb_slots[i][0]) {
+            place_overlay_rect(g_sb_slots[i][0], tx, ty, tw, th, vis);
+            place_overlay_rect(g_sb_slots[i][1], ux, uy, uw, uh, vis);
+        }
 
         scrollbar_geom_x(c, &tx, &ty, &tw, &th, &ux, &uy, &uw, &uh, &vis);
-        if (!sb_slots[i][2]) {
+        if (vis && !g_sb_slots[i][2]) {
             char id[48];
             snprintf(id, sizeof(id), "luna_sb_ht_%d", i);
-            sb_slots[i][2] = ensure_overlay_element(id, "luna_sb_track luna_sb_h", i, 2);
+            g_sb_slots[i][2] = ensure_overlay_element(id, "luna_sb_track luna_sb_h", i, 2);
             snprintf(id, sizeof(id), "luna_sb_hh_%d", i);
-            sb_slots[i][3] = ensure_overlay_element(id, "luna_sb_thumb luna_sb_h", i, 3);
+            g_sb_slots[i][3] = ensure_overlay_element(id, "luna_sb_thumb luna_sb_h", i, 3);
         }
-        place_overlay_rect(sb_slots[i][2], tx, ty, tw, th, vis);
-        place_overlay_rect(sb_slots[i][3], ux, uy, uw, uh, vis);
+        if (g_sb_slots[i][2]) {
+            place_overlay_rect(g_sb_slots[i][2], tx, ty, tw, th, vis);
+            place_overlay_rect(g_sb_slots[i][3], ux, uy, uw, uh, vis);
+        }
     }
 
     int a11y = get_element_by_id("luna_a11y_bar");
@@ -9354,7 +9460,6 @@ static void sync_css_overlay_elements(void) {
             update_element_style(&elements[a11y]);
         } else {
             add_class(&elements[a11y], "hidden");
-            update_element_style(&elements[a11y]);
         }
     }
 }
@@ -9395,6 +9500,20 @@ static int hit_scrollbar_track_x(int idx, double mx, double my) {
     if (!vis) return 0;
     if (mx < tx || mx > tx + tw || my < ty || my > ty + th) return 0;
     return !(mx >= ux && mx <= ux + uw && my >= uy && my <= uy + uh);
+}
+
+/* Hover only needs to know which scrollbar axis owns the pointer, so compute
+ * each axis geometry once instead of thumb + track as separate passes. */
+static int hit_scrollbar_axis(int idx, double mx, double my) {
+    LunaElement* c = &elements[idx];
+    if (c->luna_internal) return -1;
+    float tx, ty, tw, th, ux, uy, uw, uh;
+    int vis = 0;
+    scrollbar_geom_y(c, &tx, &ty, &tw, &th, &ux, &uy, &uw, &uh, &vis);
+    if (vis && mx >= tx && mx <= tx + tw && my >= ty && my <= ty + th) return 0;
+    scrollbar_geom_x(c, &tx, &ty, &tw, &th, &ux, &uy, &uw, &uh, &vis);
+    if (vis && mx >= tx && mx <= tx + tw && my >= ty && my <= ty + th) return 1;
+    return -1;
 }
 
 static void clamp_scroll_y(int idx) {
@@ -11945,14 +12064,10 @@ void recompute_hover(void* window, double xpos, double ypos) {
     g_scroll_hover_idx = -1;
     g_scroll_hover_axis = -1;
     for (int si = 0; si < elem_count; si++) {
-        if (hit_scrollbar_thumb_y(si, xpos, ypos) || hit_scrollbar_track_y(si, xpos, ypos)) {
+        int axis = hit_scrollbar_axis(si, xpos, ypos);
+        if (axis >= 0) {
             g_scroll_hover_idx = si;
-            g_scroll_hover_axis = 0;
-            break;
-        }
-        if (hit_scrollbar_thumb_x(si, xpos, ypos) || hit_scrollbar_track_x(si, xpos, ypos)) {
-            g_scroll_hover_idx = si;
-            g_scroll_hover_axis = 1;
+            g_scroll_hover_axis = axis;
             break;
         }
     }
@@ -11962,16 +12077,19 @@ void recompute_hover(void* window, double xpos, double ypos) {
         g_pointer_visual_revision++;
 
     int hit = hit_test_at(xpos, ypos);
+    if (++g_hover_epoch == 0) {
+        memset(g_hover_mark, 0, sizeof(g_hover_mark));
+        g_hover_epoch = 1;
+    }
+    for (int a = hit; a != -1; a = elements[a].parent_idx)
+        g_hover_mark[a] = g_hover_epoch;
 
     int best_cursor = 0;
     if (g_scroll_hover_axis == 0) best_cursor = 5;
     else if (g_scroll_hover_axis == 1) best_cursor = 4;
     for (int i = 0; i < elem_count; i++) {
         LunaElement* e = &elements[i];
-        int should_hover = 0;
-        for (int a = hit; a != -1; a = elements[a].parent_idx) {
-            if (a == i) { should_hover = 1; break; }
-        }
+        int should_hover = g_hover_mark[i] == g_hover_epoch;
         if (should_hover != e->is_hovered) {
             e->is_hovered = should_hover;
             update_element_style(e);
@@ -12815,6 +12933,7 @@ void luna_reset_css(void) {
     g_css_from_document = 0;
     memset(css_rules, 0, sizeof(css_rules));
     memset(g_keyframes, 0, sizeof(g_keyframes));
+    g_rule_index_ready = 0;
 }
 void luna_parse_html(const char* h) { g_probe_prepared = 0; parse_html(h); }
 void luna_parse_css(const char* c) {
@@ -13261,9 +13380,15 @@ void luna_invalidate_gl_state(void) {
 }
 
 void luna_render(int fbw, int fbh) {
+    if (fbw <= 0 || fbh <= 0) return;
     luna_invalidate_gl_state();
     g_luna_fbw = fbw;
     g_luna_fbh = fbh;
+    /* OpenGL contexts start with a 0 x 0 viewport, and a host/custom renderer
+     * may change it between Luna passes.  Always bind the framebuffer-sized
+     * viewport here instead of relying on backdrop-filter/FBO code to set it
+     * as a side effect. */
+    glViewport(0, 0, fbw, fbh);
     /* The backdrop-blur capture textures are allocated by the first element
      * that actually uses backdrop-filter — see apply_backdrop_blur().  Sizing
      * them here forced a full reallocation every time a differently sized layer
