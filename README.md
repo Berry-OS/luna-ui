@@ -1,57 +1,88 @@
-**🌙 Luna UI**
+# 🌙 Luna UI
 
-Header-only multiplatform HTML/CSS → OpenGL UI host.
+**Header-only, multiplatform HTML/CSS UI for native OpenGL applications.**
 
 [![Sponsor](https://img.shields.io/badge/Sponsor%20this%20project-%E2%9D%A4%EF%B8%8F-white?logo=githubsponsors&logoColor=EA4AAA&labelColor=EA4AAA)](https://github.com/sponsors/yui0)
 
-`luna-ui.h` is the only public include. It automatically selects one native host:
+Luna UI parses HTML and CSS, lays out a lightweight DOM, and renders it directly with OpenGL. The same core is used by the built-in Windows, Linux, macOS, iOS, Android, and Web hosts.
 
-- `luna_windows.h` — Win32 + WGL/OpenGL 3.3
-- `luna_linux.h` — X11 + GLX/OpenGL 3.3
-- `luna_macos.h` — Cocoa + OpenGL 4.1
-- `luna_ios.h` — UIKit + OpenGL ES 3
-- `luna_android.h` — NativeActivity + EGL/OpenGL ES 3
-- `luna_web.h` — Emscripten + WebGL 2
+`luna-ui.h` is the main public include. Define `LUNA_UI_IMPLEMENTATION` in exactly one translation unit and the appropriate native host is selected automatically.
 
-There is no `luna_platform.h`. Platform selection is performed inside `luna-ui.h`.
+## ✨ Screenshots
 
----
+These are frames rendered by the real `examples/example.c` application and the current Luna UI renderer.
 
-## 📦 Basic use
+| Running example | Button hover | Click handler / DOM update |
+| --- | --- | --- |
+| ![Luna UI example](docs/screenshots/luna-ui-welcome.png) | ![Luna UI hover state](docs/screenshots/luna-ui-hover.png) | ![Luna UI clicked state](docs/screenshots/luna-ui-clicked.png) |
+
+The screenshots were captured in a build environment without the GLFW development package by using a **capture-only minimal GLFW compatibility layer** backed by an off-screen Mesa/EGL OpenGL context. The application and Luna UI rendering code were left unchanged; the compatibility layer only supplied the small GLFW host surface needed to run the real app and read back the framebuffer.
+
+## 🚀 Quick start
 
 ```c
 #define LUNA_UI_IMPLEMENTATION
 #include "luna-ui.h"
 
+static const char* html =
+    "<body><main class=\"card\">"
+    "<h1>Hello, Luna UI</h1>"
+    "<p>HTML/CSS rendered by native OpenGL.</p>"
+    "</main></body>";
+
+static const char* css =
+    "body{display:flex;align-items:center;justify-content:center;"
+    "background:#0f172a;color:white;}"
+    ".card{padding:32px;border-radius:20px;background:#1e293b;}";
+
 int main(void) {
     LunaAppConfig app = {0};
     app.title = "My Luna app";
-    app.width = 1280;
-    app.height = 720;
+    app.width = 960;
+    app.height = 640;
     app.resizable = 1;
     app.vsync = 1;
-    app.html_path = "ui/main.html";
-    app.css_path = "ui/main.css";
+    app.html = html;
+    app.css = css;
     return luna_app_run(&app);
 }
 ```
 
-Define `LUNA_UI_IMPLEMENTATION` in exactly one translation unit. Other C or C++ source files include `luna-ui.h` normally without loading any native SDK headers. On Apple targets, only the implementation translation unit must be compiled as `.m` or `.mm`; declaration-only includes remain ordinary C/C++.
+HTML/CSS can be supplied either as strings (`html`, `css`) or paths (`html_path`, `css_path`). `examples/example.c` also demonstrates registering a native C callback for an `onclick` handler and changing DOM text at runtime.
 
-The existing third-party dependencies from the original project remain adjacent to `luna-ui.h` and are not duplicated in this package:
+## 🧩 Current architecture
 
-- `stb_truetype.h`
-- `stb_image.h`
-- `stb_image_write.h`
-- `cssparser.h`
+The repository currently consists of a shared UI/rendering core plus header-only platform hosts:
 
----
+- `luna-ui.h` — DOM, CSS, layout, input, OpenGL renderer, public UI API, and `LunaPlatform` host ABI v2.
+- `luna_windows.h` — Win32 + WGL/OpenGL host.
+- `luna_linux.h` — GLFW + OpenGL host. Luna UI does not call X11/GLX directly from this backend.
+- `luna_macos.h` — Cocoa + OpenGL host.
+- `luna_ios.h` — UIKit + OpenGL ES host.
+- `luna_android.h` — NativeActivity + EGL/OpenGL ES host.
+- `luna_web.h` — Emscripten + WebGL 2 host.
+- `luna-window.h` — optional reusable window chrome, themes, dialogs, toast/notification UI, and desktop file-dialog/file-manager support.
+- `cssparser.h`, `stb_truetype.h`, `stb_image.h`, `stb_image_write.h` — bundled single-header dependencies.
 
-## 🛠️ Platform services included
+There is no separate `luna_platform.h`. Platform selection is performed from `luna-ui.h` in the implementation translation unit.
 
-The selected `luna_*.h` host supplies the window/context lifecycle, event loop, mouse/touch and keyboard forwarding, resource loading, native font lookup, clipboard access, IME/text-input activation, cursor changes, DPI/display scale, window close/minimize/maximize, framebuffer resize handling, and swap timing.
+## 🪟 Window and platform services
 
-Common helpers:
+The built-in hosts provide the native window/context lifecycle and connect platform services to the shared `LunaPlatform` ABI. The current v2 ABI includes hooks for:
+
+- OpenGL procedure lookup and monotonic time
+- resource and font loading
+- clipboard access
+- IME/text-input activation
+- cursor changes and display scale
+- close, minimize, maximize, title changes, move and resize requests
+- redraw requests
+- PNG saving
+- system notifications
+
+`LunaPlatform` includes both `struct_size` and `api_version` (`LUNA_UI_API_VERSION` is currently `0x00020000`) so custom hosts can validate the host structure they provide.
+
+Common helpers include:
 
 ```c
 void  luna_clipboard_set(const char* utf8);
@@ -60,37 +91,63 @@ void  luna_clipboard_free(char* utf8);
 float luna_platform_scale(void);
 ```
 
-Text-field focus automatically activates the platform IME. The compact text editor currently has no range-selection model, so Ctrl/Cmd+C and X operate on the complete non-password value and V inserts at the caret.
+## 🎨 `luna-window.h`
 
----
+Applications that want consistent Luna-styled desktop chrome can additionally use `luna-window.h`:
 
-## 🖥️ Desktop build
+```c
+#define LUNA_UI_IMPLEMENTATION
+#include "luna-ui.h"
 
-### Linux/X11
-
-```sh
-cc -std=c11 examples/example.c -o luna-example \
-  -lX11 -lGL -ldl -lm
+#define LUNA_WINDOW_IMPLEMENTATION
+#include "luna-window.h"
 ```
 
-### Windows/MSVC
+It provides standard titlebar/resize markup and CSS, light/dark/custom themes, alerts, confirmation and prompt dialogs, toast notifications, and notification fallback UI.
+
+For the reusable desktop file dialog/file manager implementation, define `LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION` in the same translation unit as both implementation macros:
+
+```c
+#define LUNA_UI_IMPLEMENTATION
+#include "luna-ui.h"
+#define LUNA_WINDOW_IMPLEMENTATION
+#define LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION
+#include "luna-window.h"
+```
+
+The file-dialog API supports file manager, open file(s), select folder, and save file modes through `LunaFileDialogConfig` and `luna_file_dialog_run()`.
+
+## 🖥️ Desktop builds
+
+### Linux
+
+The current Linux host uses GLFW for windowing/input and OpenGL for rendering:
+
+```sh
+cc -O2 -std=c11 examples/example.c -o luna-example \
+  -lGL -lm -lglfw
+```
+
+No direct `-lX11` dependency is required by Luna UI itself. The GLFW package used by your system may of course depend on X11 or Wayland internally.
+
+### Windows / MSVC
 
 ```bat
 cl /std:c11 /O2 examples\example.c
 ```
 
-The Windows header adds the required Win32/OpenGL libraries with MSVC `#pragma comment`. MinGW users should link `-lopengl32 -lgdi32 -luser32 -limm32 -lshell32`.
+The Windows host uses Win32/WGL. With MinGW, link the normal Win32/OpenGL libraries (for example `opengl32`, `gdi32`, `user32`, `imm32`, and `shell32`).
 
 ### macOS
 
-Copy `examples/example.c` to `example.m`, or use an Objective-C entry file:
+Compile the implementation translation unit as Objective-C or Objective-C++:
 
 ```sh
 clang -O2 -x objective-c examples/example.c -o luna-example \
   -framework Cocoa -framework OpenGL -framework CoreText
 ```
 
----
+Declaration-only users of `luna-ui.h` can remain ordinary C/C++ translation units.
 
 ## 🌐 Web
 
@@ -101,22 +158,17 @@ emcc examples/example.c -o examples/luna-example.js \
   -sEXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8
 ```
 
-Serve the `examples` directory over HTTP and open `index.html`.
-
----
+Serve the `examples` directory over HTTP and open `examples/index.html`.
 
 ## 📱 iOS
 
-Add `examples/example_ios.m` and all Luna headers to an iOS application target.  
-Link UIKit, QuartzCore, OpenGLES, and CoreText. The header supplies its own `UIApplicationDelegate`, view controller, `EAGLContext`, touch input, and `UIKeyInput` implementation.
-
----
+Add `examples/example_ios.m` and the Luna headers to an iOS application target. Link UIKit, QuartzCore, OpenGLES, and CoreText. The iOS host supplies the application/view lifecycle, `EAGLContext`, touch input, and text input bridge.
 
 ## 🤖 Android
 
-Use `android.app.NativeActivity` and set the shared library name in the Android manifest. The implementation exports `ANativeActivity_onCreate`.
+The Android host uses `android.app.NativeActivity`, EGL, and OpenGL ES 3. The implementation exports `ANativeActivity_onCreate`.
 
-The application config is supplied with a macro before including the header:
+For NativeActivity builds the application config can be supplied before including the implementation:
 
 ```c
 #define LUNA_ANDROID_APP_CONFIG luna_android_make_config
@@ -127,17 +179,16 @@ LunaAppConfig luna_android_make_config(void) {
     LunaAppConfig app = {0};
     app.html_path = "ui/main.html";
     app.css_path = "ui/main.css";
+    app.vsync = 1;
     return app;
 }
 ```
 
-Link `android`, `EGL`, `GLESv3`, `dl`, and `log`. HTML, CSS, images, and bundled fonts should be placed in the APK assets directory.
+Link `android`, `EGL`, `GLESv3`, `dl`, and `log`. Pack HTML, CSS, images, and bundled fonts in the APK assets as appropriate.
 
----
+## 🔧 Custom host / embedding
 
-## 🔧 Custom host
-
-To use the renderer inside an existing window system:
+The renderer can be embedded in another window system without any built-in host:
 
 ```c
 #define LUNA_UI_NO_PLATFORM
@@ -145,30 +196,26 @@ To use the renderer inside an existing window system:
 #include "luna-ui.h"
 ```
 
-Provide a `LunaPlatform`, make a compatible GL context current, and call `luna_init`, the input forwarding functions, `luna_update`, and `luna_render` manually.
+Create a compatible OpenGL context, populate `LunaPlatform`, call `luna_set_platform()`, initialize Luna with `luna_init()`, forward input events, and drive `luna_update()` / `luna_render()` from your own loop.
 
----
+This is also the intended extension point for alternative window systems and future rendering hosts without changing the DOM/CSS/layout API.
 
-## ✅ Validation status
+## 📦 Implementation rules
 
-The generated core was syntax-checked as C11 and C++17. The Windows, Linux, Web, and Android hosts were also syntax-checked, including Android C and C++ JNI call paths and GLES headers that expose normal GL prototypes. Apple SDKs are not installed in the generation environment, so `luna_macos.h` and `luna_ios.h` still require a build and runtime pass in Xcode before release. Likewise, each native backend needs runtime testing on its actual OS/GPU/IME.
-
----
+- Define `LUNA_UI_IMPLEMENTATION` in exactly one translation unit.
+- Keep the Luna headers and bundled single-header dependencies in the include tree.
+- On macOS/iOS, compile the implementation translation unit as Objective-C/Objective-C++.
+- Use `LUNA_UI_NO_PLATFORM` only when supplying your own host.
+- Define `LUNA_WINDOW_IMPLEMENTATION` only if using the optional common window layer.
 
 ## 📝 Notes
 
-The Linux native header currently targets X11/GLX. A Wayland host can still use the same core through `LUNA_UI_NO_PLATFORM`, and can later be added as another branch inside `luna_linux.h` without changing the public include.
-
-macOS OpenGL and iOS OpenGL ES are legacy Apple APIs. They keep this version small and share the current renderer. A future Metal backend should replace only the rendering/host layer; the DOM, CSS, layout, input, and public API can remain unchanged.
-
----
+The current renderer is shared across the native OpenGL/OpenGL ES/WebGL hosts. macOS OpenGL and iOS OpenGL ES are legacy Apple APIs, but they keep the host layer compact while the higher-level DOM, CSS, layout, input, and application APIs remain portable.
 
 ## 📄 License
 
-This project is licensed under the **Mozilla Public License 2.0** (MPL-2.0).
+This project is licensed under the **Mozilla Public License 2.0 (MPL-2.0)**.
 
 Copyright (c) Yuichiro Nakada, Berry OS / Luna Desktop contributors.
 
-See the [LICENSE](LICENSE) file for the full text.
-
-Third-party single-header libraries (`stb_*`) retain their original licenses.
+See [LICENSE](LICENSE) for the full license text. Bundled third-party single-header libraries retain their original licenses.
