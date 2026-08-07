@@ -125,7 +125,7 @@ The current Linux host uses GLFW for windowing/input and OpenGL for rendering:
 
 ```sh
 cc -O2 -std=c11 examples/example.c -o luna-example \
-  -lglfw -lGL -ldl -lm -lpthread
+  -lGL -lm -lglfw
 ```
 
 No direct `-lX11` dependency is required by Luna UI itself. The GLFW package used by your system may of course depend on X11 or Wayland internally.
