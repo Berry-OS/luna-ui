@@ -425,6 +425,25 @@ int luna_app_run(const LunaAppConfig* user_config) {
     luna_linux_state.config = config;
 
     glfwSetErrorCallback(luna_linux_error_callback);
+#ifdef GLFW_WAYLAND_LIBDECOR
+    /* Luna provides zxdg-decoration and draws server-side title bars itself.
+     * Bypass libdecor inside a Luna session: GLFW/libdecor initialization has
+     * aborted on the bare-VT session before the first editor frame, while the
+     * native xdg-decoration path is both smaller and compositor-owned.  Set
+     * LUNA_GLFW_LIBDECOR=1 to force libdecor for diagnostics. */
+    {
+        const char* choice = getenv("LUNA_GLFW_LIBDECOR");
+        const char* backend = getenv("LUNA_BACKEND");
+        const char* desktop = getenv("XDG_CURRENT_DESKTOP");
+        int in_luna = (backend && backend[0]) ||
+                      (desktop && (strstr(desktop, "Luna") || strstr(desktop, "luna")));
+        int force_libdecor = choice &&
+            (!strcmp(choice, "1") || !strcmp(choice, "yes") ||
+             !strcmp(choice, "true") || !strcmp(choice, "on"));
+        if ((choice && !force_libdecor) || (!choice && in_luna))
+            glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_WAYLAND_DISABLE_LIBDECOR);
+    }
+#endif
     if (!glfwInit()) {
         fprintf(stderr, "[luna-ui] glfwInit failed\n");
         return 1;
@@ -504,16 +523,25 @@ int luna_app_run(const LunaAppConfig* user_config) {
     if (config.on_init) config.on_init(config.userdata);
     luna_wire_onclick_handlers();
 
-    /* Prime the renderer once while hidden.  This builds layout, shaders and
-     * glyph state without exposing an unfinished framebuffer. */
+    /* Prime layout and GPU state while hidden, but do not swap yet.  A hidden
+     * Wayland window has not received its first xdg_surface.configure;
+     * eglSwapBuffers before glfwShowWindow can wait forever (or abort inside
+     * Mesa), leaving Luna Editor with no mapped window. */
     previous = glfwGetTime();
     luna_update(previous, 0.0);
     luna_linux_state.redraw = 0;
-    (void)luna_linux_present_frame();
+    {
+        int framebuffer_width, framebuffer_height;
+        glfwGetFramebufferSize(window, &framebuffer_width, &framebuffer_height);
+        if (framebuffer_width > 0 && framebuffer_height > 0) {
+            luna_render(framebuffer_width, framebuffer_height);
+            if (config.on_render)
+                config.on_render(framebuffer_width, framebuffer_height,
+                                 config.userdata);
+        }
+    }
 
-    /* Some X11/Wayland compositors replace or reconfigure the drawable when a
-     * hidden GLFW window is mapped.  The known-good editor repainted after
-     * glfwShowWindow(); retain that correctness property, but only once. */
+    /* Map first so Wayland can issue the initial configure, then present. */
     glfwShowWindow(window);
     glfwPollEvents();
 
