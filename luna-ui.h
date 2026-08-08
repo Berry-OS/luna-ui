@@ -2575,6 +2575,8 @@ static int g_layout_dirty = 1;
  * full element scans into one scan per element. */
 static float g_intrinsic_width_cache[MAX_ELEMENTS];
 static unsigned char g_intrinsic_width_valid[MAX_ELEMENTS];
+static float g_min_content_width_cache[MAX_ELEMENTS];
+static unsigned char g_min_content_width_valid[MAX_ELEMENTS];
 static int g_render_order_dirty = 1;
 static int g_cached_eff_z[MAX_ELEMENTS];
 
@@ -4339,12 +4341,24 @@ static int rects_intersect(float ax, float ay, float aw, float ah,
 
 static int element_overflow_visible(int idx) {
     LunaElement* e = &elements[idx];
-    float ex = e->x, ey = e->y, ew = e->w, eh = e->h;
+    /* x/y are layout coordinates; CSS transforms are applied at paint time and
+     * inherited by descendants.  Culling in the untransformed coordinate
+     * space made the right/bottom children of a centered translate(-50%,-50%)
+     * window disappear against the viewport clip. */
+    float chain_tx = 0.0f, chain_ty = 0.0f;
+    for (int a = e->parent_idx; a != -1; a = elements[a].parent_idx) {
+        chain_tx += elements[a].cur_tx;
+        chain_ty += elements[a].cur_ty;
+    }
+    float ex = e->x + e->cur_tx + chain_tx;
+    float ey = e->y + e->cur_ty + chain_ty;
+    float ew = e->w, eh = e->h;
     int p = e->parent_idx;
     while (p != -1) {
         LunaElement* par = &elements[p];
         if (overflow_clips(par->overflow_x) || overflow_clips(par->overflow_y)) {
-            float cx = par->x + par->border_width + par->pad_l, cy = par->y + par->border_width + par->pad_t;
+            float cx = par->x + chain_tx + par->border_width + par->pad_l;
+            float cy = par->y + chain_ty + par->border_width + par->pad_t;
             float cw = par->w - par->border_width * 2.0f - par->pad_l - par->pad_r;
             float ch = par->h - par->border_width * 2.0f - par->pad_t - par->pad_b;
             if (cw <= 0.0f || ch <= 0.0f) return 0;
@@ -4354,6 +4368,8 @@ static int element_overflow_visible(int idx) {
             if (clip_y && (ey + eh <= cy || ey >= cy + ch)) return 0;
             if (clip_x && clip_y && !rects_intersect(ex, ey, ew, eh, cx, cy, cw, ch)) return 0;
         }
+        chain_tx -= par->cur_tx;
+        chain_ty -= par->cur_ty;
         p = par->parent_idx;
     }
     return 1;
@@ -5375,26 +5391,42 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 char fbuf[64];
                 strncpy(fbuf, val, sizeof(fbuf) - 1);
                 fbuf[sizeof(fbuf) - 1] = '\0';
-                char* tok = strtok(fbuf, " \t/");
-                int part = 0;
-                while (tok) {
-                    trim_whitespace(tok);
-                    if (part == 0) {
-                        rule->has_flex_grow = 1;
-                        rule->flex_grow = parse_float_val(tok);
-                    } else if (part == 1) {
-                        rule->has_flex_shrink = 1;
-                        rule->flex_shrink = parse_float_val(tok);
-                    } else if (part == 2) {
-                        rule->has_flex_basis = 1;
-                        if (strstr(tok, "auto")) rule->flex_basis_auto = 1;
-                        else {
-                            rule->flex_basis = parse_float_val(tok);
-                            rule->flex_basis_auto = 0;
+                rule->has_flex_grow = rule->has_flex_shrink = rule->has_flex_basis = 1;
+                rule->flex_grow = 0.0f; rule->flex_shrink = 1.0f;
+                rule->flex_basis = 0.0f; rule->flex_basis_auto = 1;
+                if (strcmp(fbuf, "none") == 0) {
+                    rule->flex_shrink = 0.0f;
+                } else if (strcmp(fbuf, "auto") == 0) {
+                    rule->flex_grow = 1.0f;
+                } else if (strcmp(fbuf, "initial") != 0) {
+                    char* toks[3] = {0}; int nt = 0;
+                    for (char* tok = strtok(fbuf, " \t/"); tok && nt < 3;
+                         tok = strtok(NULL, " \t/")) toks[nt++] = tok;
+                    char* end = NULL;
+                    float first = nt ? strtof(toks[0], &end) : 0.0f;
+                    int first_num = nt && end != toks[0] && *end == '\0';
+                    if (first_num) {
+                        rule->flex_grow = first;
+                        rule->flex_basis_auto = 0; /* one number => N 1 0% */
+                        if (nt > 1) {
+                            end = NULL; float second = strtof(toks[1], &end);
+                            if (end != toks[1] && *end == '\0') {
+                                rule->flex_shrink = second;
+                                if (nt > 2) {
+                                    rule->flex_basis = parse_float_val(toks[2]);
+                                    rule->flex_basis_auto = strstr(toks[2], "auto") != NULL;
+                                }
+                            } else {
+                                rule->flex_shrink = 1.0f;
+                                rule->flex_basis = parse_float_val(toks[1]);
+                                rule->flex_basis_auto = strstr(toks[1], "auto") != NULL;
+                            }
                         }
+                    } else if (nt > 0) {
+                        rule->flex_grow = rule->flex_shrink = 1.0f;
+                        rule->flex_basis = parse_float_val(toks[0]);
+                        rule->flex_basis_auto = strstr(toks[0], "auto") != NULL;
                     }
-                    part++;
-                    tok = strtok(NULL, " \t/");
                 }
             }
             else if (strcmp(key, "visibility") == 0)       { rule->has_visibility = 1; rule->visibility_hidden = (strcmp(val, "hidden") == 0); }
@@ -6327,7 +6359,9 @@ void update_element_style(LunaElement* e) {
     e->text_align = strcmp(e->type, "button") == 0 ? 1 : 0;
     e->has_text_align = strcmp(e->type, "button") == 0;
     e->font_size = 16; e->font_bold = 0; e->font_face = 0;
-    e->line_height = 0.0f; e->white_space = 0; e->text_overflow = 0; e->overflow_wrap = 1;
+    /* CSS initial value is overflow-wrap:normal.  break-word here split short
+     * unbreakable labels such as "Mon" across two lines in narrow flex cells. */
+    e->line_height = 0.0f; e->white_space = 0; e->text_overflow = 0; e->overflow_wrap = 0;
     e->letter_spacing = 0.0f; e->letter_spacing_em = 0; e->line_clamp = 0;
     e->text_transform = 0; e->text_decoration = 0;
     if (e->parent_idx >= 0 && e->parent_idx < elem_count) {
@@ -8052,6 +8086,74 @@ done:
     return result;
 }
 
+/* CSS min-content width: the widest unbreakable text run, recursively
+ * combined according to the formatting direction.  Flexbox's automatic
+ * minimum uses this, not max-content.  Keeping a separate per-layout cache
+ * avoids repeating font measurement during iterative shrink distribution. */
+static float min_content_width(LunaElement* e) {
+    int idx = (int)(e - elements);
+    if (idx >= 0 && idx < elem_count && g_min_content_width_valid[idx])
+        return g_min_content_width_cache[idx];
+
+    float result = 0.0f, total = 0.0f, maxw = 0.0f;
+    int n = 0;
+    for (int c = 0; c < elem_count; c++) {
+        LunaElement* ch = &elements[c];
+        if (ch->parent_idx != idx || !is_visible(c) ||
+            ch->position_mode == POS_ABSOLUTE || ch->position_fixed) continue;
+        float cw = min_content_width(ch) + ch->margin_left + ch->margin_right;
+        if (ch->has_min_width) {
+            float mw = css_outer_width(ch, ch->css_min_width);
+            if (cw < mw) cw = mw;
+        }
+        total += cw;
+        if (cw > maxw) maxw = cw;
+        n++;
+    }
+    if (n > 0) {
+        int row = (e->display_mode == DISPLAY_FLEX && e->flex_direction == FLEX_DIR_ROW);
+        result = (row ? total + e->flex_gap * (float)(n - 1) : maxw) +
+                 e->pad_l + e->pad_r + e->border_width * 2.0f;
+    } else if (e->text[0]) {
+        FontAtlas* atlas = font_loaded ? get_atlas(e->font_size, e->font_bold, NULL) : NULL;
+        if (font_loaded)
+            text_metrics_begin(e->font_size, e->font_bold, e->font_face, atlas);
+        g_text_letter_spacing = e->letter_spacing;
+        const char* s = e->text;
+        float longest = 0.0f;
+        if (e->white_space) {
+            longest = font_loaded ? measure_text_width(atlas, s)
+                                  : strlen(s) * (float)e->font_size * 0.55f;
+        } else {
+            while (*s) {
+                while (*s && isspace((unsigned char)*s)) s++;
+                const char* b = s;
+                while (*s && !isspace((unsigned char)*s)) s++;
+                if (s > b) {
+                    char word[256];
+                    size_t len = (size_t)(s - b);
+                    if (len >= sizeof(word)) len = sizeof(word) - 1;
+                    memcpy(word, b, len); word[len] = '\0';
+                    float w = font_loaded ? measure_text_width(atlas, word)
+                                          : len * (float)e->font_size * 0.55f;
+                    if (w > longest) longest = w;
+                }
+            }
+        }
+        g_text_letter_spacing = 0.0f;
+        if (font_loaded) text_metrics_end();
+        result = longest + e->pad_l + e->pad_r + e->border_width * 2.0f + 4.0f;
+    } else {
+        result = e->pad_l + e->pad_r + e->border_width * 2.0f;
+    }
+
+    if (idx >= 0 && idx < elem_count) {
+        g_min_content_width_cache[idx] = result;
+        g_min_content_width_valid[idx] = 1;
+    }
+    return result;
+}
+
 static float flex_content_width(LunaElement* ch) {
     return intrinsic_content_width(ch);
 }
@@ -8088,10 +8190,22 @@ static void layout_block_container(int container_idx) {
         if (ch->pct_w) {
             ch->w = inner_w * ch->raw_w;
         } else if (!ch->has_css_width) {
-            /* width:auto fills the containing block after ordinary margins.
-             * Auto margins resolve to zero when width itself is auto. */
-            ch->w = inner_w - ch->margin_left - ch->margin_right;
-            if (ch->w < 0.0f) ch->w = 0.0f;
+            /* The browser UA stylesheet makes form controls inline-block.
+             * Their auto width is max-content; stretching every auto-width
+             * child here made a lone <button> fill its parent. */
+            int inline_control = strcmp(ch->type, "button") == 0 ||
+                                  strcmp(ch->type, "input") == 0 ||
+                                  strcmp(ch->type, "select") == 0 ||
+                                  strcmp(ch->type, "textarea") == 0;
+            if (inline_control) {
+                ch->w = intrinsic_content_width(ch);
+            } else {
+                /* width:auto fills the containing block after ordinary
+                 * margins. Auto margins resolve to zero when width itself is
+                 * auto. */
+                ch->w = inner_w - ch->margin_left - ch->margin_right;
+                if (ch->w < 0.0f) ch->w = 0.0f;
+            }
         }
 
         if (!ch->has_css_height && !ch->pct_h) {
@@ -8185,11 +8299,25 @@ void update_layout() {
          * absolutely positioned child to a tiny strip at the top-left. */
         if (par == -1 &&
             (strcmp(e->type, "body") == 0 || strcmp(e->type, "html") == 0)) {
-            e->x = 0.0f; e->y = 0.0f;
-            e->w = window_width; e->h = window_height;
-            e->rel_x = 0.0f; e->rel_y = 0.0f;
+            /* Browser layout gives the body an auto height.  Do not make a
+             * flex body viewport-sized unless CSS explicitly asks for it. */
+            float ml = e->margin_left, mr = e->margin_right;
+            float mt = e->margin_top, mb = e->margin_bottom;
+            e->x = ml; e->y = mt;
+            e->w = window_width - ml - mr;
+            if (e->w < 0.0f) e->w = 0.0f;
+            e->rel_x = e->rel_y = 0.0f;
             e->pct_w = 1; e->raw_w = 1.0f; e->raw_w_off = 0.0f;
-            e->pct_h = 1; e->raw_h = 1.0f; e->raw_h_off = 0.0f;
+            if (e->pct_h) {
+                e->h = window_height * e->raw_h + e->raw_h_off;
+            } else if (e->has_css_height) {
+                e->h = e->box_sizing == BOX_CONTENT
+                    ? e->css_height + e->pad_t + e->pad_b + e->border_width * 2.0f
+                    : e->css_height;
+            } else {
+                e->h = flow_content_height(e) + mt + mb;
+            }
+            if (e->h < 0.0f) e->h = 0.0f;
             continue;
         }
 
@@ -8388,7 +8516,7 @@ static float flex_min_main(LunaElement* ch, int row_mode) {
      * wallpaper/cursor rows overlapped in the Appearance panel. */
     if (row_mode) {
         if (overflow_clips(ch->overflow_x)) return 0.0f;
-        float content = flex_content_width(ch);
+        float content = min_content_width(ch);
         if (ch->has_max_width && !ch->max_width_pct && content > ch->css_max_width)
             content = ch->css_max_width;
         return content;
@@ -9151,13 +9279,43 @@ static void layout_flex_containers(void) {
         else
             layout_block_container(i);
     }
+}
+
+/* Layout containers work in parent-local coordinates.  Resolve screen
+ * coordinates once, after every flex/grid settling pass has finished.
+ *
+ * Doing this inside layout_flex_containers() updated only in-flow children and
+ * did it once per settling pass.  Descendants of an absolute container then
+ * retained coordinates based on the container's pre-settled position.  Paint
+ * and clipping disagreed: elements existed and had correct local geometry but
+ * were culled at stale screen coordinates.  A single top-down O(elements)
+ * pass is both correct and cheaper than those repeated partial passes. */
+static void resolve_global_layout_positions(void) {
     for (int i = 0; i < elem_count; i++) {
         LunaElement* e = &elements[i];
         int par = e->parent_idx;
-        if (par == -1 || e->position_fixed) continue;
-        if (!e->flex_child && !e->grid_child && !e->flow_child) continue;
-        e->x = elements[par].x + e->rel_x + e->margin_left;
-        e->y = elements[par].y + e->rel_y + e->margin_top;
+
+        if (par == -1) {
+            if (strcmp(e->type, "body") != 0 && strcmp(e->type, "html") != 0) {
+                e->x = e->rel_x + e->margin_left;
+                e->y = e->rel_y + e->margin_top;
+            }
+            continue;
+        }
+        if (e->position_fixed) {
+            e->x = e->rel_x + e->margin_left;
+            e->y = e->rel_y + e->margin_top;
+        } else if (e->position_mode == POS_ABSOLUTE) {
+            int cb = find_containing_block(i);
+            float ox, oy, cw, ch;
+            containing_block_rect(cb, &ox, &oy, &cw, &ch);
+            (void)cw; (void)ch;
+            e->x = ox + e->rel_x + e->margin_left;
+            e->y = oy + e->rel_y + e->margin_top;
+        } else {
+            e->x = elements[par].x + e->rel_x + e->margin_left;
+            e->y = elements[par].y + e->rel_y + e->margin_top;
+        }
     }
 }
 
@@ -9247,6 +9405,7 @@ static void sync_css_overlay_elements(void);
 
 void update_layout_pass(void) {
     memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
+    memset(g_min_content_width_valid, 0, sizeof(g_min_content_width_valid));
     update_layout();
     layout_flex_containers();
     /* Wrapping flex rows finalize their height after a definite width is known.
@@ -9259,6 +9418,7 @@ void update_layout_pass(void) {
         layout_flex_containers();
         layout_flex_containers();
     }
+    resolve_global_layout_positions();
     apply_relative_offsets();
     apply_scroll_metrics();
     apply_scroll_offsets();
@@ -10139,9 +10299,12 @@ static int rc_is_rendered(int idx) {
     const LunaRenderCache* c = &g_rc[idx];
     if (!c->vis || elements[idx].visibility_hidden) return 0;
     if (!c->clipped) return 1;
-    if (c->lw <= 0.0f || c->lh <= 0.0f) return 0;
+    if (c->cw <= 0.0f || c->ch <= 0.0f) return 0;
     LunaElement* e = &elements[idx];
-    return rects_intersect(e->x, e->y, e->w, e->h, c->lx, c->ly, c->lw, c->lh);
+    float dw = e->w * e->cur_scale, dh = e->h * e->cur_scale;
+    float dx = e->x + (e->w - dw) * 0.5f + e->cur_tx + c->anc_tx;
+    float dy = e->y + (e->h - dh) * 0.5f + e->cur_ty + c->anc_ty;
+    return rects_intersect(dx, dy, dw, dh, c->cx, c->cy, c->cw, c->ch);
 }
 
 /* ── Render damage ──────────────────────────────────────────────────────────
@@ -11093,7 +11256,9 @@ void init_font() {
             "fonts/Inter-Regular.ttf", "ui/fonts/Inter-Regular.ttf",
             "skins/fonts/web/Inter-Regular.ttf",
             "apps/luna-shell/skins/fonts/web/Inter-Regular.ttf",
-            "../skins/fonts/web/Inter-Regular.ttf"
+            "../skins/fonts/web/Inter-Regular.ttf",
+            "../luna-shell/skins/fonts/web/Inter-Regular.ttf",
+            "../../luna-shell/skins/fonts/web/Inter-Regular.ttf"
         };
         reg_buf = luna_try_font_candidates(cands, sizeof(cands)/sizeof(cands[0]),
                                            &g_font_ttf_sz, "regular font");
@@ -11774,6 +11939,14 @@ static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
                 for (int i = 0; i < take; i++)
                     if (p[i] == ' ' || p[i] == '\t') last_space = i;
                 if (last_space > 0) take = last_space;
+                else {
+                    /* overflow-wrap:normal never splits an unbreakable word.
+                     * Paint it overflowing this line, then resume at the next
+                     * whitespace if more words follow. */
+                    take = para_len;
+                    for (int i = 0; i < para_len; i++)
+                        if (p[i] == ' ' || p[i] == '\t') { take = i; break; }
+                }
             } else if (take < para_len) {
                 int last_space = -1;
                 for (int i = 0; i < take; i++)
@@ -11924,6 +12097,11 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
                 for (int i = 0; i < take; i++)
                     if (p[i] == ' ' || p[i] == '\t') last_space = i;
                 if (last_space > 0) take = last_space;
+                else {
+                    take = para_len;
+                    for (int i = 0; i < para_len; i++)
+                        if (p[i] == ' ' || p[i] == '\t') { take = i; break; }
+                }
             } else if (take < para_len) {
                 int last_space = -1;
                 for (int i = 0; i < take; i++)
@@ -11974,8 +12152,12 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
         if (fx && fx->has_text_shadow && fx->tsh_a > 0.004f) {
             float sa = fx->tsh_a * a;
             if (fx->tsh_blur >= 2.0f) {
-                float o = fx->tsh_blur * 0.5f;
-                float qa = sa * 0.35f;
+                /* Sparse samples at half the blur radius look like displaced
+                 * duplicate text (14px became four readable ghost labels).
+                 * Keep taps near the glyph and lower their energy: this is a
+                 * compact glow approximation without an off-screen blur pass. */
+                float o = 1.0f;
+                float qa = sa * 0.06f;
                 render_text_pass(atlas, line, start_x + fx->tsh_dx - o, baseline + fx->tsh_dy, fx->tsh_r, fx->tsh_g, fx->tsh_b, qa);
                 render_text_pass(atlas, line, start_x + fx->tsh_dx + o, baseline + fx->tsh_dy, fx->tsh_r, fx->tsh_g, fx->tsh_b, qa);
                 render_text_pass(atlas, line, start_x + fx->tsh_dx, baseline + fx->tsh_dy - o, fx->tsh_r, fx->tsh_g, fx->tsh_b, qa);

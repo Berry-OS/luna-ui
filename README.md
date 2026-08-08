@@ -18,6 +18,36 @@ These are frames rendered by the real `examples/example.c` application and the c
 
 The screenshots were captured in a build environment without the GLFW development package by using a **capture-only minimal GLFW compatibility layer** backed by an off-screen Mesa/EGL OpenGL context. The application and Luna UI rendering code were left unchanged; the compatibility layer only supplied the small GLFW host surface needed to run the real app and read back the framebuffer.
 
+### Standalone demo gallery
+
+These screenshots were captured by running the migrated demo applications in `examples/` with the real GLFW/OpenGL host:
+
+| Aurora dashboard | CSS/OpenGL showcase |
+| --- | --- |
+| ![Aurora dashboard demo](docs/screenshots/luna-ui-aurora.png) | ![CSS and OpenGL showcase](docs/screenshots/luna-ui-showcase.png) |
+
+| Modal, backdrop and focus trap | Select menu and native controls |
+| --- | --- |
+| ![Apply Changes confirmation modal rendered by Luna UI](docs/screenshots/luna-ui-modal.png) | ![Theme select menu and form controls rendered by Luna UI](docs/screenshots/luna-ui-controls.png) |
+
+The interaction shots above are not mockups: the demo was launched under the
+GLFW/OpenGL host, the controls were clicked through Luna UI's input system, and
+the resulting framebuffer was captured with the built-in `F12` screenshot path.
+
+| Minimal card sample | Profile studio and text fields |
+| --- | --- |
+| ![Minimal Luna UI sample](docs/screenshots/luna-ui-sample01.png) | ![Profile studio sample](docs/screenshots/luna-ui-sample02.png) |
+
+Build and run the gallery demos locally with:
+
+```sh
+make -C examples
+./examples/luna-ui --size 1024x700
+./examples/opengl_gui --size 1024x700
+./examples/sample_01
+./examples/sample_02
+```
+
 ## 🚀 Quick start
 
 ```c
