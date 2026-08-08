@@ -12,9 +12,14 @@
 #define LUNA_UI_IMPLEMENTATION
 #define LUNA_UI_GLFW
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <GLFW/glfw3.h>
 #include "luna-ui.h"
+
+#ifndef GLFW_KEY_F12
+#define GLFW_KEY_F12 301
+#endif
 
 static GLFWwindow* g_window;
 
@@ -153,6 +158,7 @@ static const char* SAMPLE_CSS =
     "}\n"
     "#submit_btn, #clear_btn, #close_btn {\n"
     "  height: 42px; border-radius: 12px; cursor: pointer;\n"
+    "  display: flex; align-items: center; justify-content: center;\n"
     "  font-size: 14px; font-weight: bold; text-align: center; color: #fff;\n"
     "  transition: 0.12s;\n"
     "}\n"
@@ -226,7 +232,10 @@ static void on_scroll(GLFWwindow* w, double xoff, double yoff) {
 }
 
 static void on_key(GLFWwindow* w, int key, int scancode, int action, int mods) {
-    (void)w; luna_key(key, scancode, action, mods);
+    (void)w;
+    if (key == GLFW_KEY_F12 && action == GLFW_PRESS)
+        luna_request_screenshot("luna-ui-sample02.png");
+    luna_key(key, scancode, action, mods);
 }
 
 static void on_char(GLFWwindow* w, unsigned int codepoint) {
@@ -288,6 +297,8 @@ int main(void) {
     glfwSetFramebufferSizeCallback(g_window, on_fb);
 
     double prev = glfwGetTime();
+    const char* screenshot_path = getenv("LUNA_SCREENSHOT");
+    int frame_no = 0;
     while (!glfwWindowShouldClose(g_window)) {
         double now = glfwGetTime();
         luna_update(now, now - prev);
@@ -299,6 +310,11 @@ int main(void) {
         glClearColor(0.04f, 0.05f, 0.08f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         luna_render(fbw, fbh);
+        if (screenshot_path && frame_no++ == 2)
+            luna_request_screenshot(screenshot_path);
+        luna_flush_pending_screenshot();
+        if (screenshot_path && frame_no > 3)
+            glfwSetWindowShouldClose(g_window, GLFW_TRUE);
 
         glfwSwapBuffers(g_window);
         glfwPollEvents();

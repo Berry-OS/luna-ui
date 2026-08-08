@@ -1539,9 +1539,10 @@ typedef struct {
     int has_rad_c[4]; float rad_c[4];   /* per-corner radius: tl, tr, br, bl */
     int has_width;  float width;
     int has_height; float height;
-    int has_padding; float padding;
+    int has_padding; int has_pad_t, has_pad_r, has_pad_b, has_pad_l; float padding;
     float pad_t, pad_r, pad_b, pad_l;
-    int has_margin; float margin_top, margin_right, margin_bottom, margin_left;
+    int has_margin; int has_margin_top, has_margin_right, has_margin_bottom, has_margin_left;
+    float margin_top, margin_right, margin_bottom, margin_left;
     int margin_top_auto, margin_right_auto, margin_bottom_auto, margin_left_auto;
     int has_left;   float left;
     int has_top;    float top;
@@ -3483,6 +3484,7 @@ static void parse_padding_shorthand(const char* val, StyleRule* rule) {
         tok = strtok(NULL, " \t");
     }
     rule->has_padding = 1;
+    rule->has_pad_t = rule->has_pad_r = rule->has_pad_b = rule->has_pad_l = 1;
     /* CSS shorthand: 1=all, 2=(v h), 3=(t h b), 4=(t r b l) */
     if (count == 1) {
         rule->pad_t = rule->pad_r = rule->pad_b = rule->pad_l = vals[0];
@@ -3512,6 +3514,8 @@ static void parse_margin_shorthand(const char* val, StyleRule* rule) {
         tok = strtok(NULL, " \t");
     }
     rule->has_margin = 1;
+    rule->has_margin_top = rule->has_margin_right = 1;
+    rule->has_margin_bottom = rule->has_margin_left = 1;
     if (count == 1) {
         rule->margin_top = rule->margin_right = rule->margin_bottom = rule->margin_left = vals[0];
     } else if (count == 2) {
@@ -4166,10 +4170,10 @@ static void apply_element_inline_style(LunaElement* e) {
         e->display_mode = rule.display_mode;
     }
     if (rule.has_margin) {
-        e->margin_top = rule.margin_top;
-        e->margin_right = rule.margin_right;
-        e->margin_bottom = rule.margin_bottom;
-        e->margin_left = rule.margin_left;
+        if (rule.has_margin_top) e->margin_top = rule.margin_top;
+        if (rule.has_margin_right) e->margin_right = rule.margin_right;
+        if (rule.has_margin_bottom) e->margin_bottom = rule.margin_bottom;
+        if (rule.has_margin_left) e->margin_left = rule.margin_left;
     }
     if (rule.has_shadow) {
         e->has_shadow = (rule.shadow_count > 0);
@@ -5057,15 +5061,15 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 }
             }
             else if (strcmp(key, "padding") == 0)          { parse_padding_shorthand(val, rule); }
-            else if (strcmp(key, "padding-top") == 0)      { rule->has_padding = 1; rule->pad_t = parse_float_val(val); }
-            else if (strcmp(key, "padding-right") == 0)    { rule->has_padding = 1; rule->pad_r = parse_float_val(val); }
-            else if (strcmp(key, "padding-bottom") == 0)   { rule->has_padding = 1; rule->pad_b = parse_float_val(val); }
-            else if (strcmp(key, "padding-left") == 0)     { rule->has_padding = 1; rule->pad_l = parse_float_val(val); }
+            else if (strcmp(key, "padding-top") == 0)      { rule->has_padding = 1; rule->has_pad_t = 1; rule->pad_t = parse_float_val(val); }
+            else if (strcmp(key, "padding-right") == 0)    { rule->has_padding = 1; rule->has_pad_r = 1; rule->pad_r = parse_float_val(val); }
+            else if (strcmp(key, "padding-bottom") == 0)   { rule->has_padding = 1; rule->has_pad_b = 1; rule->pad_b = parse_float_val(val); }
+            else if (strcmp(key, "padding-left") == 0)     { rule->has_padding = 1; rule->has_pad_l = 1; rule->pad_l = parse_float_val(val); }
             else if (strcmp(key, "margin") == 0)           { parse_margin_shorthand(val, rule); }
-            else if (strcmp(key, "margin-top") == 0)       { rule->has_margin = 1; if (strcmp(val,"auto")==0) rule->margin_top_auto=1; else rule->margin_top = parse_float_val(val); }
-            else if (strcmp(key, "margin-right") == 0)     { rule->has_margin = 1; if (strcmp(val,"auto")==0) rule->margin_right_auto=1; else rule->margin_right = parse_float_val(val); }
-            else if (strcmp(key, "margin-bottom") == 0)    { rule->has_margin = 1; if (strcmp(val,"auto")==0) rule->margin_bottom_auto=1; else rule->margin_bottom = parse_float_val(val); }
-            else if (strcmp(key, "margin-left") == 0)      { rule->has_margin = 1; if (strcmp(val,"auto")==0) rule->margin_left_auto=1; else rule->margin_left = parse_float_val(val); }
+            else if (strcmp(key, "margin-top") == 0)       { rule->has_margin = 1; rule->has_margin_top = 1; if (strcmp(val,"auto")==0) rule->margin_top_auto=1; else rule->margin_top = parse_float_val(val); }
+            else if (strcmp(key, "margin-right") == 0)     { rule->has_margin = 1; rule->has_margin_right = 1; if (strcmp(val,"auto")==0) rule->margin_right_auto=1; else rule->margin_right = parse_float_val(val); }
+            else if (strcmp(key, "margin-bottom") == 0)    { rule->has_margin = 1; rule->has_margin_bottom = 1; if (strcmp(val,"auto")==0) rule->margin_bottom_auto=1; else rule->margin_bottom = parse_float_val(val); }
+            else if (strcmp(key, "margin-left") == 0)      { rule->has_margin = 1; rule->has_margin_left = 1; if (strcmp(val,"auto")==0) rule->margin_left_auto=1; else rule->margin_left = parse_float_val(val); }
             else if (strcmp(key, "inset") == 0)            { parse_inset_shorthand(val, rule); }
             else if (strcmp(key, "left") == 0) { rule->has_left = 1; parse_length_calc(val, &rule->left, &rule->pct_left, &rule->raw_left_off); if (rule->pct_left) rule->raw_left = rule->left; }
             else if (strcmp(key, "top") == 0)  { rule->has_top = 1; parse_length_calc(val, &rule->top, &rule->pct_top, &rule->raw_top_off); if (rule->pct_top) rule->raw_top = rule->top; }
@@ -6383,6 +6387,24 @@ void update_element_style(LunaElement* e) {
             e->t_b = parent->t_b; e->t_a = parent->t_a;
         }
     }
+    /* Compact browser-UA defaults.  They live below author rules in the
+     * cascade, so a longhand such as `h1 { margin-bottom:12px }` must not
+     * accidentally erase the other three UA margin sides.  Keeping these
+     * scalar defaults here is allocation-free and adds no render-time work. */
+    if (strcmp(e->type, "body") == 0) {
+        e->margin_top = e->margin_right = e->margin_bottom = e->margin_left = 8.0f;
+    } else if (strcmp(e->type, "h1") == 0) {
+        e->font_bold = 1;
+        e->margin_top = e->margin_bottom = e->font_size * 0.67f;
+    } else if (strcmp(e->type, "h2") == 0) {
+        e->font_bold = 1;
+        e->margin_top = e->margin_bottom = e->font_size * 0.83f;
+    } else if (strcmp(e->type, "h3") == 0) {
+        e->font_bold = 1;
+        e->margin_top = e->margin_bottom = e->font_size;
+    } else if (strcmp(e->type, "p") == 0) {
+        e->margin_top = e->margin_bottom = e->font_size;
+    }
     e->has_text_shadow = 0;
     e->tsh_dx = e->tsh_dy = e->tsh_blur = 0.0f;
     e->tsh_r = e->tsh_g = e->tsh_b = 0.0f; e->tsh_a = 0.0f;
@@ -6432,6 +6454,8 @@ void update_element_style(LunaElement* e) {
     e->grad_rad_rx = 0.0f;
     e->grad_rad_ry = 0.0f;
 
+    int author_margin_top = 0, author_margin_right = 0;
+    int author_margin_bottom = 0, author_margin_left = 0;
     uint64_t rule_candidates[LUNA_RULE_WORDS];
     build_rule_candidates(e, rule_candidates);
     for (int i = 0; i < rule_count; i++) {
@@ -6553,18 +6577,16 @@ void update_element_style(LunaElement* e) {
         }
         if (r->has_padding) {
             e->padding = r->padding;
-            e->pad_t = r->pad_t; e->pad_r = r->pad_r;
-            e->pad_b = r->pad_b; e->pad_l = r->pad_l;
+            if (r->has_pad_t) e->pad_t = r->pad_t;
+            if (r->has_pad_r) e->pad_r = r->pad_r;
+            if (r->has_pad_b) e->pad_b = r->pad_b;
+            if (r->has_pad_l) e->pad_l = r->pad_l;
         }
         if (r->has_margin) {
-            e->margin_top = r->margin_top;
-            e->margin_right = r->margin_right;
-            e->margin_bottom = r->margin_bottom;
-            e->margin_left = r->margin_left;
-            e->margin_top_auto = r->margin_top_auto;
-            e->margin_right_auto = r->margin_right_auto;
-            e->margin_bottom_auto = r->margin_bottom_auto;
-            e->margin_left_auto = r->margin_left_auto;
+            if (r->has_margin_top) { author_margin_top = 1; e->margin_top = r->margin_top; e->margin_top_auto = r->margin_top_auto; }
+            if (r->has_margin_right) { author_margin_right = 1; e->margin_right = r->margin_right; e->margin_right_auto = r->margin_right_auto; }
+            if (r->has_margin_bottom) { author_margin_bottom = 1; e->margin_bottom = r->margin_bottom; e->margin_bottom_auto = r->margin_bottom_auto; }
+            if (r->has_margin_left) { author_margin_left = 1; e->margin_left = r->margin_left; e->margin_left_auto = r->margin_left_auto; }
         }
         if (r->has_position) {
             e->position_fixed = r->position_fixed;
@@ -6843,6 +6865,18 @@ void update_element_style(LunaElement* e) {
         }
     }
 
+    /* UA em margins compute from the final font size after the author cascade,
+     * not the inherited size that was present when defaults were seeded. */
+    if (strcmp(e->type, "h1") == 0 || strcmp(e->type, "h2") == 0 ||
+        strcmp(e->type, "h3") == 0 || strcmp(e->type, "p") == 0) {
+        float em = 1.0f;
+        if (strcmp(e->type, "h1") == 0) em = 0.67f;
+        else if (strcmp(e->type, "h2") == 0) em = 0.83f;
+        if (!author_margin_top) e->margin_top = e->font_size * em;
+        if (!author_margin_bottom) e->margin_bottom = e->font_size * em;
+    }
+    (void)author_margin_right;
+    (void)author_margin_left;
     apply_element_inline_style(e);
 
     if (e->letter_spacing_em) {
@@ -8302,7 +8336,7 @@ void update_layout() {
             /* Browser layout gives the body an auto height.  Do not make a
              * flex body viewport-sized unless CSS explicitly asks for it. */
             float ml = e->margin_left, mr = e->margin_right;
-            float mt = e->margin_top, mb = e->margin_bottom;
+            float mt = e->margin_top;
             e->x = ml; e->y = mt;
             e->w = window_width - ml - mr;
             if (e->w < 0.0f) e->w = 0.0f;
@@ -8315,7 +8349,10 @@ void update_layout() {
                     ? e->css_height + e->pad_t + e->pad_b + e->border_width * 2.0f
                     : e->css_height;
             } else {
-                e->h = flow_content_height(e) + mt + mb;
+                /* Margins are outside the body's border box.  Including them
+                 * here and again during positioning inflated the flex cross
+                 * axis by 16px for the browser-default 8px body margin. */
+                e->h = flow_content_height(e);
             }
             if (e->h < 0.0f) e->h = 0.0f;
             continue;
@@ -12191,12 +12228,20 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
             float ey = y - g_render_off_y;
             uni4f(tx_loc.uElemBounds, &tx_uni.uElemBounds, ex, ey, box_w, box_h);
             render_text_pass(atlas, line, start_x, baseline, 1.0f, 1.0f, 1.0f, 1.0f);
-            if (is_fake_bold) render_text_pass(atlas, line, start_x + 1.0f, baseline, 1.0f, 1.0f, 1.0f, 1.0f);
+            if (is_fake_bold) {
+                render_text_pass(atlas, line, start_x + 1.0f, baseline, 1.0f, 1.0f, 1.0f, 1.0f);
+                if (fsize >= 24.0f)
+                    render_text_pass(atlas, line, start_x + 2.0f, baseline, 1.0f, 1.0f, 1.0f, 1.0f);
+            }
             luna_use_program(text_program);
             uni1i(tx_loc.uGradMode, &tx_uni.uGradMode, 0);
         } else {
             render_text_pass(atlas, line, start_x, baseline, r, g, b, a);
-            if (is_fake_bold) render_text_pass(atlas, line, start_x + 1.0f, baseline, r, g, b, a);
+            if (is_fake_bold) {
+                render_text_pass(atlas, line, start_x + 1.0f, baseline, r, g, b, a);
+                if (fsize >= 24.0f)
+                    render_text_pass(atlas, line, start_x + 2.0f, baseline, r, g, b, a);
+            }
         }
         /* CSS text-decoration: underline / line-through */
         if (fx && fx->text_decoration) {
@@ -13774,6 +13819,19 @@ void luna_render(int fbw, int fbh) {
         if (eff_op <= 0.004f) { damage_drop(i); continue; }
         float dx, dy, dw, dh;
         rc_element_draw_bounds(i, &dx, &dy, &dw, &dh);
+        /* CSS propagates the root body's background to the canvas.  Keep the
+         * body's auto-height box for flex/layout, but paint its background
+         * across the whole initial containing block.  Gradients are images
+         * and repeat by default, using the body outer box as their tile. */
+        int canvas_body = g_render_root < 0 && e->parent_idx == -1 &&
+                          strcmp(e->type, "body") == 0;
+        float canvas_tile_h = e->h + e->margin_top + e->margin_bottom;
+        if (canvas_body) {
+            dx = g_render_off_x;
+            dy = g_render_off_y;
+            dw = LUNA_RRES_X;
+            dh = LUNA_RRES_Y;
+        }
         if (dw <= 0.0f || dh <= 0.0f) { damage_drop(i); continue; }
         float scale = e->cur_scale;
         /* Viewport culling: skip elements fully off the surface region. */
@@ -13871,9 +13929,22 @@ void luna_render(int fbw, int fbh) {
                            rad4, e->border_width,
                            e->cur_bd_r, e->cur_bd_g, e->cur_bd_b, e->cur_bd_a * eff_op, NULL);
         } else {
-        draw_rect_full(dx, dy, dw, dh, e->cur_r, e->cur_g, e->cur_b, e->cur_a * eff_op,
-                       rad4, e->border_width,
-                       e->cur_bd_r, e->cur_bd_g, e->cur_bd_b, e->cur_bd_a * eff_op, e);
+        if (canvas_body && e->has_gradient && canvas_tile_h > 0.5f &&
+            canvas_tile_h < dh - 0.5f) {
+            float tile_y = dy;
+            while (tile_y < dy + dh) {
+                float tile_h = canvas_tile_h;
+                if (tile_y + tile_h > dy + dh) tile_h = dy + dh - tile_y;
+                draw_rect_full(dx, tile_y, dw, tile_h,
+                               e->cur_r, e->cur_g, e->cur_b, e->cur_a * eff_op,
+                               rad4, 0.0f, 0, 0, 0, 0, e);
+                tile_y += canvas_tile_h;
+            }
+        } else {
+            draw_rect_full(dx, dy, dw, dh, e->cur_r, e->cur_g, e->cur_b, e->cur_a * eff_op,
+                           rad4, e->border_width,
+                           e->cur_bd_r, e->cur_bd_g, e->cur_bd_b, e->cur_bd_a * eff_op, e);
+        }
         }
         if (e->has_shadow) {
             for (int s = 0; s < e->shadow_count; s++) {

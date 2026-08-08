@@ -10,13 +10,11 @@ Luna UI parses HTML and CSS, lays out a lightweight DOM, and renders it directly
 
 ## ✨ Screenshots
 
-These are frames rendered by the real `examples/example.c` application and the current Luna UI renderer.
+This frame is rendered by the real `examples/example.c` application and the current Luna UI renderer.
 
-| Running example | Button hover | Click handler / DOM update |
-| --- | --- | --- |
-| ![Luna UI example](docs/screenshots/luna-ui-welcome.png) | ![Luna UI hover state](docs/screenshots/luna-ui-hover.png) | ![Luna UI clicked state](docs/screenshots/luna-ui-clicked.png) |
+![Luna UI header-only example rendered by the native OpenGL renderer](docs/screenshots/luna-ui-example.png)
 
-The screenshots were captured in a build environment without the GLFW development package by using a **capture-only minimal GLFW compatibility layer** backed by an off-screen Mesa/EGL OpenGL context. The application and Luna UI rendering code were left unchanged; the compatibility layer only supplied the small GLFW host surface needed to run the real app and read back the framebuffer.
+The screenshot was captured from the real GLFW/OpenGL application with Luna UI's built-in `F12` framebuffer capture path at 960 × 640. It replaces the older broken and stale example-state images.
 
 ### Standalone demo gallery
 
@@ -38,6 +36,11 @@ the resulting framebuffer was captured with the built-in `F12` screenshot path.
 | --- | --- |
 | ![Minimal Luna UI sample](docs/screenshots/luna-ui-sample01.png) | ![Profile studio sample](docs/screenshots/luna-ui-sample02.png) |
 
+The samples now bind `F12` directly to Luna UI's PNG capture path. For an
+automated, reproducible capture, set `LUNA_SCREENSHOT` to the output filename;
+the sample renders three settling frames, writes the PNG, and exits. The images
+above use the samples' real 800 × 500 and 860 × 620 framebuffers respectively.
+
 Build and run the gallery demos locally with:
 
 ```sh
@@ -46,6 +49,7 @@ make -C examples
 ./examples/opengl_gui --size 1024x700
 ./examples/sample_01
 ./examples/sample_02
+# or: LUNA_SCREENSHOT=sample.png ./examples/sample_01
 ```
 
 ## 🚀 Quick start
