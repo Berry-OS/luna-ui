@@ -111,6 +111,7 @@ static const char* SAMPLE_CSS =
     "#chip {\n"
     "  margin-top: 28px; height: 34px; width: 150px;\n"
     "  border-radius: 999px; font-size: 12px; font-weight: bold;\n"
+    "  display: flex; align-items: center; justify-content: center;\n"
     "  text-align: center; color: #e0f2fe;\n"
     "  background: linear-gradient(135deg, #0ea5e9, #6366f1);\n"
     "  box-shadow: 0 8px 24px rgba(14,165,233,0.35);\n"

@@ -55,6 +55,7 @@ typedef struct LunaLinuxState {
     int framebuffer_width;
     int framebuffer_height;
     int glfw_initialized;
+    int visible_at_create;
     int redraw;
     int window_drag_mode;
     int window_resize_edges;
@@ -426,21 +427,17 @@ int luna_app_run(const LunaAppConfig* user_config) {
 
     glfwSetErrorCallback(luna_linux_error_callback);
 #ifdef GLFW_WAYLAND_LIBDECOR
-    /* Luna provides zxdg-decoration and draws server-side title bars itself.
-     * Bypass libdecor inside a Luna session: GLFW/libdecor initialization has
-     * aborted on the bare-VT session before the first editor frame, while the
-     * native xdg-decoration path is both smaller and compositor-owned.  Set
-     * LUNA_GLFW_LIBDECOR=1 to force libdecor for diagnostics. */
+    /* luna-session selects the dependency-free libdecor-cairo plugin.  Keep
+     * GLFW's normal libdecor path by default: on some GLFW/Mesa builds the
+     * forced native-decoration path configures the xdg_toplevel but never
+     * publishes its first EGL buffer.  An explicit false value remains useful
+     * for diagnostics on systems with a known-good native path. */
     {
         const char* choice = getenv("LUNA_GLFW_LIBDECOR");
-        const char* backend = getenv("LUNA_BACKEND");
-        const char* desktop = getenv("XDG_CURRENT_DESKTOP");
-        int in_luna = (backend && backend[0]) ||
-                      (desktop && (strstr(desktop, "Luna") || strstr(desktop, "luna")));
-        int force_libdecor = choice &&
-            (!strcmp(choice, "1") || !strcmp(choice, "yes") ||
-             !strcmp(choice, "true") || !strcmp(choice, "on"));
-        if ((choice && !force_libdecor) || (!choice && in_luna))
+        int disable_libdecor = choice &&
+            (!strcmp(choice, "0") || !strcmp(choice, "no") ||
+             !strcmp(choice, "false") || !strcmp(choice, "off"));
+        if (disable_libdecor)
             glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_WAYLAND_DISABLE_LIBDECOR);
     }
 #endif
@@ -455,7 +452,22 @@ int luna_app_run(const LunaAppConfig* user_config) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
-    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    /* A hidden GLFW Wayland window creates its xdg_toplevel only when
+     * glfwShowWindow is called.  With Mesa's wl_shm EGL path, creating the EGL
+     * window/context before that role exists can leave swapBuffers returning
+     * forever without attaching a wl_buffer.  Wayland does not expose an
+     * unpainted native window anyway: make it logically visible at creation,
+     * then publish the first pixels with the first swap below.  Keep the
+     * hidden warm-up on X11 where mapping and buffer attachment are separate. */
+    {
+        const char* session_type = getenv("XDG_SESSION_TYPE");
+        const char* wayland_display = getenv("WAYLAND_DISPLAY");
+        int wayland_session =
+            (session_type && strcmp(session_type, "wayland") == 0) ||
+            (wayland_display && wayland_display[0] && !getenv("DISPLAY"));
+        luna_linux_state.visible_at_create = wayland_session;
+        glfwWindowHint(GLFW_VISIBLE, wayland_session ? GLFW_TRUE : GLFW_FALSE);
+    }
     glfwWindowHint(GLFW_RESIZABLE, config.resizable ? GLFW_TRUE : GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, config.frameless ? GLFW_FALSE : GLFW_TRUE);
 #ifdef GLFW_TRANSPARENT_FRAMEBUFFER
@@ -523,14 +535,14 @@ int luna_app_run(const LunaAppConfig* user_config) {
     if (config.on_init) config.on_init(config.userdata);
     luna_wire_onclick_handlers();
 
-    /* Prime layout and GPU state while hidden, but do not swap yet.  A hidden
-     * Wayland window has not received its first xdg_surface.configure;
-     * eglSwapBuffers before glfwShowWindow can wait forever (or abort inside
-     * Mesa), leaving Luna Editor with no mapped window. */
+    /* Prime layout everywhere, but prime GPU draw state only while the X11
+     * window is hidden.  On Wayland even drawing (without swapping) before the
+     * initial xdg_surface.configure can strand Mesa's wl_shm EGL surface with
+     * no first buffer attachment. */
     previous = glfwGetTime();
     luna_update(previous, 0.0);
     luna_linux_state.redraw = 0;
-    {
+    if (!luna_linux_state.visible_at_create) {
         int framebuffer_width, framebuffer_height;
         glfwGetFramebufferSize(window, &framebuffer_width, &framebuffer_height);
         if (framebuffer_width > 0 && framebuffer_height > 0) {

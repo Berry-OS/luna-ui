@@ -1175,10 +1175,14 @@ typedef struct {
 } GridAreaRect;
 
 /* One CSS background layer (background: grad1, grad2, ...) */
-#define LUNA_MAX_BG_LAYERS 4
+#ifndef LUNA_UI_MAX_BG_LAYERS
+#define LUNA_UI_MAX_BG_LAYERS 12
+#endif
+#define LUNA_MAX_BG_LAYERS LUNA_UI_MAX_BG_LAYERS
 typedef struct {
     int  has_gradient; int grad_type;
     int  grad_stop_count;
+    unsigned int grad_stop_px_mask;
     float grad_stop_pos[MAX_GRAD_STOPS];
     float grad_stop_r[MAX_GRAD_STOPS], grad_stop_g[MAX_GRAD_STOPS];
     float grad_stop_b[MAX_GRAD_STOPS], grad_stop_a[MAX_GRAD_STOPS];
@@ -1310,6 +1314,7 @@ struct LunaElement {
     int has_gradient;
     int grad_type;
     int grad_stop_count;
+    unsigned int grad_stop_px_mask;
     float grad_stop_pos[MAX_GRAD_STOPS];
     float grad_stop_r[MAX_GRAD_STOPS], grad_stop_g[MAX_GRAD_STOPS];
     float grad_stop_b[MAX_GRAD_STOPS], grad_stop_a[MAX_GRAD_STOPS];
@@ -1643,6 +1648,7 @@ typedef struct {
     int has_gradient;
     int grad_type;
     int grad_stop_count;
+    unsigned int grad_stop_px_mask;
     float grad_stop_pos[MAX_GRAD_STOPS];
     float grad_stop_r[MAX_GRAD_STOPS], grad_stop_g[MAX_GRAD_STOPS];
     float grad_stop_b[MAX_GRAD_STOPS], grad_stop_a[MAX_GRAD_STOPS];
@@ -2681,7 +2687,7 @@ void parse_color(const char* val, float* r, float* g, float* b, float* a) {
     if (val[0] == '#') {
         int len = (int)strlen(val);
         if (len == 4) {
-            int rv, gv, bv;
+            unsigned int rv, gv, bv;
             if (sscanf(val, "#%1x%1x%1x", &rv, &gv, &bv) == 3) {
                 *r = (rv * 17) / 255.0f; *g = (gv * 17) / 255.0f; *b = (bv * 17) / 255.0f;
             }
@@ -3011,6 +3017,7 @@ static void apply_gradient_rule(StyleRule* rule, int type, float angle,
 static int parse_gradient_stops(const char** p_in, StyleRule* rule) {
     const char* p = *p_in;
     int count = 0;
+    rule->grad_stop_px_mask = 0;
     while (*p && *p != ')' && count < MAX_GRAD_STOPS) {
         while (isspace((unsigned char)*p) || *p == ',') p++;
         if (*p == ')' || !*p) break;
@@ -3029,48 +3036,57 @@ static int parse_gradient_stops(const char** p_in, StyleRule* rule) {
         trim_whitespace(token);
 
         char color_buf[96] = {0};
-        float pos = -1.0f;
-        /* A stop position is separated from the color by whitespace at the
-           top level.  strrchr() also found spaces inside rgba()/hsl(), so
-           `rgba(141, 123, 255, 0.38)` was split before its alpha component and
-           became an opaque color. */
+        /* Split after the color, never at whitespace inside rgb()/hsl(). */
         char* sp = NULL;
         int token_depth = 0;
         for (char* q = token; *q; q++) {
             if (*q == '(') token_depth++;
             else if (*q == ')' && token_depth > 0) token_depth--;
-            else if (isspace((unsigned char)*q) && token_depth == 0) sp = q;
+            else if (isspace((unsigned char)*q) && token_depth == 0) { sp = q; break; }
         }
         if (sp) {
-            char posbuf[24] = {0};
-            strncpy(posbuf, sp + 1, 23);
-            trim_whitespace(posbuf);
-            int plen = (int)strlen(posbuf);
-            char* pos_end = NULL;
-            float parsed_pos = strtof(posbuf, &pos_end);
-            while (pos_end && isspace((unsigned char)*pos_end)) pos_end++;
-            int is_percent = pos_end && *pos_end == '%' && pos_end[1] == '\0';
-            int is_unitless_zero = pos_end && *pos_end == '\0' && parsed_pos == 0.0f;
-            if (plen > 0 && (is_percent || is_unitless_zero)) {
-                pos = is_percent ? parsed_pos / 100.0f : 0.0f;
-                int clen = (int)(sp - token);
-                if (clen > (int)sizeof(color_buf) - 1)
-                    clen = (int)sizeof(color_buf) - 1;
-                strncpy(color_buf, token, clen);
-                color_buf[clen] = '\0';
-                trim_whitespace(color_buf);
-            } else {
-                snprintf(color_buf, sizeof(color_buf), "%s", token);
-            }
+            int clen = (int)(sp - token);
+            if (clen > (int)sizeof(color_buf) - 1) clen = (int)sizeof(color_buf) - 1;
+            strncpy(color_buf, token, clen);
+            color_buf[clen] = '\0';
+            trim_whitespace(color_buf);
         } else {
             snprintf(color_buf, sizeof(color_buf), "%s", token);
         }
 
-        parse_color(color_buf,
-                    &rule->grad_stop_r[count], &rule->grad_stop_g[count],
-                    &rule->grad_stop_b[count], &rule->grad_stop_a[count]);
-        rule->grad_stop_pos[count] = pos;
-        count++;
+        float cr, cg, cb, ca;
+        parse_color(color_buf, &cr, &cg, &cb, &ca);
+        float positions[2] = {-1.0f, -1.0f};
+        int pos_is_px[2] = {0, 0};
+        int pos_count = 0;
+        const char* pp = sp ? sp + 1 : NULL;
+        while (pp && *pp && pos_count < 2) {
+            while (isspace((unsigned char)*pp)) pp++;
+            if (!*pp) break;
+            char* endp = NULL;
+            float v = strtof(pp, &endp);
+            if (endp == pp) break;
+            if (*endp == '%') {
+                positions[pos_count++] = v / 100.0f;
+                pp = endp + 1;
+            } else if (endp[0] == 'p' && endp[1] == 'x') {
+                positions[pos_count] = v;
+                pos_is_px[pos_count++] = 1;
+                pp = endp + 2;
+            } else if (v == 0.0f) {
+                positions[pos_count++] = 0.0f;
+                pp = endp;
+            } else {
+                break;
+            }
+        }
+        if (pos_count == 0) pos_count = 1; /* one auto-positioned color stop */
+        for (int pi = 0; pi < pos_count && count < MAX_GRAD_STOPS; pi++, count++) {
+            rule->grad_stop_r[count] = cr; rule->grad_stop_g[count] = cg;
+            rule->grad_stop_b[count] = cb; rule->grad_stop_a[count] = ca;
+            rule->grad_stop_pos[count] = positions[pi];
+            if (pos_is_px[pi]) rule->grad_stop_px_mask |= 1u << count;
+        }
         if (*p == ',') p++;
     }
     rule->grad_stop_count = count;
@@ -3317,6 +3333,7 @@ static void rule_to_bg_layer(const StyleRule* rule, LunaBgLayer* layer) {
     layer->has_gradient = rule->has_gradient;
     layer->grad_type    = rule->grad_type;
     layer->grad_stop_count = rule->grad_stop_count;
+    layer->grad_stop_px_mask = rule->grad_stop_px_mask;
     layer->grad_angle   = rule->grad_angle;
     layer->grad_rad_cx  = rule->grad_rad_cx;
     layer->grad_rad_cy  = rule->grad_rad_cy;
@@ -3415,6 +3432,7 @@ static void parse_background_shorthand(const char* val, StyleRule* rule) {
     }
 
     /* Multiple layers */
+    rule->has_bg = 1;
     rule->bg_layer_count = 0;
     for (int li = 0; li < n && li < LUNA_MAX_BG_LAYERS; li++) {
         char* piece = pieces[li];
@@ -3449,6 +3467,7 @@ static void parse_background_shorthand(const char* val, StyleRule* rule) {
             rule->has_gradient  = last->has_gradient;
             rule->grad_type     = last->grad_type;
             rule->grad_stop_count = last->grad_stop_count;
+            rule->grad_stop_px_mask = last->grad_stop_px_mask;
             rule->grad_angle    = last->grad_angle;
             rule->grad_rad_cx   = last->grad_rad_cx;
             rule->grad_rad_cy   = last->grad_rad_cy;
@@ -5467,17 +5486,22 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                         trim_whitespace(tok);
                         if (part == 0 && strcmp(tok, "none") != 0)
                             strncpy(rule->anim_name, tok, sizeof(rule->anim_name) - 1);
-                        else if (strchr(tok, 's') || isdigit((unsigned char)tok[0])) {
+                        else if (strcmp(tok, "ease-in-out") == 0 || strcmp(tok, "ease") == 0)
+                            rule->anim_easing = 1;
+                        else if (strcmp(tok, "ease-in") == 0) rule->anim_easing = 2;
+                        else if (strcmp(tok, "ease-out") == 0) rule->anim_easing = 3;
+                        else if (strcmp(tok, "linear") == 0) rule->anim_easing = 0;
+                        else if (strcmp(tok, "infinite") == 0) rule->anim_infinite = 1;
+                        else if (strcmp(tok, "alternate") == 0) rule->anim_alternate = 1;
+                        else if (isdigit((unsigned char)tok[0]) || tok[0] == '.' ||
+                                 tok[0] == '+' || tok[0] == '-') {
                             float sec = 0.0f;
                             if (strstr(tok, "ms")) sec = (float)atof(tok) / 1000.0f;
                             else sec = (float)atof(tok);
                             if (part == 0 && rule->anim_duration <= 0.0f) rule->anim_duration = sec;
                             else if (rule->anim_duration <= 0.0f) rule->anim_duration = sec;
                             else rule->anim_delay = sec;
-                        } else if (strstr(tok, "ease-in-out")) rule->anim_easing = 1;
-                        else if (strstr(tok, "linear")) rule->anim_easing = 0;
-                        else if (strcmp(tok, "infinite") == 0) rule->anim_infinite = 1;
-                        else if (strcmp(tok, "alternate") == 0) rule->anim_alternate = 1;
+                        }
                         part++;
                         tok = strtok(NULL, " \t,");
                     }
@@ -5978,21 +6002,23 @@ static void ingest_parsed_rule(const CSSRule *pr) {
         const CSSSelector *cs = &pr->selectors[si];
         if (cs->compound_count == 0) continue;
 
-        /* Check for pseudo-elements (::before, ::after, etc.) in last compound.
-           ::before/::after are kept with pseudo_elem set; others (scrollbar etc.) dropped. */
+        /* Check for pseudo-elements (::before, ::after, etc.) in the last
+           compound.  CSS 2 compatibility requires the legacy single-colon
+           :before/:after spellings to behave exactly like pseudo-elements. */
         int pseudo_elem_type = 0; /* 0=none 1=before 2=after */
         {
             const CSSCompound *tgt = &cs->compounds[cs->compound_count - 1];
             for (int pi = 0; pi < tgt->part_count; pi++) {
-                if (tgt->parts[pi].type == CSS_SEL_PSEUDO_ELEM) {
+                if (tgt->parts[pi].type == CSS_SEL_PSEUDO_ELEM ||
+                    tgt->parts[pi].type == CSS_SEL_PSEUDO_CLASS) {
                     const char* pname = tgt->parts[pi].name;
                     if (strcmp(pname, "before") == 0 || strcmp(pname, "::before") == 0)
                         pseudo_elem_type = 1;
                     else if (strcmp(pname, "after") == 0 || strcmp(pname, "::after") == 0)
                         pseudo_elem_type = 2;
-                    else
+                    else if (tgt->parts[pi].type == CSS_SEL_PSEUDO_ELEM)
                         pseudo_elem_type = -1; /* unsupported pseudo-elem — drop */
-                    break;
+                    if (pseudo_elem_type != 0) break;
                 }
             }
             if (pseudo_elem_type == -1) continue; /* drop unsupported pseudo-elements */
@@ -6112,13 +6138,16 @@ static void ingest_keyframes_from_sheet(const CSSStyleSheet* sheet) {
         snprintf(kf.name, sizeof(kf.name), "%s", name);
         for (int ri = 0; ri < at->nested_rule_count && kf.stop_count < MAX_KF_STOPS; ri++) {
             const CSSRule* kr = &at->nested_rules[ri];
-            if (kr->selector_count == 0 || kr->selectors[0].compound_count == 0) continue;
-            const CSSCompound* cmp = &kr->selectors[0].compounds[0];
-            if (cmp->part_count == 0) continue;
-            KeyframeStop stop;
-            keyframe_stop_from_rule(kr, &stop);
-            stop.position = parse_keyframe_stop_pos(cmp->parts[0].name);
-            kf.stops[kf.stop_count++] = stop;
+            if (kr->selector_count == 0) continue;
+            KeyframeStop values;
+            keyframe_stop_from_rule(kr, &values);
+            for (int si = 0; si < kr->selector_count && kf.stop_count < MAX_KF_STOPS; si++) {
+                const CSSSelector* sel = &kr->selectors[si];
+                if (sel->compound_count == 0 || sel->compounds[0].part_count == 0) continue;
+                KeyframeStop stop = values;
+                stop.position = parse_keyframe_stop_pos(sel->compounds[0].parts[0].name);
+                kf.stops[kf.stop_count++] = stop;
+            }
         }
         if (kf.stop_count > 0) {
             /* Sort stops and insert implicit 0% keyframe when only `to` is defined */
@@ -6257,7 +6286,7 @@ void update_element_style(LunaElement* e) {
     double prev_anim_start_time = e->anim_start_time;
 
     g_probe_prepared = 0;
-    if (!e->has_custom_bg)     { e->r = 0.0f; e->g = 0.0f; e->b = 0.0f; e->a = 0.0f; e->has_gradient = 0; e->has_bg_image = 0; e->bg_image_path[0] = '\0'; e->bg_image_tex = 0; }
+    if (!e->has_custom_bg)     { e->r = 0.0f; e->g = 0.0f; e->b = 0.0f; e->a = 0.0f; e->has_gradient = 0; e->grad_stop_px_mask = 0; e->has_bg_image = 0; e->bg_image_path[0] = '\0'; e->bg_image_tex = 0; }
     if (!e->has_custom_color)  { e->t_r = 0.1f; e->t_g = 0.1f; e->t_b = 0.1f; e->t_a = 1.0f; }
     e->has_caret_color = 0;
     if (!e->has_custom_border) { e->border_width = 0; e->bd_r = 0; e->bd_g = 0; e->bd_b = 0; e->bd_a = 0; }
@@ -6493,6 +6522,7 @@ void update_element_style(LunaElement* e) {
                 e->has_gradient = 1;
                 e->grad_type = r->grad_type;
                 e->grad_stop_count = r->grad_stop_count;
+                e->grad_stop_px_mask = r->grad_stop_px_mask;
                 e->grad_angle = r->grad_angle;
                 e->grad_rad_cx = r->grad_rad_cx;
                 e->grad_rad_cy = r->grad_rad_cy;
@@ -10174,7 +10204,8 @@ static int find_rounded_clip_ancestor(int idx) {
     while (p != -1) {
         LunaElement* par = &elements[p];
         if (par->border_radius > 0.0f &&
-            (overflow_clips(par->overflow_x) || overflow_clips(par->overflow_y)))
+            (overflow_clips(par->overflow_x) || overflow_clips(par->overflow_y)) &&
+            !(par->parent_idx == -1 && strcmp(par->type, "body") == 0))
             return p;
         p = par->parent_idx;
     }
@@ -10260,10 +10291,13 @@ static void rc_fill_slow(int i) {
         float ptx, pty;
         accum_ancestor_transform(p, &ptx, &pty);
         ptx += par->cur_tx; pty += par->cur_ty;
-        float pw = par->w - par->border_width * 2.0f - par->pad_l - par->pad_r;
-        float ph = par->h - par->border_width * 2.0f - par->pad_t - par->pad_b;
-        float px = par->x + par->border_width + par->pad_l;
-        float py = par->y + par->border_width + par->pad_t;
+        int viewport_body = par->parent_idx == -1 && strcmp(par->type, "body") == 0;
+        float pw = viewport_body ? window_width :
+            par->w - par->border_width * 2.0f - par->pad_l - par->pad_r;
+        float ph = viewport_body ? window_height :
+            par->h - par->border_width * 2.0f - par->pad_t - par->pad_b;
+        float px = viewport_body ? 0.0f : par->x + par->border_width + par->pad_l;
+        float py = viewport_body ? 0.0f : par->y + par->border_width + par->pad_t;
         int cx_on = overflow_clips(par->overflow_x);
         int cy_on = overflow_clips(par->overflow_y);
         c->clipped = 1;
@@ -10306,17 +10340,21 @@ static void rc_build(void) {
         c->in_root = (unsigned char)(g_render_root < 0 || i == g_render_root || pc->in_root);
         int cx_on = overflow_clips(par->overflow_x);
         int cy_on = overflow_clips(par->overflow_y);
-        c->clip_anc = (par->border_radius > 0.0f && (cx_on || cy_on)) ? p : pc->clip_anc;
+        int viewport_body = par->parent_idx == -1 && strcmp(par->type, "body") == 0;
+        c->clip_anc = (!viewport_body && par->border_radius > 0.0f && (cx_on || cy_on))
+            ? p : pc->clip_anc;
         c->clipped  = pc->clipped;
         c->cx = pc->cx; c->cy = pc->cy; c->cw = pc->cw; c->ch = pc->ch;
         c->lx = pc->lx; c->ly = pc->ly; c->lw = pc->lw; c->lh = pc->lh;
         if (cx_on || cy_on) {
             /* c->anc_tx already includes par->cur_tx, which is exactly the
              * transform that moves the parent's own padding box. */
-            float pw = par->w - par->border_width * 2.0f - par->pad_l - par->pad_r;
-            float ph = par->h - par->border_width * 2.0f - par->pad_t - par->pad_b;
-            float px = par->x + par->border_width + par->pad_l;
-            float py = par->y + par->border_width + par->pad_t;
+            float pw = viewport_body ? window_width :
+                par->w - par->border_width * 2.0f - par->pad_l - par->pad_r;
+            float ph = viewport_body ? window_height :
+                par->h - par->border_width * 2.0f - par->pad_t - par->pad_b;
+            float px = viewport_body ? 0.0f : par->x + par->border_width + par->pad_l;
+            float py = viewport_body ? 0.0f : par->y + par->border_width + par->pad_t;
             c->clipped = 1;
             rc_rect_isect(&c->cx, &c->cy, &c->cw, &c->ch,
                           cx_on ? px + c->anc_tx : -LUNA_RC_INF,
@@ -10778,6 +10816,8 @@ int luna_css_anim_running_under(int root_idx) {
 
 static float css_anim_ease(int easing, float t) {
     if (easing == 1) return t * t * (3.0f - 2.0f * t);
+    if (easing == 2) return t * t * t;
+    if (easing == 3) { float u = 1.0f - t; return 1.0f - u * u * u; }
     return t;
 }
 
@@ -11635,6 +11675,11 @@ static void draw_bg_layer(float x, float y, float w, float h,
                 pr=layer->grad_stop_r[i]; pg=layer->grad_stop_g[i];
                 pb=layer->grad_stop_b[i]; pa=layer->grad_stop_a[i];
                 pp=layer->grad_stop_pos[i];
+                if (layer->grad_stop_px_mask & (1u << i)) {
+                    float basis = layer->grad_rad_r * (w > h ? w : h);
+                    if (basis < 0.001f) basis = (w > h ? w : h);
+                    pp /= basis;
+                }
                 pa *= eff_op;
             }
             uni4f(bg_loc.uGradColors[i], &bg_uni.uGradColors[i], pr, pg, pb, pa);
@@ -11710,6 +11755,11 @@ void draw_rect_full(float x, float y, float w, float h,
                 pr = ge->grad_stop_r[i]; pg = ge->grad_stop_g[i];
                 pb = ge->grad_stop_b[i]; pa = ge->grad_stop_a[i];
                 pp = ge->grad_stop_pos[i];
+                if (ge->grad_stop_px_mask & (1u << i)) {
+                    float basis = ge->grad_rad_r * (w > h ? w : h);
+                    if (basis < 0.001f) basis = (w > h ? w : h);
+                    pp /= basis;
+                }
             }
             uni4f(bg_loc.uGradColors[i], &bg_uni.uGradColors[i], pr, pg, pb, pa);
             uni1f(bg_loc.uGradStops[i],  &bg_uni.uGradStops[i],  pp);
@@ -13388,10 +13438,9 @@ void luna_request_screenshot(const char* p) { strncpy(g_screenshot_path, p, size
 
 void luna_inject_body_background(void) {
     if (elem_count >= MAX_ELEMENTS) return;
-    /* parse_html may already have materialized <body> as a real element.
-     * Reassert the initial-containing-block fields: update_element_style()
-     * deliberately resets layout fields and a host-side restyle must not turn
-     * overflow:hidden on body into a tiny global clip rectangle. */
+    /* A real body keeps its CSS-computed auto/percentage dimensions.  Canvas
+     * background propagation and viewport overflow clipping are paint concerns
+     * handled by luna_render()/rc_build(), not reasons to rewrite layout. */
     for (int i = 0; i < elem_count; i++) {
         if (strcmp(elements[i].type, "body") != 0) continue;
         LunaElement* body = &elements[i];
@@ -13401,11 +13450,6 @@ void luna_inject_body_background(void) {
         body->z_override_valid = 1;
         body->z_override = -9999;
         body->z_index = body->z_override;
-        body->pct_w = 1; body->raw_w = 1.0f; body->raw_w_off = 0.0f;
-        body->pct_h = 1; body->raw_h = 1.0f; body->raw_h_off = 0.0f;
-        body->x = body->y = body->rel_x = body->rel_y = 0.0f;
-        body->w = luna_window_width;
-        body->h = luna_window_height;
         g_layout_dirty = 1;
         g_render_order_dirty = 1;
         g_visual_scan_needed = 1;
@@ -13820,12 +13864,10 @@ void luna_render(int fbw, int fbh) {
         float dx, dy, dw, dh;
         rc_element_draw_bounds(i, &dx, &dy, &dw, &dh);
         /* CSS propagates the root body's background to the canvas.  Keep the
-         * body's auto-height box for flex/layout, but paint its background
-         * across the whole initial containing block.  Gradients are images
-         * and repeat by default, using the body outer box as their tile. */
+         * body's auto-height box for layout, but use the initial containing
+         * block as the propagated background's positioning/painting area. */
         int canvas_body = g_render_root < 0 && e->parent_idx == -1 &&
                           strcmp(e->type, "body") == 0;
-        float canvas_tile_h = e->h + e->margin_top + e->margin_bottom;
         if (canvas_body) {
             dx = g_render_off_x;
             dy = g_render_off_y;
@@ -13929,22 +13971,10 @@ void luna_render(int fbw, int fbh) {
                            rad4, e->border_width,
                            e->cur_bd_r, e->cur_bd_g, e->cur_bd_b, e->cur_bd_a * eff_op, NULL);
         } else {
-        if (canvas_body && e->has_gradient && canvas_tile_h > 0.5f &&
-            canvas_tile_h < dh - 0.5f) {
-            float tile_y = dy;
-            while (tile_y < dy + dh) {
-                float tile_h = canvas_tile_h;
-                if (tile_y + tile_h > dy + dh) tile_h = dy + dh - tile_y;
-                draw_rect_full(dx, tile_y, dw, tile_h,
-                               e->cur_r, e->cur_g, e->cur_b, e->cur_a * eff_op,
-                               rad4, 0.0f, 0, 0, 0, 0, e);
-                tile_y += canvas_tile_h;
-            }
-        } else {
-            draw_rect_full(dx, dy, dw, dh, e->cur_r, e->cur_g, e->cur_b, e->cur_a * eff_op,
-                           rad4, e->border_width,
-                           e->cur_bd_r, e->cur_bd_g, e->cur_bd_b, e->cur_bd_a * eff_op, e);
-        }
+        draw_rect_full(dx, dy, dw, dh, e->cur_r, e->cur_g, e->cur_b, e->cur_a * eff_op,
+                       rad4, canvas_body ? 0.0f : e->border_width,
+                       e->cur_bd_r, e->cur_bd_g, e->cur_bd_b,
+                       canvas_body ? 0.0f : e->cur_bd_a * eff_op, e);
         }
         if (e->has_shadow) {
             for (int s = 0; s < e->shadow_count; s++) {

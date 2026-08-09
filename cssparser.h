@@ -178,6 +178,25 @@ void css_resolve_vars(CSSStyleSheet *sheet);
  * ═════════════════════════════════════════════════════════════════════ */
 #ifdef CSS_PARSER_IMPLEMENTATION
 
+/* strdup() is POSIX rather than ISO C.  Keep the single-header parser usable
+ * with the documented `-std=c11` build on every supported host. */
+static char *css_strdup(const char *src) {
+    size_t len = strlen(src) + 1;
+    char *copy = (char *)malloc(len);
+    if (copy) memcpy(copy, src, len);
+    return copy;
+}
+
+static int css_strncasecmp(const char *lhs, const char *rhs, size_t count) {
+    while (count--) {
+        unsigned char a = (unsigned char)*lhs++;
+        unsigned char b = (unsigned char)*rhs++;
+        int diff = tolower(a) - tolower(b);
+        if (diff || !a || !b) return diff;
+    }
+    return 0;
+}
+
 /* ── Internal lexer ──────────────────────────────────────────────────── */
 
 typedef struct {
@@ -672,7 +691,7 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
             if (at.type == CSS_AT_CHARSET) {
                 if (lex_peek(l) == '"' || lex_peek(l) == '\'') {
                     lex_string(l, at.prelude, CSS_MAX_VALUE);
-                    if (!sheet->charset) sheet->charset = strdup(at.prelude);
+                    if (!sheet->charset) sheet->charset = css_strdup(at.prelude);
                 }
                 lex_skip_ws(l);
                 if (lex_peek(l) == ';') lex_advance(l);
@@ -753,13 +772,21 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                         char stop_sel[CSS_MAX_STR] = {0};
                         lex_until(l, stop_sel, CSS_MAX_STR, "{");
                         str_trim(stop_sel);
-                        /* store as type selector for simplicity */
-                        if (kf->selector_count < CSS_MAX_SELECTORS) {
-                            snprintf(kf->selectors[0].compounds[0].parts[0].name, CSS_MAX_STR, "%s", stop_sel);
-                            kf->selectors[0].compounds[0].parts[0].type = CSS_SEL_TYPE;
-                            kf->selectors[0].compounds[0].part_count = 1;
-                            kf->selectors[0].compound_count = 1;
-                            kf->selector_count = 1;
+                        /* A block may target several stops: `0%, 100% {...}`. */
+                        char *stop = stop_sel;
+                        while (*stop && kf->selector_count < CSS_MAX_SELECTORS) {
+                            char *comma = strchr(stop, ',');
+                            if (comma) *comma = '\0';
+                            str_trim(stop);
+                            if (*stop) {
+                                CSSSelector *sel = &kf->selectors[kf->selector_count++];
+                                snprintf(sel->compounds[0].parts[0].name, CSS_MAX_STR, "%s", stop);
+                                sel->compounds[0].parts[0].type = CSS_SEL_TYPE;
+                                sel->compounds[0].part_count = 1;
+                                sel->compound_count = 1;
+                            }
+                            if (!comma) break;
+                            stop = comma + 1;
                         }
                         lex_skip_ws(l);
                         if (lex_peek(l) == '{') parse_rule_block(l, kf, NULL);
@@ -1073,7 +1100,7 @@ CSSStyleSheet *css_parse_html(const char *html, size_t len) {
         while (tag < end) {
             if (*tag == '<') {
                 if ((end - tag) >= 7 &&
-                    (strncasecmp(tag, "<style", 6) == 0) &&
+                    (css_strncasecmp(tag, "<style", 6) == 0) &&
                     (tag[6] == '>' || tag[6] == ' ' || tag[6] == '\t' ||
                      tag[6] == '\r' || tag[6] == '\n')) break;
             }
@@ -1090,7 +1117,7 @@ CSSStyleSheet *css_parse_html(const char *html, size_t len) {
         const char *content_end = content_start;
         while (content_end < end) {
             if ((end - content_end) >= 8 &&
-                strncasecmp(content_end, "</style", 7) == 0) break;
+                css_strncasecmp(content_end, "</style", 7) == 0) break;
             content_end++;
         }
 
@@ -1119,7 +1146,7 @@ CSSStyleSheet *css_parse_html(const char *html, size_t len) {
         const char *attr = p;
         while (attr < end) {
             if ((end - attr) >= 7 &&
-                strncasecmp(attr, "style=", 6) == 0 &&
+                css_strncasecmp(attr, "style=", 6) == 0 &&
                 (attr[6] == '"' || attr[6] == '\'')) {
                 break;
             }
