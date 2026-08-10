@@ -153,6 +153,10 @@ void luna_window_theme_apply(const LunaWindowTheme* theme);
 void luna_window_bind(const LunaWindowConfig* config);
 void luna_window_unbind(void);
 void luna_window_tick(double dt);
+/* Re-paint chrome that sits above host custom drawing (dialog, toast, window
+ * menu).  Call after any on_render that paints over the Luna DOM — e.g. a
+ * virtualized editor surface — otherwise those popups appear behind it. */
+void luna_window_render_floating(int fbw, int fbh);
 void luna_window_set_title(const char* title);
 void luna_window_alert(LunaWindowDialogKind kind, const char* title,
                        const char* message);
@@ -237,8 +241,11 @@ const char* luna_file_dialog_backend_name(LunaFileDialogBackend backend);
 #include <string.h>
 
 static const char* luna_window_css_text =
-".luna-window-root{position:fixed;inset:0;display:flex;flex-direction:column;overflow:hidden;background:#f3f5f8;color:#202633;}\n"
-".luna-window-root.luna-theme-dark{background:#111722;color:#edf2f7;}\n"
+/* Surface fill is chrome-only (:not(.app)).  Applications that share the
+ * chrome root keep authorship of background/color in their own stylesheet. */
+".luna-window-root{position:fixed;inset:0;display:flex;flex-direction:column;overflow:hidden;}\n"
+".luna-window-root:not(.app){background:#f3f5f8;color:#202633;}\n"
+".luna-window-root.luna-theme-dark:not(.app){background:#111722;color:#edf2f7;}\n"
 ".luna-titlebar{height:42px;min-height:42px;display:flex;align-items:center;position:relative;padding:0 12px;border-bottom:1px solid rgba(30,41,59,.14);background:rgba(250,251,253,.96);user-select:none;}\n"
 ".luna-theme-dark .luna-titlebar{background:rgba(24,31,43,.97);border-bottom-color:rgba(148,163,184,.16);}\n"
 ".luna-titlebar-title{flex:1;text-align:center;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none;}\n"
@@ -261,7 +268,15 @@ static const char* luna_window_css_text =
 ".luna-common-dialog-title{font-size:16px;font-weight:750}.luna-common-dialog-message{line-height:1.55;white-space:pre-wrap;color:#5d6b7d}.luna-theme-dark .luna-common-dialog-message{color:#b4c0ce}\n"
 ".luna-common-dialog-input{height:36px;padding:7px 10px;border:1px solid #9fb5cf;border-radius:9px;background:white;color:#172033}.luna-theme-dark .luna-common-dialog-input{background:#111a26;color:#eef3f8;border-color:#40536b}\n"
 ".luna-common-dialog-actions{display:flex;justify-content:flex-end;gap:8px}.luna-common-button{min-width:78px;height:32px;display:flex;align-items:center;justify-content:center;border-radius:9px;background:#e6ebf1;cursor:pointer}.luna-theme-dark .luna-common-button{background:#2b394b}.luna-common-button.primary{background:#237fe5;color:white}.luna-common-button.danger{background:#d94a55;color:white}\n"
-".luna-common-toast{position:fixed;right:16px;top:54px;width:340px;max-width:calc(100% - 32px);display:flex;flex-direction:column;gap:3px;padding:13px 15px;border-radius:13px;background:rgba(24,32,45,.94);color:white;box-shadow:0 18px 48px rgba(0,0,0,.34);z-index:5200}.luna-common-toast-title{font-weight:700}.luna-common-toast-message{color:rgba(236,242,248,.82);white-space:pre-wrap;}\n";
+".luna-common-toast{position:fixed;right:16px;top:54px;width:340px;max-width:calc(100% - 32px);display:flex;flex-direction:column;gap:3px;padding:13px 15px;border-radius:13px;background:rgba(24,32,45,.94);color:white;box-shadow:0 18px 48px rgba(0,0,0,.34);z-index:5200}.luna-common-toast-title{font-weight:700}.luna-common-toast-message{color:rgba(236,242,248,.82);white-space:pre-wrap;}\n"
+".luna-window-menu{position:fixed;left:0;top:0;width:188px;display:flex;flex-direction:column;gap:1px;padding:6px;border:1px solid rgba(71,85,105,.18);border-radius:10px;background:rgba(250,252,255,.98);box-shadow:0 14px 36px rgba(15,23,42,.22);z-index:5400;color:#303641;font-size:12px;}\n"
+".luna-window-menu.hidden{display:none;}\n"
+".luna-theme-dark .luna-window-menu{background:#172130;border-color:rgba(148,163,184,.18);box-shadow:0 18px 48px rgba(0,0,0,.45);color:#d7e0ea;}\n"
+".luna-window-menu-item{height:28px;min-height:28px;display:flex;align-items:center;padding:0 10px;border-radius:6px;cursor:pointer;white-space:nowrap;}\n"
+".luna-window-menu-item:hover{background:#dbeafe;color:#145da7;}\n"
+".luna-theme-dark .luna-window-menu-item:hover{background:rgba(59,130,246,.22);color:#dbeafe;}\n"
+".luna-window-menu-sep{height:1px;margin:3px 4px;background:rgba(71,85,105,.13);}\n"
+".luna-theme-dark .luna-window-menu-sep{background:rgba(148,163,184,.16);}\n";
 
 static const char* luna_window_titlebar_html_text =
 "<header id=\"luna-titlebar\" class=\"luna-titlebar\">"
@@ -292,6 +307,12 @@ static const char* luna_window_overlay_html_text =
 "<div id=\"luna-common-toast\" class=\"luna-common-toast hidden\" onclick=\"lunaWindowToastClose()\">"
 "<div id=\"luna-common-toast-title\" class=\"luna-common-toast-title\"></div>"
 "<div id=\"luna-common-toast-message\" class=\"luna-common-toast-message\"></div>"
+"</div>"
+"<div id=\"luna-window-menu\" class=\"luna-window-menu hidden\">"
+"<div class=\"luna-window-menu-item\" onclick=\"lunaWindowMenuMinimize()\">最小化</div>"
+"<div id=\"luna-window-menu-maximize\" class=\"luna-window-menu-item\" onclick=\"lunaWindowMenuMaximize()\">最大化</div>"
+"<div class=\"luna-window-menu-sep\"></div>"
+"<div class=\"luna-window-menu-item\" onclick=\"lunaWindowMenuClose()\">閉じる</div>"
 "</div>";
 
 typedef struct LunaWindowState {
@@ -302,6 +323,7 @@ typedef struct LunaWindowState {
     int dialog_overlay, dialog_title, dialog_message, dialog_input;
     int dialog_cancel, dialog_ok;
     int toast, toast_title, toast_message;
+    int window_menu, window_menu_maximize;
     double toast_remaining;
     LunaWindowDialogCallback dialog_callback;
     void* dialog_userdata;
@@ -333,6 +355,8 @@ static void luna_window_state_reset(void) {
     luna_window_state.toast=-1;
     luna_window_state.toast_title=-1;
     luna_window_state.toast_message=-1;
+    luna_window_state.window_menu=-1;
+    luna_window_state.window_menu_maximize=-1;
 }
 
 static int luna_window_id(const char* id) { return id && id[0] ? luna_get_element_by_id(id) : -1; }
@@ -351,6 +375,57 @@ static int luna_window_notify_kind(LunaWindowDialogKind kind) {
 static void luna_window_control_close(LunaElement* e) { (void)e; luna_platform_request_close(); }
 static void luna_window_control_minimize(LunaElement* e) { (void)e; luna_platform_iconify(); }
 static void luna_window_control_maximize(LunaElement* e) { (void)e; luna_platform_maximize_toggle(); }
+
+static void luna_window_menu_hide(void) {
+    if (luna_window_state.window_menu < 0) return;
+    luna_add_class(luna_window_state.window_menu, "hidden");
+    luna_mark_layout_dirty();
+    luna_platform_request_redraw();
+}
+
+static void luna_window_menu_show_at(double mx, double my) {
+    LunaElement* e;
+    float menu_w = 188.0f, menu_h = 104.0f;
+    float x, y, ww, hh;
+    if (luna_window_state.window_menu < 0) return;
+    e = luna_element_at(luna_window_state.window_menu);
+    if (!e) return;
+    if (e->w > 1.0f) menu_w = e->w;
+    if (e->h > 1.0f) menu_h = e->h;
+    ww = luna_window_width > 1.0f ? luna_window_width : 800.0f;
+    hh = luna_window_height > 1.0f ? luna_window_height : 600.0f;
+    x = (float)mx;
+    y = (float)my;
+    if (x + menu_w > ww - 4.0f) x = ww - menu_w - 4.0f;
+    if (y + menu_h > hh - 4.0f) y = hh - menu_h - 4.0f;
+    if (x < 4.0f) x = 4.0f;
+    if (y < 4.0f) y = 4.0f;
+    snprintf(e->inline_style, sizeof(e->inline_style), "left:%.0fpx;top:%.0fpx;", x, y);
+    e->has_inline_style = 1;
+    luna_update_element_style(luna_window_state.window_menu);
+    if (luna_window_state.window_menu_maximize >= 0)
+        luna_set_text(luna_window_state.window_menu_maximize, "最大化");
+    luna_remove_class(luna_window_state.window_menu, "hidden");
+    luna_consume_pointer_event();
+    luna_mark_layout_dirty();
+    luna_platform_request_redraw();
+}
+
+static void luna_window_menu_minimize(LunaElement* e) {
+    (void)e;
+    luna_window_menu_hide();
+    luna_platform_iconify();
+}
+static void luna_window_menu_maximize(LunaElement* e) {
+    (void)e;
+    luna_window_menu_hide();
+    luna_platform_maximize_toggle();
+}
+static void luna_window_menu_close(LunaElement* e) {
+    (void)e;
+    luna_window_menu_hide();
+    luna_platform_request_close();
+}
 
 static void luna_window_dialog_finish(LunaWindowDialogResult result) {
     char input_copy[512] = {0};
@@ -374,12 +449,67 @@ static void luna_window_dialog_ok_handler(LunaElement* e) { (void)e; luna_window
 static void luna_window_dialog_cancel_handler(LunaElement* e) { (void)e; luna_window_dialog_finish(LUNA_WINDOW_RESULT_CANCEL); }
 static void luna_window_toast_close_handler(LunaElement* e) { (void)e; if (luna_window_state.toast >= 0) luna_add_class(luna_window_state.toast, "hidden"); luna_window_state.toast_remaining = 0; luna_platform_request_redraw(); }
 
+static int luna_window_hit_is_interactive(int hit) {
+    LunaElement* e;
+    if (hit < 0) return 0;
+    e = luna_element_at(hit);
+    if (!e) return 0;
+    if (e->on_click || e->is_input) return 1;
+    if (!strcmp(e->type, "button") || !strcmp(e->type, "a") ||
+        !strcmp(e->type, "input") || !strcmp(e->type, "textarea") ||
+        !strcmp(e->type, "select")) return 1;
+    return 0;
+}
+
 static void luna_window_press_hook(int hit, int button, int mods) {
     (void)mods;
-    if (button != LUNA_MOUSE_BUTTON_LEFT || hit < 0) return;
+    /* Dismiss the local window menu on any outside press. */
+    if (luna_window_state.window_menu >= 0) {
+        LunaElement* menu = luna_element_at(luna_window_state.window_menu);
+        if (menu && !element_has_class(menu, "hidden")) {
+            if (!luna_window_is_descendant(hit, luna_window_state.window_menu)) {
+                luna_window_menu_hide();
+                if (!(button == LUNA_MOUSE_BUTTON_RIGHT &&
+                      luna_window_is_descendant(hit, luna_window_state.titlebar))) {
+                    return;
+                }
+                /* Else fall through and reopen at the new point. */
+            } else if (button == LUNA_MOUSE_BUTTON_LEFT) {
+                /* Let menu item on_click run on release. */
+                return;
+            }
+        }
+    }
+    if (hit < 0) return;
+    if (button == LUNA_MOUSE_BUTTON_RIGHT) {
+        /* Titlebar right-click → Luna shell menu, else in-app fallback (LXDE/X11). */
+        if (!luna_window_is_descendant(hit, luna_window_state.titlebar)) return;
+        if (luna_window_is_descendant(hit, luna_window_state.close_btn) ||
+            luna_window_is_descendant(hit, luna_window_state.min_btn) ||
+            luna_window_is_descendant(hit, luna_window_state.max_btn)) return;
+        {
+            double mx = 0.0, my = 0.0;
+            luna_get_pointer(&mx, &my);
+            /* luna_linux_show_window_menu lives in luna_linux.h; custom hosts
+             * that set LUNA_UI_NO_PLATFORM (e.g. luna-shell) skip it and use
+             * the in-app fallback menu below. */
+#if (defined(__linux__) || defined(__FreeBSD__)) && !defined(LUNA_UI_NO_PLATFORM)
+            if (luna_linux_show_window_menu((int)mx, (int)my)) {
+                luna_consume_pointer_event();
+                return;
+            }
+#endif
+            luna_window_menu_show_at(mx, my);
+        }
+        return;
+    }
+    if (button != LUNA_MOUSE_BUTTON_LEFT) return;
     if (luna_window_is_descendant(hit, luna_window_state.close_btn) ||
         luna_window_is_descendant(hit, luna_window_state.min_btn) ||
         luna_window_is_descendant(hit, luna_window_state.max_btn)) return;
+    /* Toolbar titlebars host Open/Save buttons.  Starting a compositor move
+     * grab on those hits steals the click and makes Open appear broken. */
+    if (luna_window_hit_is_interactive(hit)) return;
     if (luna_window_is_descendant(hit, luna_window_state.titlebar)) {
         luna_platform_begin_move();
         return;
@@ -581,8 +711,14 @@ void luna_window_theme_apply(const LunaWindowTheme* theme) {
     luna_window_color(titlebar,sizeof(titlebar),theme->titlebar_active);
     luna_window_color(titlebar_inactive,sizeof(titlebar_inactive),theme->titlebar_inactive);
     luna_window_color(frame,sizeof(frame),theme->titlebar_frame);
+    /* Root fill/text must not clobber application stylesheets.  Apps that share
+     * the chrome root (class="app luna-window-root") author their own
+     * background/color; theme_apply runs after those sheets and would otherwise
+     * flatten gradients or wipe transparency.  Restrict the surface fill to
+     * chrome-only roots via :not(.app).  Titlebar/dialog/control tokens still
+     * apply under either root shape. */
     snprintf(css,sizeof(css),
-        ".luna-window-root{background:%s;color:%s;}"
+        ".luna-window-root:not(.app){background:%s;color:%s;}"
         ".luna-window-root .luna-titlebar{height:%.1fpx;min-height:%.1fpx;background:%s;border-bottom-color:%s;}"
         ".luna-window-root.luna-window-inactive .luna-titlebar{background:%s;}"
         ".luna-window-root .luna-window-control{width:%.1fpx;height:%.1fpx;}"
@@ -639,9 +775,14 @@ void luna_window_bind(const LunaWindowConfig* config) {
     luna_window_state.toast=luna_window_id("luna-common-toast");
     luna_window_state.toast_title=luna_window_id("luna-common-toast-title");
     luna_window_state.toast_message=luna_window_id("luna-common-toast-message");
+    luna_window_state.window_menu=luna_window_id("luna-window-menu");
+    luna_window_state.window_menu_maximize=luna_window_id("luna-window-menu-maximize");
     luna_register_js_handler("lunaWindowClose",luna_window_control_close);
     luna_register_js_handler("lunaWindowMinimize",luna_window_control_minimize);
     luna_register_js_handler("lunaWindowMaximize",luna_window_control_maximize);
+    luna_register_js_handler("lunaWindowMenuMinimize",luna_window_menu_minimize);
+    luna_register_js_handler("lunaWindowMenuMaximize",luna_window_menu_maximize);
+    luna_register_js_handler("lunaWindowMenuClose",luna_window_menu_close);
     luna_register_js_handler("lunaWindowDialogOk",luna_window_dialog_ok_handler);
     luna_register_js_handler("lunaWindowDialogCancel",luna_window_dialog_cancel_handler);
     luna_register_js_handler("lunaWindowToastClose",luna_window_toast_close_handler);
@@ -662,6 +803,22 @@ void luna_window_bind(const LunaWindowConfig* config) {
         (void)luna_window_system_theme_path(luna_window_state.system_theme_path,sizeof(luna_window_state.system_theme_path));
 }
 void luna_window_unbind(void) { luna_set_mouse_press_hook(NULL); luna_window_state_reset(); }
+void luna_window_render_floating(int fbw, int fbh) {
+    float ww, hh;
+    if (!luna_window_state.bound || fbw <= 0 || fbh <= 0) return;
+    ww = luna_window_width > 1.0f ? luna_window_width : (float)fbw;
+    hh = luna_window_height > 1.0f ? luna_window_height : (float)fbh;
+    /* Paint in CSS z-index order: dialog (5000) < toast (5200) < menu (5400). */
+    if (luna_window_state.dialog_overlay >= 0 &&
+        luna_element_visible(luna_window_state.dialog_overlay))
+        luna_render_region(luna_window_state.dialog_overlay, fbw, fbh, 0, 0, ww, hh);
+    if (luna_window_state.toast >= 0 &&
+        luna_element_visible(luna_window_state.toast))
+        luna_render_region(luna_window_state.toast, fbw, fbh, 0, 0, ww, hh);
+    if (luna_window_state.window_menu >= 0 &&
+        luna_element_visible(luna_window_state.window_menu))
+        luna_render_region(luna_window_state.window_menu, fbw, fbh, 0, 0, ww, hh);
+}
 void luna_window_tick(double dt) {
     if(!luna_window_state.bound)return;
     if (dt < 0) dt = 0;
@@ -1040,12 +1197,14 @@ int luna_file_dialog_show(const LunaFileDialogConfig* config,
 #define MAX_HISTORY      64
 #define MAX_SEARCH      256
 #define MAX_OPEN_APPS     24
+#define MAX_VOLUMES       16
 #define TOAST_SECONDS   2.8
 #define MIN_WINDOW_W     400
 #define MIN_WINDOW_H     400
 #define DEFAULT_WINDOW_W 700
 #define DEFAULT_WINDOW_H 460
 #define MODAL_INFO_PARTS 28
+#define VOLUME_REFRESH_SEC 2.5
 
 typedef enum {
     SORT_NAME = 0,
@@ -1063,6 +1222,18 @@ typedef struct {
     int is_link;
     int selected;
 } FileEntry;
+
+typedef struct {
+    char name[256];
+    char device[PATH_MAX];
+    char mount_path[PATH_MAX];
+    char uuid[128];
+    int can_mount;
+    int can_unmount;
+    int can_eject;
+    int is_mounted;
+    int is_removable;
+} VolumeEntry;
 
 typedef struct {
     GLFWwindow *window;
@@ -1132,6 +1303,19 @@ typedef struct {
     char open_app_names[MAX_OPEN_APPS][256];
     char open_app_files[MAX_OPEN_APPS][PATH_MAX];
 
+    VolumeEntry volumes[MAX_VOLUMES];
+    int volume_count;
+    int volume_context;
+    double volumes_next_refresh;
+
+    /* XDG .desktop entry editor (create or edit). */
+    int desktop_edit_open;
+    int desktop_edit_create; /* 1 = new launcher in cwd, 0 = edit existing */
+    char desktop_edit_path[PATH_MAX];
+    char desktop_edit_type[32]; /* Application | Link | Directory */
+    int desktop_edit_terminal;
+    char desktop_edit_extra[4096]; /* preserved unknown Desktop Entry keys / other sections */
+
     int modal_kind; /* 0 none, 1 new folder, 2 rename, 3 properties, 4 XDG app, 5 terminal, 6 font, 7 permanent delete */
     int modal_return_settings;
     int modal_target;
@@ -1157,6 +1341,23 @@ typedef struct {
     int id_open_with;
     int id_open_with_info;
     int id_open_app_list;
+    int id_side_devices_label;
+    int id_volume_context;
+    int id_desktop_edit;
+    int id_desktop_edit_title;
+    int id_desktop_edit_hint;
+    int id_desktop_edit_type;
+    int id_desktop_edit_name;
+    int id_desktop_edit_comment;
+    int id_desktop_edit_exec_label;
+    int id_desktop_edit_exec;
+    int id_desktop_edit_icon;
+    int id_desktop_edit_workdir_row;
+    int id_desktop_edit_workdir;
+    int id_desktop_edit_terminal_row;
+    int id_desktop_edit_terminal;
+    int id_desktop_edit_filename_row;
+    int id_desktop_edit_filename;
     int id_toast;
     int id_btn_back;
     int id_btn_forward;
@@ -1214,6 +1415,19 @@ static void refresh_sidebar_visibility(void);
 static void save_settings(void);
 static void show_toast(const char *fmt, ...);
 static void open_settings_dialog(void);
+static void hide_context(void);
+static void close_open_with_dialog(void);
+static void close_modal(void);
+static int load_directory(const char *path);
+static void request_overlay_layout(void);
+static void refresh_volumes(int force);
+static void render_volumes(void);
+static void navigate(const char *path, int add_history);
+static void hide_volume_context(void);
+static int program_exists(const char *name);
+static int pipe_read_program(const char *prog, char *const argv[], char *out, size_t cap);
+static void trim_text(char *s);
+static int run_program_wait(const char *prog, char *const argv[]);
 
 static const char *UI_CSS =
 "* { box-sizing: border-box; }\n"
@@ -1238,8 +1452,13 @@ static const char *UI_CSS =
 ".side-item { height:29px; display:flex; align-items:center; padding:5px 8px; border-radius:7px; cursor:pointer; color:#344256; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n"
 ".side-item:hover { background:rgba(255,255,255,.74); }\n"
 ".side-item.missing { display:none; }\n"
+".side-item.hidden { display:none; }\n"
 ".sidebar.hidden,.search.hidden { display:none; }\n"
 ".side-item.active { background:#d9eaff; color:#135eaf; font-weight:700; }\n"
+".side-item.volume-unmounted { opacity:.78; font-style:italic; }\n"
+".side-label.hidden { display:none; }\n"
+".volume-context { position:fixed; right:12px; top:120px; width:240px; display:flex; flex-direction:column; gap:1px; padding:6px; border:1px solid rgba(71,85,105,.16); border-radius:11px; background:rgba(250,252,255,.96); box-shadow:0 16px 44px rgba(15,23,42,.23); z-index:85; }\n"
+".volume-context.hidden { display:none; }\n"
 ".main { flex:1 1 0; min-width:0; min-height:0; display:flex; flex-direction:column; background:rgba(255,255,255,.58); overflow:hidden; }\n"
 ".subbar { height:32px; min-height:32px; flex:0 0 32px; display:flex; align-items:center; gap:6px; padding:3px 10px; color:#64748b; border-bottom:1px solid rgba(71,85,105,.08); }\n"
 ".folder-title { flex:1; font-size:12px; font-weight:700; color:#334155; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n"
@@ -1262,6 +1481,7 @@ static const char *UI_CSS =
 ".grid-item.type-video .file-icon { color:#8b5fd7; background:linear-gradient(145deg,#efe7ff,#ded0ff); }\n"
 ".grid-item.type-code .file-icon { color:#3b8f77; background:linear-gradient(145deg,#e2f8f0,#ccefe3); }\n"
 ".grid-item.type-archive .file-icon { color:#9a7040; background:linear-gradient(145deg,#f5ecdf,#ead9c2); }\n"
+".grid-item.type-desktop .file-icon { color:#2f7d56; background:linear-gradient(145deg,#e5f7ee,#cfeedd); }\n"
 ".list-item .file-icon { width:26px; height:26px; display:flex; align-items:center; justify-content:center; border-radius:7px; background:#e8f2ff; color:#4a82c5; font-size:15px; }\n"
 ".list-item.type-folder .file-icon { background:#fff0b3; color:#bf8420; }\n"
 ".file-name { width:100%; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n"
@@ -1296,6 +1516,16 @@ static const char *UI_CSS =
 ".app-choice:hover { background:#dbeafe; color:#145da7; border-color:rgba(54,152,255,.25); }\n"
 ".app-choice.hidden { display:none; }\n"
 ".modal-input { height:34px; padding:6px 9px; border:1px solid #9eb9d7; border-radius:8px; background:white; caret-color:#1684ff; }\n"
+".desktop-edit-modal { width:94%; max-width:540px; max-height:92%; gap:8px; }\n"
+".desktop-edit-hint { color:#617085; font-size:11px; line-height:1.4; white-space:pre-line; }\n"
+".desktop-edit-form { display:flex; flex-direction:column; gap:7px; min-height:0; overflow-y:auto; padding:2px 1px 4px; scrollbar-width:thin; }\n"
+".desktop-edit-row { display:flex; flex-direction:column; gap:3px; }\n"
+".desktop-edit-row.hidden { display:none; }\n"
+".desktop-edit-label { color:#4b5b70; font-size:11px; font-weight:700; }\n"
+".desktop-edit-input { height:32px; padding:5px 8px; border:1px solid #9eb9d7; border-radius:8px; background:white; caret-color:#1684ff; }\n"
+".desktop-edit-toggle { height:32px; min-height:32px; display:flex; align-items:center; justify-content:space-between; padding:5px 10px; border:1px solid rgba(100,116,139,.18); border-radius:8px; background:rgba(255,255,255,.78); cursor:pointer; color:#334155; font-size:12px; }\n"
+".desktop-edit-toggle:hover { background:#dbeafe; color:#145da7; }\n"
+".desktop-edit-toggle.on { border-color:rgba(54,152,255,.35); background:#eef6ff; }\n"
 ".modal-actions { display:flex; justify-content:flex-end; gap:6px; }\n"
 ".button { min-width:72px; height:30px; display:flex; align-items:center; justify-content:center; padding:5px 10px; border-radius:8px; background:#e6ebf1; cursor:pointer; }\n"
 ".button:hover { filter:brightness(1.04); }\n"
@@ -1412,7 +1642,11 @@ static const char *UI_CSS =
 ".app.theme-dark .navgroup,.app.theme-dark .viewgroup { background:rgba(148,163,184,.10); }\n"
 ".app.theme-dark .tool { color:#c8d2df; }\n"
 ".app.theme-dark .tool:hover { background:rgba(51,65,85,.92); box-shadow:0 1px 5px rgba(0,0,0,.22); }\n"
-".app.theme-dark .location,.app.theme-dark .search,.app.theme-dark .modal-input { background:#182231; color:#eef3f8; border-color:rgba(148,163,184,.22); }\n"
+".app.theme-dark .location,.app.theme-dark .search,.app.theme-dark .modal-input,.app.theme-dark .desktop-edit-input { background:#182231; color:#eef3f8; border-color:rgba(148,163,184,.22); }\n"
+".app.theme-dark .desktop-edit-hint,.app.theme-dark .desktop-edit-label { color:#8997aa; }\n"
+".app.theme-dark .desktop-edit-toggle { background:#1d2a3a; border-color:rgba(148,163,184,.14); color:#d7e0ea; }\n"
+".app.theme-dark .desktop-edit-toggle:hover { background:#29415d; color:#c9e3ff; }\n"
+".app.theme-dark .desktop-edit-toggle.on { background:#24364c; border-color:rgba(125,178,255,.35); }\n"
 ".app.theme-dark .sidebar { background:rgba(18,27,39,.94); border-right-color:rgba(148,163,184,.13); }\n"
 ".app.theme-dark .side-label,.app.theme-dark .hint,.app.theme-dark .file-meta,.app.theme-dark .settings-note,.app.theme-dark .settings-shortcut { color:#8997aa; }\n"
 ".app.theme-dark .side-item { color:#cbd5e1; }\n"
@@ -1426,7 +1660,7 @@ static const char *UI_CSS =
 ".app.theme-dark .list-item .file-icon { background:#22344a; }\n"
 ".app.theme-dark .list-item.type-folder .file-icon { background:#463a20; }\n"
 ".app.theme-dark .status { background:rgba(20,28,39,.96); color:#8fa0b5; border-top-color:rgba(148,163,184,.11); }\n"
-".app.theme-dark .context,.app.theme-dark .modal,.app.theme-dark .settings-panel { background:#172130; border-color:rgba(148,163,184,.18); box-shadow:0 22px 60px rgba(0,0,0,.45); }\n"
+".app.theme-dark .context,.app.theme-dark .volume-context,.app.theme-dark .modal,.app.theme-dark .settings-panel { background:#172130; border-color:rgba(148,163,184,.18); box-shadow:0 22px 60px rgba(0,0,0,.45); }\n"
 ".app.theme-dark .menu-item { color:#d7e0ea; }\n"
 ".app.theme-dark .menu-item:hover,.app.theme-dark .settings-row:hover { background:#24364c; }\n"
 ".app.theme-dark .app-choice { background:#1d2a3a; color:#d7e0ea; border-color:rgba(148,163,184,.14); }\n"
@@ -1646,6 +1880,7 @@ static const char *type_class(const FileEntry *f) {
         !strcasecmp(ext,"py") || !strcasecmp(ext,"js") || !strcasecmp(ext,"ts") ||
         !strcasecmp(ext,"html") || !strcasecmp(ext,"css") || !strcasecmp(ext,"json") ||
         !strcasecmp(ext,"md") || !strcasecmp(ext,"sh")) return "type-code";
+    if (!strcasecmp(ext,"desktop")) return "type-desktop";
     return "type-file";
 }
 
@@ -1657,6 +1892,7 @@ static const char *type_icon(const FileEntry *f) {
     if (!strcmp(t,"type-video")) return "▶";
     if (!strcmp(t,"type-archive")) return "▤";
     if (!strcmp(t,"type-code")) return "⌘";
+    if (!strcmp(t,"type-desktop")) return "☆";
     return "◇";
 }
 
@@ -1818,7 +2054,330 @@ static void refresh_sidebar_visibility(void) {
     }
     if(g.show_sidebar)luna_remove_class(g.id_sidebar,"hidden"); else luna_add_class(g.id_sidebar,"hidden");
     if(g.show_search)luna_remove_class(g.id_search,"hidden"); else luna_add_class(g.id_search,"hidden");
+    refresh_volumes(0);
     request_redraw();
+}
+
+static int hex_nibble(char c) {
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='a'&&c<='f')return c-'a'+10;
+    if(c>='A'&&c<='F')return c-'A'+10;
+    return -1;
+}
+
+static void file_uri_to_path(const char *uri, char *out, size_t cap) {
+    const char *p=uri?uri:"";
+    size_t w=0;
+    if(!strncmp(p,"file://",7))p+=7;
+    while(*p&&w+1<cap){
+        if(*p=='%'&&hex_nibble(p[1])>=0&&hex_nibble(p[2])>=0){
+            out[w++]=(char)((hex_nibble(p[1])<<4)|hex_nibble(p[2]));
+            p+=3;
+        }else out[w++]=*p++;
+    }
+    out[w]=0;
+}
+
+static int volume_path_is_under(const char *cwd, const char *mount) {
+    size_t n;
+    if(!cwd||!mount||!*mount)return 0;
+    n=strlen(mount);
+    if(strcmp(cwd,mount)==0)return 1;
+    return strncmp(cwd,mount,n)==0 && cwd[n]=='/';
+}
+
+static int add_volume_entry(const char *name, const char *device, const char *mount,
+                            const char *uuid, int can_mount, int can_unmount, int can_eject,
+                            int is_removable) {
+    VolumeEntry *v;
+    if(g.volume_count>=MAX_VOLUMES)return 0;
+    if((!name||!*name)&&(!device||!*device)&&(!mount||!*mount))return 0;
+    /* Deduplicate by device or mount path. */
+    for(int i=0;i<g.volume_count;i++){
+        if(device&&*device&&g.volumes[i].device[0]&&!strcmp(g.volumes[i].device,device)){
+            v=&g.volumes[i];
+            if(name&&*name)safe_copy(v->name,sizeof(v->name),name);
+            if(mount&&*mount){safe_copy(v->mount_path,sizeof(v->mount_path),mount);v->is_mounted=1;v->can_unmount=can_unmount||v->can_unmount;v->can_mount=0;}
+            if(uuid&&*uuid)safe_copy(v->uuid,sizeof(v->uuid),uuid);
+            v->can_eject=can_eject||v->can_eject;
+            v->is_removable=is_removable||v->is_removable;
+            return 1;
+        }
+        if(mount&&*mount&&g.volumes[i].mount_path[0]&&!strcmp(g.volumes[i].mount_path,mount)){
+            v=&g.volumes[i];
+            if(name&&*name)safe_copy(v->name,sizeof(v->name),name);
+            if(device&&*device)safe_copy(v->device,sizeof(v->device),device);
+            v->is_mounted=1;v->can_unmount=1;v->can_mount=0;
+            v->can_eject=can_eject||v->can_eject;
+            return 1;
+        }
+    }
+    v=&g.volumes[g.volume_count++];
+    memset(v,0,sizeof(*v));
+    if(name&&*name)safe_copy(v->name,sizeof(v->name),name);
+    else if(device&&*device)safe_copy(v->name,sizeof(v->name),base_name(device));
+    else safe_copy(v->name,sizeof(v->name),"ボリューム");
+    if(device)safe_copy(v->device,sizeof(v->device),device);
+    if(mount&&*mount){safe_copy(v->mount_path,sizeof(v->mount_path),mount);v->is_mounted=1;}
+    if(uuid)safe_copy(v->uuid,sizeof(v->uuid),uuid);
+    v->can_mount=can_mount && !v->is_mounted;
+    v->can_unmount=can_unmount || v->is_mounted;
+    v->can_eject=can_eject;
+    v->is_removable=is_removable;
+    return 1;
+}
+
+static void collect_volumes_from_gio(void) {
+    char output[131072];
+    char *argv[]={"gio","mount","-l","-i",NULL};
+    char cur_name[256]="",cur_device[PATH_MAX]="",cur_uuid[128]="",cur_mount[PATH_MAX]="";
+    int in_volume=0,can_mount=0,can_eject=0,can_unmount=0,drive_removable=0;
+    char *line,*save=NULL;
+    if(!program_exists("gio"))return;
+    if(!pipe_read_program("gio",argv,output,sizeof(output)))return;
+    for(line=strtok_r(output,"\n",&save);line;line=strtok_r(NULL,"\n",&save)){
+        char *p=line;
+        while(*p==' '||*p=='\t')p++;
+        if(!strncmp(p,"Drive(",6)){
+            if(in_volume)
+                add_volume_entry(cur_name,cur_device,cur_mount,cur_uuid,can_mount,can_unmount,can_eject,drive_removable);
+            in_volume=0;cur_name[0]=cur_device[0]=cur_uuid[0]=cur_mount[0]=0;
+            can_mount=can_eject=can_unmount=0;drive_removable=0;
+            continue;
+        }
+        if(!strncmp(p,"is_removable=",13)){drive_removable=atoi(p+13)!=0;continue;}
+        if(!strncmp(p,"Volume(",7)){
+            if(in_volume)
+                add_volume_entry(cur_name,cur_device,cur_mount,cur_uuid,can_mount,can_unmount,can_eject,drive_removable);
+            in_volume=1;cur_name[0]=cur_device[0]=cur_uuid[0]=cur_mount[0]=0;
+            can_mount=can_eject=can_unmount=0;
+            {
+                const char *colon=strchr(p,':');
+                if(colon){safe_copy(cur_name,sizeof(cur_name),colon+1);trim_text(cur_name);}
+            }
+            continue;
+        }
+        if(!in_volume)continue;
+        if(!strncmp(p,"unix-device: '",13)){
+            const char *s=p+13;const char *e=strchr(s,'\'');
+            size_t n=e?(size_t)(e-s):strlen(s);
+            if(n>=sizeof(cur_device))n=sizeof(cur_device)-1;
+            memcpy(cur_device,s,n);cur_device[n]=0;
+            continue;
+        }
+        if(!strncmp(p,"uuid=",5)&&!cur_uuid[0]){safe_copy(cur_uuid,sizeof(cur_uuid),p+5);trim_text(cur_uuid);continue;}
+        if(!strncmp(p,"can_mount=",10)){can_mount=atoi(p+10)!=0;continue;}
+        if(!strncmp(p,"can_eject=",10)){can_eject=atoi(p+10)!=0;continue;}
+        if(!strncmp(p,"can_unmount=",12)){can_unmount=atoi(p+12)!=0;continue;}
+        if(!strncmp(p,"Mount(",6)){
+            const char *arrow=strstr(p,"->");
+            if(arrow){
+                char uri[PATH_MAX];
+                safe_copy(uri,sizeof(uri),arrow+2);trim_text(uri);
+                file_uri_to_path(uri,cur_mount,sizeof(cur_mount));
+                can_unmount=1;can_mount=0;
+            }
+            continue;
+        }
+    }
+    if(in_volume)
+        add_volume_entry(cur_name,cur_device,cur_mount,cur_uuid,can_mount,can_unmount,can_eject,drive_removable);
+}
+
+static void collect_volumes_from_lsblk_pairs(void) {
+    char output[65536];
+    char *argv[]={"lsblk","-P","-o","NAME,LABEL,UUID,FSTYPE,MOUNTPOINT,RM,HOTPLUG,TYPE",NULL};
+    char *line,*save=NULL;
+    if(!program_exists("lsblk"))return;
+    if(!pipe_read_program("lsblk",argv,output,sizeof(output)))return;
+    for(line=strtok_r(output,"\n",&save);line;line=strtok_r(NULL,"\n",&save)){
+        char name[128]="",label[256]="",uuid[128]="",fstype[64]="",mount[PATH_MAX]="",type[32]="";
+        int rm=0,hotplug=0;
+        char *p=line;
+        while(*p){
+            while(*p==' ')p++;
+            if(!*p)break;
+            char key[32]="",val[PATH_MAX]="";
+            char *eq=strchr(p,'=');
+            if(!eq)break;
+            size_t klen=(size_t)(eq-p);if(klen>=sizeof(key))klen=sizeof(key)-1;
+            memcpy(key,p,klen);key[klen]=0;p=eq+1;
+            if(*p=='"'){
+                p++;char *end=strchr(p,'"');if(!end)break;
+                size_t n=(size_t)(end-p);if(n>=sizeof(val))n=sizeof(val)-1;
+                memcpy(val,p,n);val[n]=0;p=end+1;
+            }else{
+                char *sp=strchr(p,' ');size_t n=sp?(size_t)(sp-p):strlen(p);
+                if(n>=sizeof(val))n=sizeof(val)-1;
+                memcpy(val,p,n);val[n]=0;p+=n;
+            }
+            if(!strcmp(key,"NAME"))safe_copy(name,sizeof(name),val);
+            else if(!strcmp(key,"LABEL"))safe_copy(label,sizeof(label),val);
+            else if(!strcmp(key,"UUID"))safe_copy(uuid,sizeof(uuid),val);
+            else if(!strcmp(key,"FSTYPE"))safe_copy(fstype,sizeof(fstype),val);
+            else if(!strcmp(key,"MOUNTPOINT"))safe_copy(mount,sizeof(mount),val);
+            else if(!strcmp(key,"TYPE"))safe_copy(type,sizeof(type),val);
+            else if(!strcmp(key,"RM"))rm=atoi(val)!=0;
+            else if(!strcmp(key,"HOTPLUG"))hotplug=atoi(val)!=0;
+        }
+        if(strcmp(type,"part")&&strcmp(type,"crypt")&&strcmp(type,"lvm"))continue;
+        if(!fstype[0])continue;
+        /* Keep removable/hotplug volumes and anything already mounted under media paths. */
+        int media_mount = mount[0] && (strstr(mount,"/media/")||strstr(mount,"/run/media/")||
+                                       (!strncmp(mount,"/mnt/",5)&&strcmp(mount,"/mnt")));
+        if(!(rm||hotplug||media_mount))continue;
+        if(!strcmp(mount,"/")||!strcmp(mount,"/boot")||!strncmp(mount,"/boot/",6)||
+           !strcmp(mount,"/home")||!strncmp(mount,"/home/",6))continue;
+        {
+            char device[PATH_MAX];
+            if(name[0]=='/')safe_copy(device,sizeof(device),name);
+            else snprintf(device,sizeof(device),"/dev/%s",name);
+            add_volume_entry(label[0]?label:name,device,mount,uuid,
+                             mount[0]?0:1, mount[0]?1:0, rm||hotplug, rm||hotplug);
+        }
+    }
+}
+
+static void render_volumes(void) {
+    if(g.id_side_devices_label>=0){
+        if(g.volume_count>0)luna_remove_class(g.id_side_devices_label,"hidden");
+        else luna_add_class(g.id_side_devices_label,"hidden");
+    }
+    for(int i=0;i<MAX_VOLUMES;i++){
+        char id[32],label[320];
+        int eid;
+        snprintf(id,sizeof(id),"vol%02d",i);
+        eid=luna_get_element_by_id(id);
+        if(eid<0)continue;
+        if(i>=g.volume_count){
+            luna_add_class(eid,"hidden");
+            luna_remove_class(eid,"active");
+            luna_remove_class(eid,"volume-unmounted");
+            continue;
+        }
+        VolumeEntry *v=&g.volumes[i];
+        snprintf(label,sizeof(label),"%s　%s",
+                 v->is_mounted?"▣":"◇",
+                 v->name[0]?v->name:(v->device[0]?v->device:"ボリューム"));
+        luna_set_text(eid,label);
+        luna_remove_class(eid,"hidden");
+        if(v->is_mounted && volume_path_is_under(g.cwd,v->mount_path))luna_add_class(eid,"active");
+        else luna_remove_class(eid,"active");
+        if(v->is_mounted)luna_remove_class(eid,"volume-unmounted");
+        else luna_add_class(eid,"volume-unmounted");
+    }
+    request_redraw();
+}
+
+static void refresh_volumes(int force) {
+    double now=glfwGetTime();
+    if(!force && g.volumes_next_refresh>0 && now<g.volumes_next_refresh)return;
+    g.volume_count=0;
+    /* Prefer util-linux lsblk (no gvfs). Optional gio fills network mounts. */
+    collect_volumes_from_lsblk_pairs();
+    if(program_exists("gio"))collect_volumes_from_gio();
+    g.volumes_next_refresh=now+VOLUME_REFRESH_SEC;
+    /* If the current folder vanished because a volume was unmounted, go home. */
+    if(g.cwd[0] && !path_is_directory(g.cwd)){
+        show_toast("マウントが解除されたためホームへ戻ります");
+        navigate(home_dir(),1);
+        return;
+    }
+    render_volumes();
+}
+
+static int mount_volume_index(int index) {
+    VolumeEntry *v;
+    char device_arg[PATH_MAX];
+    if(index<0||index>=g.volume_count)return 0;
+    v=&g.volumes[index];
+    if(v->is_mounted && v->mount_path[0] && path_is_directory(v->mount_path))return 1;
+    if(v->device[0])safe_copy(device_arg,sizeof(device_arg),v->device);
+    else return 0;
+    /* udisks2 alone is enough; gio/gvfs is optional. */
+    if(program_exists("udisksctl")){
+        char *argv[]={"udisksctl","mount","-b",device_arg,NULL};
+        if(run_program_wait("udisksctl",argv)){refresh_volumes(1);return 1;}
+    }
+    if(program_exists("gio")){
+        char *argv[]={"gio","mount","-d",device_arg,NULL};
+        if(run_program_wait("gio",argv)){refresh_volumes(1);return 1;}
+    }
+    return 0;
+}
+
+static int unmount_volume_index(int index, int eject) {
+    VolumeEntry *v;
+    if(index<0||index>=g.volume_count)return 0;
+    v=&g.volumes[index];
+    if(program_exists("udisksctl") && v->device[0]){
+        char *argv[]={"udisksctl","unmount","-b",v->device,NULL};
+        if(run_program_wait("udisksctl",argv)){
+            if(eject){
+                char *pargv[]={"udisksctl","power-off","-b",v->device,NULL};
+                run_program_wait("udisksctl",pargv);
+            }
+            refresh_volumes(1);return 1;
+        }
+    }
+    if(program_exists("gio")){
+        if(eject && v->mount_path[0]){
+            char *argv[]={"gio","mount","-e",v->mount_path,NULL};
+            if(run_program_wait("gio",argv)){refresh_volumes(1);return 1;}
+        }
+        if(v->mount_path[0]){
+            char *argv[]={"gio","mount","-u",v->mount_path,NULL};
+            if(run_program_wait("gio",argv)){
+                if(eject && v->device[0] && program_exists("udisksctl")){
+                    char *pargv[]={"udisksctl","power-off","-b",v->device,NULL};
+                    run_program_wait("udisksctl",pargv);
+                }
+                refresh_volumes(1);return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void hide_volume_context(void) {
+    if(g.id_volume_context>=0)luna_add_class(g.id_volume_context,"hidden");
+    g.volume_context=-1;
+}
+
+static void show_volume_context(int index) {
+    if(index<0||index>=g.volume_count)return;
+    hide_context();
+    g.volume_context=index;
+    if(g.id_volume_context>=0){
+        luna_remove_class(g.id_volume_context,"hidden");
+        request_overlay_layout();
+    }
+}
+
+static void activate_volume_index(int index) {
+    char name[256], device[PATH_MAX], uuid[128], mount_path[PATH_MAX];
+    int was_mounted;
+    if(index<0||index>=g.volume_count)return;
+    safe_copy(name,sizeof(name),g.volumes[index].name);
+    safe_copy(device,sizeof(device),g.volumes[index].device);
+    safe_copy(uuid,sizeof(uuid),g.volumes[index].uuid);
+    safe_copy(mount_path,sizeof(mount_path),g.volumes[index].mount_path);
+    was_mounted=g.volumes[index].is_mounted;
+    if(!was_mounted){
+        show_toast("%s をマウントしています…",name);
+        if(!mount_volume_index(index)){show_toast("マウントに失敗しました");return;}
+        index=-1;
+        for(int i=0;i<g.volume_count;i++){
+            if((device[0]&&!strcmp(g.volumes[i].device,device))||
+               (uuid[0]&&!strcmp(g.volumes[i].uuid,uuid))||
+               (name[0]&&!strcmp(g.volumes[i].name,name))){index=i;break;}
+        }
+        if(index>=0)safe_copy(mount_path,sizeof(mount_path),g.volumes[index].mount_path);
+    }
+    if(mount_path[0]&&path_is_directory(mount_path)){
+        navigate(mount_path,1);
+        show_toast("%s を開きました",name);
+    }else show_toast("マウントポイントが見つかりません");
 }
 
 static int ensure_dir(const char *path, mode_t mode) {
@@ -2378,6 +2937,315 @@ static int launch_desktop_application(int slot, const char *path) {
     return 0;
 }
 
+static int is_desktop_filename(const char *name) {
+    size_t n;
+    if (!name || !*name) return 0;
+    n = strlen(name);
+    return n > 8 && !strcasecmp(name + n - 8, ".desktop");
+}
+
+static int desktop_key_managed(const char *key) {
+    return !strcmp(key, "Type") || !strcmp(key, "Version") || !strcmp(key, "Name") ||
+           !strcmp(key, "Comment") || !strcmp(key, "Exec") || !strcmp(key, "URL") ||
+           !strcmp(key, "Icon") || !strcmp(key, "Path") || !strcmp(key, "Terminal");
+}
+
+static void desktop_entry_defaults(void) {
+    safe_copy(g.desktop_edit_type, sizeof(g.desktop_edit_type), "Application");
+    g.desktop_edit_terminal = 0;
+    g.desktop_edit_extra[0] = 0;
+    g.desktop_edit_path[0] = 0;
+}
+
+static int load_desktop_entry_file(const char *path,
+                                   char *name, size_t name_cap,
+                                   char *comment, size_t comment_cap,
+                                   char *exec_or_url, size_t exec_cap,
+                                   char *icon, size_t icon_cap,
+                                   char *workdir, size_t workdir_cap) {
+    FILE *fp;
+    char line[2048];
+    int in_entry = 0, saw_entry = 0;
+    if (name_cap) name[0] = 0;
+    if (comment_cap) comment[0] = 0;
+    if (exec_cap) exec_or_url[0] = 0;
+    if (icon_cap) icon[0] = 0;
+    if (workdir_cap) workdir[0] = 0;
+    desktop_entry_defaults();
+    safe_copy(g.desktop_edit_path, sizeof(g.desktop_edit_path), path ? path : "");
+    fp = fopen(path, "r");
+    if (!fp) return 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strpbrk(line, "\r\n");
+        char *eq;
+        char key[128];
+        const char *val;
+        size_t key_len;
+        if (nl) *nl = 0;
+        if (line[0] == '[') {
+            if (!strcmp(line, "[Desktop Entry]")) {
+                in_entry = 1;
+                saw_entry = 1;
+            } else {
+                in_entry = 0;
+                append_text(g.desktop_edit_extra, sizeof(g.desktop_edit_extra), "%s\n", line);
+            }
+            continue;
+        }
+        if (!in_entry) {
+            append_text(g.desktop_edit_extra, sizeof(g.desktop_edit_extra), "%s\n", line);
+            continue;
+        }
+        if (!line[0] || line[0] == '#') {
+            append_text(g.desktop_edit_extra, sizeof(g.desktop_edit_extra), "%s\n", line);
+            continue;
+        }
+        eq = strchr(line, '=');
+        if (!eq) {
+            append_text(g.desktop_edit_extra, sizeof(g.desktop_edit_extra), "%s\n", line);
+            continue;
+        }
+        key_len = (size_t)(eq - line);
+        if (key_len >= sizeof(key)) key_len = sizeof(key) - 1;
+        memcpy(key, line, key_len);
+        key[key_len] = 0;
+        val = eq + 1;
+        /* Localized keys (Name[ja]=...) and unmanaged keys stay in extra. */
+        if (!desktop_key_managed(key) || strchr(key, '[')) {
+            append_text(g.desktop_edit_extra, sizeof(g.desktop_edit_extra), "%s\n", line);
+            continue;
+        }
+        if (!strcmp(key, "Version")) continue;
+        if (!strcmp(key, "Type")) safe_copy(g.desktop_edit_type, sizeof(g.desktop_edit_type), val);
+        else if (!strcmp(key, "Name")) safe_copy(name, name_cap, val);
+        else if (!strcmp(key, "Comment")) safe_copy(comment, comment_cap, val);
+        else if (!strcmp(key, "Exec") || !strcmp(key, "URL")) safe_copy(exec_or_url, exec_cap, val);
+        else if (!strcmp(key, "Icon")) safe_copy(icon, icon_cap, val);
+        else if (!strcmp(key, "Path")) safe_copy(workdir, workdir_cap, val);
+        else if (!strcmp(key, "Terminal"))
+            g.desktop_edit_terminal = (!strcasecmp(val, "true") || !strcmp(val, "1"));
+    }
+    fclose(fp);
+    if (!g.desktop_edit_type[0]) safe_copy(g.desktop_edit_type, sizeof(g.desktop_edit_type), "Application");
+    return saw_entry || (name && name[0]) || (exec_or_url && exec_or_url[0]);
+}
+
+static void suggest_desktop_filename(const char *name, char *out, size_t cap) {
+    size_t w = 0;
+    const unsigned char *p = (const unsigned char *)(name ? name : "");
+    if (!out || !cap) return;
+    for (; *p && w + 9 < cap; p++) {
+        unsigned char c = *p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+            out[w++] = (char)c;
+        else if (c == '-' || c == '_' || c == '.')
+            out[w++] = (char)c;
+        else if ((c == ' ' || c == '\t') && w > 0 && out[w - 1] != '-')
+            out[w++] = '-';
+    }
+    while (w && (out[w - 1] == '-' || out[w - 1] == '.')) w--;
+    if (!w) {
+        safe_copy(out, cap, "launcher.desktop");
+        return;
+    }
+    out[w] = 0;
+    if (w + 8 < cap) {
+        memcpy(out + w, ".desktop", 8);
+        out[w + 8] = 0;
+    } else
+        safe_copy(out, cap, "launcher.desktop");
+}
+
+static int write_desktop_entry_file(const char *path,
+                                    const char *type,
+                                    const char *name,
+                                    const char *comment,
+                                    const char *exec_or_url,
+                                    const char *icon,
+                                    const char *workdir,
+                                    int terminal,
+                                    const char *extra) {
+    FILE *fp;
+    int is_link, is_dir;
+    if (!path || !*path || !type || !*type || !name || !*name) return 0;
+    is_link = !strcmp(type, "Link");
+    is_dir = !strcmp(type, "Directory");
+    if (!is_dir && (!exec_or_url || !*exec_or_url)) return 0;
+    fp = fopen(path, "w");
+    if (!fp) return 0;
+    fprintf(fp, "[Desktop Entry]\n");
+    fprintf(fp, "Version=1.0\n");
+    fprintf(fp, "Type=%s\n", type);
+    fprintf(fp, "Name=%s\n", name);
+    if (comment && *comment) fprintf(fp, "Comment=%s\n", comment);
+    if (is_link) fprintf(fp, "URL=%s\n", exec_or_url);
+    else if (!is_dir) fprintf(fp, "Exec=%s\n", exec_or_url);
+    if (icon && *icon) fprintf(fp, "Icon=%s\n", icon);
+    if (!is_link && !is_dir && workdir && *workdir) fprintf(fp, "Path=%s\n", workdir);
+    if (!is_link && !is_dir) fprintf(fp, "Terminal=%s\n", terminal ? "true" : "false");
+    if (extra && *extra) {
+        const char *p = extra;
+        while (*p) {
+            const char *eol = strchr(p, '\n');
+            size_t n = eol ? (size_t)(eol - p) : strlen(p);
+            if (n) fwrite(p, 1, n, fp);
+            fputc('\n', fp);
+            if (!eol) break;
+            p = eol + 1;
+        }
+    }
+    if (fclose(fp) != 0) return 0;
+    chmod(path, 0755);
+    return 1;
+}
+
+static void sync_desktop_edit_type_controls(void) {
+    int is_link = !strcmp(g.desktop_edit_type, "Link");
+    int is_dir = !strcmp(g.desktop_edit_type, "Directory");
+    const char *type_label = is_link ? "リンク" : is_dir ? "ディレクトリ" : "アプリケーション";
+    char type_row[128], term[128];
+    snprintf(type_row, sizeof(type_row), "種類　　%s", type_label);
+    luna_set_text(g.id_desktop_edit_type, type_row);
+    luna_set_text(g.id_desktop_edit_exec_label, is_link ? "URL" : "コマンド (Exec)");
+    luna_update_classes(g.id_desktop_edit_workdir_row, "hidden", (is_link || is_dir) ? "hidden" : "");
+    luna_update_classes(g.id_desktop_edit_terminal_row, "hidden", (is_link || is_dir) ? "hidden" : "");
+    snprintf(term, sizeof(term), "ターミナルで実行　　%s", g.desktop_edit_terminal ? "はい" : "いいえ");
+    luna_set_text(g.id_desktop_edit_terminal, term);
+    luna_update_classes(g.id_desktop_edit_type, "on", "on");
+    luna_update_classes(g.id_desktop_edit_terminal, "on", g.desktop_edit_terminal ? "on" : "");
+}
+
+static void close_desktop_edit_dialog(void) {
+    if (!g.desktop_edit_open) return;
+    luna_pop_focus_trap(g.id_desktop_edit);
+    luna_add_class(g.id_desktop_edit, "hidden");
+    g.desktop_edit_open = 0;
+    g.desktop_edit_create = 0;
+    g.desktop_edit_path[0] = 0;
+    g.desktop_edit_extra[0] = 0;
+    request_overlay_layout();
+}
+
+static void show_desktop_edit_dialog(int create, int target) {
+    char name[256] = "", comment[512] = "", exec_or_url[1024] = "", icon[512] = "", workdir[PATH_MAX] = "";
+    char filename[NAME_MAX + 1] = "", hint[768];
+    hide_context();
+    if (g.open_with_open) close_open_with_dialog();
+    if (g.modal_kind) close_modal();
+    if (g.settings_open) {
+        luna_add_class(g.id_settings, "overlay-idle");
+        luna_pop_focus_trap(g.id_settings);
+        g.settings_open = 0;
+    }
+    desktop_entry_defaults();
+    if (create) {
+        g.desktop_edit_create = 1;
+        g.desktop_edit_path[0] = 0;
+        safe_copy(name, sizeof(name), "新しいランチャー");
+        safe_copy(exec_or_url, sizeof(exec_or_url), "");
+        safe_copy(icon, sizeof(icon), "application-x-executable");
+        suggest_desktop_filename(name, filename, sizeof(filename));
+        snprintf(hint, sizeof(hint),
+                 "現在のフォルダーに XDG Desktop Entry（.desktop）を作成します。\n"
+                 "Exec にはコマンドと %%f / %%u などのプレースホルダを書けます。");
+        luna_set_text(g.id_desktop_edit_title, "ランチャーを作成");
+    } else {
+        if (target < 0 || target >= g.entry_count || g.entries[target].is_dir ||
+            !is_desktop_filename(g.entries[target].name)) {
+            show_toast(".desktop ファイルを選択してください");
+            return;
+        }
+        if (!load_desktop_entry_file(g.entries[target].path,
+                                     name, sizeof(name),
+                                     comment, sizeof(comment),
+                                     exec_or_url, sizeof(exec_or_url),
+                                     icon, sizeof(icon),
+                                     workdir, sizeof(workdir))) {
+            show_toast("デスクトップエントリを読み込めませんでした");
+            return;
+        }
+        g.desktop_edit_create = 0;
+        safe_copy(filename, sizeof(filename), g.entries[target].name);
+        snprintf(hint, sizeof(hint),
+                 "ファイル: %s\n書き込みできない場合は ~/.local/share/applications にコピーして保存します。",
+                 g.entries[target].path);
+        luna_set_text(g.id_desktop_edit_title, "デスクトップエントリを編集");
+    }
+    luna_set_text(g.id_desktop_edit_hint, hint);
+    luna_set_value(g.id_desktop_edit_name, name);
+    luna_set_value(g.id_desktop_edit_comment, comment);
+    luna_set_value(g.id_desktop_edit_exec, exec_or_url);
+    luna_set_value(g.id_desktop_edit_icon, icon);
+    luna_set_value(g.id_desktop_edit_workdir, workdir);
+    luna_set_value(g.id_desktop_edit_filename, filename);
+    luna_update_classes(g.id_desktop_edit_filename_row, "hidden", create ? "" : "hidden");
+    sync_desktop_edit_type_controls();
+    g.desktop_edit_open = 1;
+    luna_remove_class(g.id_desktop_edit, "hidden");
+    luna_push_focus_trap(g.id_desktop_edit, NULL, 0);
+    luna_focus_element(g.id_desktop_edit_name);
+    request_overlay_layout();
+}
+
+static int save_desktop_edit_dialog(void) {
+    char name[256], comment[512], exec_or_url[1024], icon[512], workdir[PATH_MAX], filename[NAME_MAX + 1];
+    char dest[PATH_MAX];
+    const char *type = g.desktop_edit_type;
+    int is_link = !strcmp(type, "Link");
+    int is_dir = !strcmp(type, "Directory");
+    safe_copy(name, sizeof(name), luna_get_value(g.id_desktop_edit_name));
+    safe_copy(comment, sizeof(comment), luna_get_value(g.id_desktop_edit_comment));
+    safe_copy(exec_or_url, sizeof(exec_or_url), luna_get_value(g.id_desktop_edit_exec));
+    safe_copy(icon, sizeof(icon), luna_get_value(g.id_desktop_edit_icon));
+    safe_copy(workdir, sizeof(workdir), luna_get_value(g.id_desktop_edit_workdir));
+    safe_copy(filename, sizeof(filename), luna_get_value(g.id_desktop_edit_filename));
+    trim_text(name); trim_text(comment); trim_text(exec_or_url); trim_text(icon); trim_text(workdir); trim_text(filename);
+    if (!name[0]) { show_toast("名前を入力してください"); return 0; }
+    if (!is_dir && !exec_or_url[0]) {
+        show_toast(is_link ? "URL を入力してください" : "コマンドを入力してください");
+        return 0;
+    }
+    if (g.desktop_edit_create) {
+        if (!filename[0]) suggest_desktop_filename(name, filename, sizeof(filename));
+        if (strchr(filename, '/') || filename[0] == '.') { show_toast("ファイル名が不正です"); return 0; }
+        if (!is_desktop_filename(filename)) {
+            size_t n = strlen(filename);
+            if (n + 8 >= sizeof(filename)) { show_toast("ファイル名が長すぎます"); return 0; }
+            memcpy(filename + n, ".desktop", 8);
+            filename[n + 8] = 0;
+        }
+        if (!unique_destination(g.cwd, filename, dest, sizeof(dest))) {
+            show_toast("保存先を決められませんでした");
+            return 0;
+        }
+    } else {
+        safe_copy(dest, sizeof(dest), g.desktop_edit_path);
+        if (access(dest, W_OK) != 0) {
+            char local_dir[PATH_MAX], local_name[NAME_MAX + 1];
+            snprintf(local_dir, sizeof(local_dir), "%s/.local/share/applications", home_dir());
+            ensure_dir(local_dir, 0755);
+            safe_copy(local_name, sizeof(local_name), base_name(dest));
+            if (!unique_destination(local_dir, local_name, dest, sizeof(dest))) {
+                show_toast("ユーザー領域へコピー保存できませんでした");
+                return 0;
+            }
+            show_toast("書き込み不可のためユーザー領域に保存します");
+        }
+    }
+    if (!write_desktop_entry_file(dest, type, name, comment, exec_or_url, icon, workdir,
+                                  g.desktop_edit_terminal, g.desktop_edit_extra)) {
+        show_toast("保存に失敗しました: %s", strerror(errno));
+        return 0;
+    }
+    {
+        int created = g.desktop_edit_create;
+        close_desktop_edit_dialog();
+        load_directory(g.cwd);
+        show_toast(created ? "ランチャーを作成しました" : "デスクトップエントリを保存しました");
+    }
+    return 1;
+}
+
 static void format_time_value(time_t value, char *out, size_t cap) {
     struct tm tmv;if(!localtime_r(&value,&tmv)){safe_copy(out,cap,"不明");return;}
     strftime(out,cap,"%Y/%m/%d %H:%M:%S",&tmv);
@@ -2502,6 +3370,7 @@ static void show_toast(const char *fmt, ...) {
 static void hide_context(void) {
     luna_add_class(g.id_context,"hidden");
     g.context_entry=-1;
+    hide_volume_context();
     request_overlay_layout();
 }
 
@@ -2522,6 +3391,7 @@ static void update_sidebar_active(void) {
         int id=luna_get_element_by_id(ids[i]);
         if(!strcmp(g.cwd,g.side_paths[i]))luna_add_class(id,"active"); else luna_remove_class(id,"active");
     }
+    render_volumes();
     request_redraw();
 }
 
@@ -3175,6 +4045,7 @@ static void on_blank(LunaElement *e) {
     clear_selection();
     refresh_file_visuals();
     if (luna_last_click_button() == LUNA_MOUSE_BUTTON_RIGHT) {
+        hide_volume_context();
         g.context_entry = -1;
         luna_remove_class(g.id_context, "hidden");
         request_overlay_layout();
@@ -3186,6 +4057,7 @@ static void on_item(LunaElement *e) {
     int slot=parse_slot(e->id);if(slot<0)return;int ei=g.slot_entry[slot];if(ei<0)return;
     int button=luna_last_click_button(),mods=luna_last_click_mods();
     if(button==LUNA_MOUSE_BUTTON_RIGHT){
+        hide_volume_context();
         select_entry_click(ei,mods,1);
         g.context_entry=ei;
         luna_remove_class(g.id_context,"hidden");
@@ -3201,7 +4073,7 @@ static void on_item(LunaElement *e) {
 static void on_back(LunaElement *e){(void)e;if(g.history_pos>0){g.history_pos--;load_directory(g.history[g.history_pos]);update_toolbar_state();}}
 static void on_forward(LunaElement *e){(void)e;if(g.history_pos+1<g.history_count){g.history_pos++;load_directory(g.history[g.history_pos]);update_toolbar_state();}}
 static void on_up(LunaElement *e){(void)e;char p[PATH_MAX];parent_path(g.cwd,p,sizeof(p));navigate(p,1);}
-static void on_reload(LunaElement *e){(void)e;load_directory(g.cwd);show_toast("更新しました");}
+static void on_reload(LunaElement *e){(void)e;refresh_volumes(1);load_directory(g.cwd);show_toast("更新しました");}
 static void on_home(LunaElement *e){(void)e;navigate(home_dir(),1);}
 static void on_grid(LunaElement *e){(void)e;g.grid_view=1;render_files();}
 static void on_list(LunaElement *e){(void)e;g.grid_view=0;render_files();}
@@ -3226,6 +4098,26 @@ static void on_open_with_default(LunaElement *e){(void)e;if(g.open_with_target<0
 static void on_open_with_cancel(LunaElement *e){(void)e;close_open_with_dialog();}
 static void on_set_default_app(LunaElement *e){(void)e;hide_context();int i=first_selected();if(i>=0)open_modal(4,i);else show_toast("ファイルを選択してください");}
 static void on_terminal(LunaElement *e){(void)e;hide_context();open_terminal_here();}
+static void on_create_launcher(LunaElement *e){(void)e;show_desktop_edit_dialog(1,-1);}
+static void on_edit_desktop(LunaElement *e){
+    (void)e;hide_context();
+    int i=first_selected();
+    if(i<0){show_toast(".desktop ファイルを選択してください");return;}
+    show_desktop_edit_dialog(0,i);
+}
+static void on_desktop_edit_cancel(LunaElement *e){(void)e;close_desktop_edit_dialog();}
+static void on_desktop_edit_save(LunaElement *e){(void)e;save_desktop_edit_dialog();}
+static void on_desktop_edit_type(LunaElement *e){
+    (void)e;
+    if(!strcmp(g.desktop_edit_type,"Application")) safe_copy(g.desktop_edit_type,sizeof(g.desktop_edit_type),"Link");
+    else if(!strcmp(g.desktop_edit_type,"Link")) safe_copy(g.desktop_edit_type,sizeof(g.desktop_edit_type),"Directory");
+    else safe_copy(g.desktop_edit_type,sizeof(g.desktop_edit_type),"Application");
+    sync_desktop_edit_type_controls();
+    request_redraw();
+}
+static void on_desktop_edit_terminal(LunaElement *e){
+    (void)e;g.desktop_edit_terminal=!g.desktop_edit_terminal;sync_desktop_edit_type_controls();request_redraw();
+}
 static void on_modal_cancel(LunaElement *e){(void)e;close_modal();}
 static void on_modal_ok(LunaElement *e){(void)e;confirm_modal();}
 static void file_dialog_finish(int accepted) {
@@ -3305,6 +4197,38 @@ static void on_side_music(LunaElement *e){(void)e;side_navigate_index(5);}
 static void on_side_videos(LunaElement *e){(void)e;side_navigate_index(6);}
 static void on_side_trash(LunaElement *e){(void)e;side_navigate_index(7);}
 static void on_side_root(LunaElement *e){(void)e;side_navigate_index(8);}
+static int parse_vol_slot(const char *id) {
+    int s;
+    if(!id||strncmp(id,"vol",3)!=0||strlen(id)!=5)return -1;
+    if(id[3]<'0'||id[3]>'9'||id[4]<'0'||id[4]>'9')return -1;
+    s=(id[3]-'0')*10+(id[4]-'0');
+    return (s>=0&&s<MAX_VOLUMES)?s:-1;
+}
+static void on_volume(LunaElement *e){
+    int slot=parse_vol_slot(e?e->id:NULL);
+    int button=luna_last_click_button();
+    if(slot<0||slot>=g.volume_count)return;
+    if(button==LUNA_MOUSE_BUTTON_RIGHT){show_volume_context(slot);return;}
+    hide_volume_context();hide_context();
+    activate_volume_index(slot);
+}
+static void on_volume_open(LunaElement *e){(void)e;int i=g.volume_context;hide_volume_context();if(i>=0)activate_volume_index(i);}
+static void on_volume_unmount(LunaElement *e){
+    (void)e;int i=g.volume_context;VolumeEntry v;
+    if(i<0||i>=g.volume_count){hide_volume_context();return;}
+    v=g.volumes[i];hide_volume_context();
+    if(!v.is_mounted){show_toast("マウントされていません");return;}
+    if(unmount_volume_index(i,0))show_toast("%s をアンマウントしました",v.name);
+    else show_toast("アンマウントに失敗しました");
+}
+static void on_volume_eject(LunaElement *e){
+    (void)e;int i=g.volume_context;VolumeEntry v;
+    if(i<0||i>=g.volume_count){hide_volume_context();return;}
+    v=g.volumes[i];hide_volume_context();
+    if(unmount_volume_index(i,1))show_toast("%s を取り外しました",v.name);
+    else show_toast("取り外しに失敗しました");
+}
+static void on_volume_context_cancel(LunaElement *e){(void)e;hide_volume_context();}
 
 static void apply_display_classes(void) {
     if(g.id_app<0)return;
@@ -3442,6 +4366,9 @@ static void register_handlers(void) {
     luna_register_js_handler("onOpen",on_open); luna_register_js_handler("onOpenWith",on_open_with); luna_register_js_handler("onOpenApp",on_open_app);
     luna_register_js_handler("onOpenWithDefault",on_open_with_default); luna_register_js_handler("onOpenWithCancel",on_open_with_cancel);
     luna_register_js_handler("onSetDefaultApp",on_set_default_app); luna_register_js_handler("onTerminal",on_terminal);
+    luna_register_js_handler("onCreateLauncher",on_create_launcher); luna_register_js_handler("onEditDesktop",on_edit_desktop);
+    luna_register_js_handler("onDesktopEditCancel",on_desktop_edit_cancel); luna_register_js_handler("onDesktopEditSave",on_desktop_edit_save);
+    luna_register_js_handler("onDesktopEditType",on_desktop_edit_type); luna_register_js_handler("onDesktopEditTerminal",on_desktop_edit_terminal);
     luna_register_js_handler("onModalCancel",on_modal_cancel);
     luna_register_js_handler("onModalOk",on_modal_ok); luna_register_js_handler("onClose",on_close);
     luna_register_js_handler("onSideHome",on_side_home); luna_register_js_handler("onSideDesktop",on_side_desktop);
@@ -3449,6 +4376,11 @@ static void register_handlers(void) {
     luna_register_js_handler("onSidePictures",on_side_pictures); luna_register_js_handler("onSideMusic",on_side_music);
     luna_register_js_handler("onSideVideos",on_side_videos); luna_register_js_handler("onSideTrash",on_side_trash);
     luna_register_js_handler("onSideRoot",on_side_root);
+    luna_register_js_handler("onVolume",on_volume);
+    luna_register_js_handler("onVolumeOpen",on_volume_open);
+    luna_register_js_handler("onVolumeUnmount",on_volume_unmount);
+    luna_register_js_handler("onVolumeEject",on_volume_eject);
+    luna_register_js_handler("onVolumeContextCancel",on_volume_context_cancel);
     luna_register_js_handler("onSettingsOpen",on_settings_open); luna_register_js_handler("onSettingsClose",on_settings_close); luna_register_js_handler("onSettingsReset",on_settings_reset);
     luna_register_js_handler("onSettingTheme",on_setting_theme); luna_register_js_handler("onSettingAccent",on_setting_accent);
     luna_register_js_handler("onSettingFontFamily",on_setting_font_family); luna_register_js_handler("onSettingCustomFont",on_setting_custom_font);
@@ -3487,7 +4419,10 @@ static char *build_html(void) {
       "<div class=\"side-label\">場所</div>"
       "<div id=\"side-trash\" class=\"side-item\" onclick=\"onSideTrash()\">♲　ごみ箱</div>"
       "<div id=\"side-root\" class=\"side-item\" onclick=\"onSideRoot()\">◈　ファイルシステム</div>"
-      "</div><div class=\"main\"><div class=\"subbar\"><div id=\"folder-title\" class=\"folder-title\">ホーム</div><div class=\"hint\">右クリックで操作メニュー　F4: ターミナル</div></div>"
+      "<div id=\"side-devices-label\" class=\"side-label hidden\">デバイス</div>");
+    for(int i=0;i<MAX_VOLUMES;i++)
+        APPEND("<div id=\"vol%02d\" class=\"side-item volume-item hidden\" onclick=\"onVolume()\"></div>",i);
+    APPEND("</div><div class=\"main\"><div class=\"subbar\"><div id=\"folder-title\" class=\"folder-title\">ホーム</div><div class=\"hint\">右クリックで操作メニュー　F4: ターミナル</div></div>"
       "<div id=\"file-grid\" class=\"file-grid grid\" onclick=\"onBlank()\">");
     for(int i=0;i<MAX_ITEMS;i++) APPEND("<div id=\"item%03d\" class=\"file-item grid-item hidden\" onclick=\"onItem()\"><div id=\"icon%03d\" class=\"file-icon\">◇</div><div id=\"name%03d\" class=\"file-name\"></div><div id=\"meta%03d\" class=\"file-meta\"></div></div>",i,i,i,i);
     APPEND("<div id=\"empty\" class=\"empty hidden\">このフォルダーは空です</div></div><div id=\"status\" class=\"status\"></div></div></div>");
@@ -3497,7 +4432,14 @@ static char *build_html(void) {
             APPEND("<input id=\"file-dialog-name\" class=\"file-dialog-name\" type=\"text\" placeholder=\"ファイル名\">");
         APPEND("<div class=\"button\" onclick=\"onFileDialogCancel()\">キャンセル</div><div id=\"file-dialog-accept\" class=\"button primary\" onclick=\"onFileDialogAccept()\">開く</div></div>");
     }
-    APPEND("<div id=\"context\" class=\"context hidden\"><div class=\"menu-item\" onclick=\"onOpen()\">開く</div><div class=\"menu-item\" onclick=\"onOpenWith()\">アプリケーションで開く…</div><div class=\"menu-item\" onclick=\"onSetDefaultApp()\">この種類の既定アプリを設定…</div><div class=\"menu-item\" onclick=\"onTerminal()\">ここでターミナルを開く　F4</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onCopy()\">コピー　Ctrl+C</div><div class=\"menu-item\" onclick=\"onCut()\">切り取り　Ctrl+X</div><div class=\"menu-item\" onclick=\"onPaste()\">貼り付け　Ctrl+V</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onRename()\">名前を変更　F2</div><div class=\"menu-item danger\" onclick=\"onDelete()\">ごみ箱へ移動　Delete</div><div class=\"menu-item danger\" onclick=\"onPermanentDelete()\">完全に削除…　Shift+Delete</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onProperties()\">プロパティ</div></div>"
+    APPEND("<div id=\"context\" class=\"context hidden\"><div class=\"menu-item\" onclick=\"onOpen()\">開く</div><div class=\"menu-item\" onclick=\"onOpenWith()\">アプリケーションで開く…</div><div class=\"menu-item\" onclick=\"onSetDefaultApp()\">この種類の既定アプリを設定…</div><div class=\"menu-item\" onclick=\"onCreateLauncher()\">ランチャーを作成…</div><div class=\"menu-item\" onclick=\"onEditDesktop()\">デスクトップエントリを編集…</div><div class=\"menu-item\" onclick=\"onTerminal()\">ここでターミナルを開く　F4</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onCopy()\">コピー　Ctrl+C</div><div class=\"menu-item\" onclick=\"onCut()\">切り取り　Ctrl+X</div><div class=\"menu-item\" onclick=\"onPaste()\">貼り付け　Ctrl+V</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onRename()\">名前を変更　F2</div><div class=\"menu-item danger\" onclick=\"onDelete()\">ごみ箱へ移動　Delete</div><div class=\"menu-item danger\" onclick=\"onPermanentDelete()\">完全に削除…　Shift+Delete</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onProperties()\">プロパティ</div></div>"
+      "<div id=\"volume-context\" class=\"volume-context hidden\">"
+      "<div class=\"menu-item\" onclick=\"onVolumeOpen()\">開く / マウント</div>"
+      "<div class=\"menu-item\" onclick=\"onVolumeUnmount()\">アンマウント</div>"
+      "<div class=\"menu-item\" onclick=\"onVolumeEject()\">取り出す</div>"
+      "<div class=\"menu-sep\"></div>"
+      "<div class=\"menu-item\" onclick=\"onVolumeContextCancel()\">キャンセル</div>"
+      "</div>"
       "<div id=\"modal-wrap\" class=\"modal-wrap overlay-idle\"><div class=\"modal\"><div id=\"modal-title\" class=\"modal-title\"></div><div class=\"modal-info-stack\">");
     for(int i=0;i<MODAL_INFO_PARTS;i++)
         APPEND("<div id=\"modal-info%d\" class=\"modal-info\"></div>",i);
@@ -3505,6 +4447,21 @@ static char *build_html(void) {
       "<div id=\"open-with-wrap\" class=\"modal-wrap hidden\"><div class=\"modal open-with-modal\"><div class=\"modal-title\">アプリケーションで開く</div><div id=\"open-with-info\" class=\"modal-info\"></div><div id=\"open-app-list\" class=\"open-app-list\">");
     for(int i=0;i<MAX_OPEN_APPS;i++) APPEND("<div id=\"openapp%02d\" class=\"app-choice hidden\" onclick=\"onOpenApp()\"></div>",i);
     APPEND("</div><div class=\"modal-actions\"><div class=\"button\" onclick=\"onOpenWithCancel()\">キャンセル</div><div class=\"button primary\" onclick=\"onOpenWithDefault()\">既定で開く</div></div></div></div>"
+      "<div id=\"desktop-edit-wrap\" class=\"modal-wrap hidden\"><div class=\"modal desktop-edit-modal\">"
+      "<div id=\"desktop-edit-title\" class=\"modal-title\">デスクトップエントリ</div>"
+      "<div id=\"desktop-edit-hint\" class=\"desktop-edit-hint\"></div>"
+      "<div class=\"desktop-edit-form\">"
+      "<div id=\"desktop-edit-type\" class=\"desktop-edit-toggle\" onclick=\"onDesktopEditType()\">種類</div>"
+      "<div class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">名前</div><input id=\"desktop-edit-name\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"表示名\"></div>"
+      "<div class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">コメント</div><input id=\"desktop-edit-comment\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"説明（任意）\"></div>"
+      "<div class=\"desktop-edit-row\"><div id=\"desktop-edit-exec-label\" class=\"desktop-edit-label\">コマンド (Exec)</div><input id=\"desktop-edit-exec\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"command %%f\"></div>"
+      "<div class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">アイコン</div><input id=\"desktop-edit-icon\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"theme-icon または ファイルパス\"></div>"
+      "<div id=\"desktop-edit-workdir-row\" class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">作業ディレクトリ (Path)</div><input id=\"desktop-edit-workdir\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"任意\"></div>"
+      "<div id=\"desktop-edit-terminal-row\" class=\"desktop-edit-row\"><div id=\"desktop-edit-terminal\" class=\"desktop-edit-toggle\" onclick=\"onDesktopEditTerminal()\">ターミナルで実行</div></div>"
+      "<div id=\"desktop-edit-filename-row\" class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">ファイル名</div><input id=\"desktop-edit-filename\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"launcher.desktop\"></div>"
+      "</div>"
+      "<div class=\"modal-actions\"><div class=\"button\" onclick=\"onDesktopEditCancel()\">キャンセル</div><div class=\"button primary\" onclick=\"onDesktopEditSave()\">保存</div></div>"
+      "</div></div>"
       "<div id=\"settings-wrap\" class=\"modal-wrap overlay-idle\"><div class=\"settings-panel\">"
       "<div class=\"settings-header\"><div class=\"modal-title\">設定</div><div class=\"settings-shortcut\">Ctrl+,</div></div>"
       "<div id=\"settings-scroll\" class=\"settings-scroll\"><div class=\"settings-note\">外観と動作をここで変更できます。フォントの種類とカスタムフォントは、次回起動時に読み込まれます。</div>"
@@ -3541,6 +4498,8 @@ static void cache_ids(void) {
     g.id_app=luna_get_element_by_id("app");g.id_toolbar=luna_get_element_by_id("toolbar");g.id_sidebar=luna_get_element_by_id("sidebar");
     g.id_path=luna_get_element_by_id("path");g.id_search=luna_get_element_by_id("search");g.id_grid=luna_get_element_by_id("file-grid");
     g.id_status=luna_get_element_by_id("status");g.id_title=luna_get_element_by_id("folder-title");g.id_context=luna_get_element_by_id("context");
+    g.id_side_devices_label=luna_get_element_by_id("side-devices-label");
+    g.id_volume_context=luna_get_element_by_id("volume-context");
     g.id_modal=luna_get_element_by_id("modal-wrap");g.id_modal_title=luna_get_element_by_id("modal-title");g.id_modal_input=luna_get_element_by_id("modal-input");
     g.id_modal_cancel=luna_get_element_by_id("modal-cancel");g.id_modal_ok=luna_get_element_by_id("modal-ok");
     for(int i=0;i<MODAL_INFO_PARTS;i++){
@@ -3548,6 +4507,21 @@ static void cache_ids(void) {
         g.id_modal_info_parts[i]=luna_get_element_by_id(id);
     }
     g.id_modal_info=g.id_modal_info_parts[0];g.id_open_with=luna_get_element_by_id("open-with-wrap");g.id_open_with_info=luna_get_element_by_id("open-with-info");g.id_open_app_list=luna_get_element_by_id("open-app-list");
+    g.id_desktop_edit=luna_get_element_by_id("desktop-edit-wrap");
+    g.id_desktop_edit_title=luna_get_element_by_id("desktop-edit-title");
+    g.id_desktop_edit_hint=luna_get_element_by_id("desktop-edit-hint");
+    g.id_desktop_edit_type=luna_get_element_by_id("desktop-edit-type");
+    g.id_desktop_edit_name=luna_get_element_by_id("desktop-edit-name");
+    g.id_desktop_edit_comment=luna_get_element_by_id("desktop-edit-comment");
+    g.id_desktop_edit_exec_label=luna_get_element_by_id("desktop-edit-exec-label");
+    g.id_desktop_edit_exec=luna_get_element_by_id("desktop-edit-exec");
+    g.id_desktop_edit_icon=luna_get_element_by_id("desktop-edit-icon");
+    g.id_desktop_edit_workdir_row=luna_get_element_by_id("desktop-edit-workdir-row");
+    g.id_desktop_edit_workdir=luna_get_element_by_id("desktop-edit-workdir");
+    g.id_desktop_edit_terminal_row=luna_get_element_by_id("desktop-edit-terminal-row");
+    g.id_desktop_edit_terminal=luna_get_element_by_id("desktop-edit-terminal");
+    g.id_desktop_edit_filename_row=luna_get_element_by_id("desktop-edit-filename-row");
+    g.id_desktop_edit_filename=luna_get_element_by_id("desktop-edit-filename");
     g.id_toast=luna_get_element_by_id("toast");g.id_btn_back=luna_get_element_by_id("btn-back");
     g.id_btn_forward=luna_get_element_by_id("btn-forward");g.id_btn_paste=luna_get_element_by_id("btn-paste");g.id_btn_hidden=luna_get_element_by_id("btn-hidden");g.id_btn_sort=luna_get_element_by_id("btn-sort");
     g.id_btn_settings=luna_get_element_by_id("btn-settings");g.id_settings=luna_get_element_by_id("settings-wrap");g.id_settings_scroll=luna_get_element_by_id("settings-scroll");
@@ -3560,7 +4534,7 @@ static void cache_ids(void) {
 }
 
 static int validate_ui_ids(void) {
-    int ids[]={g.id_app,g.id_toolbar,g.id_sidebar,g.id_path,g.id_search,g.id_grid,g.id_status,g.id_title,g.id_context,g.id_modal,g.id_modal_cancel,g.id_modal_ok,g.id_open_with,g.id_open_with_info,g.id_open_app_list,g.id_toast,g.id_settings,g.id_settings_scroll,
+    int ids[]={g.id_app,g.id_toolbar,g.id_sidebar,g.id_path,g.id_search,g.id_grid,g.id_status,g.id_title,g.id_context,g.id_side_devices_label,g.id_volume_context,g.id_modal,g.id_modal_cancel,g.id_modal_ok,g.id_open_with,g.id_open_with_info,g.id_open_app_list,g.id_desktop_edit,g.id_desktop_edit_title,g.id_desktop_edit_hint,g.id_desktop_edit_type,g.id_desktop_edit_name,g.id_desktop_edit_comment,g.id_desktop_edit_exec_label,g.id_desktop_edit_exec,g.id_desktop_edit_icon,g.id_desktop_edit_workdir_row,g.id_desktop_edit_workdir,g.id_desktop_edit_terminal_row,g.id_desktop_edit_terminal,g.id_desktop_edit_filename_row,g.id_desktop_edit_filename,g.id_toast,g.id_settings,g.id_settings_scroll,
                g.id_set_font_size,g.id_set_font_family,g.id_set_custom_font,g.id_set_density,g.id_set_theme,g.id_set_accent,g.id_set_status,g.id_set_grid_details,g.id_set_animations,g.id_set_startup,g.id_set_terminal};
     for(size_t i=0;i<sizeof(ids)/sizeof(ids[0]);i++){
         if(ids[i]<0){log_error("UI element lookup failed at index %zu",i);return 0;}
@@ -3715,16 +4689,17 @@ static void key_cb(GLFWwindow *w,int key,int scancode,int action,int mods) {
             complete_path_input();
             consumed = 1;
         }
-        else if(key==GLFW_KEY_ESCAPE){if(g.settings_open)close_settings_dialog();else if(g.open_with_open)close_open_with_dialog();else if(g.modal_kind)close_modal();else hide_context();}
+        else if(key==GLFW_KEY_ESCAPE){if(g.settings_open)close_settings_dialog();else if(g.desktop_edit_open)close_desktop_edit_dialog();else if(g.open_with_open)close_open_with_dialog();else if(g.modal_kind)close_modal();else if(g.volume_context>=0)hide_volume_context();else hide_context();}
         else if(key==GLFW_KEY_ENTER||key==GLFW_KEY_KP_ENTER){
             if(g.settings_open)close_settings_dialog();
+            else if(g.desktop_edit_open)save_desktop_edit_dialog();
             else if(g.open_with_open){}
             else if(g.modal_kind)confirm_modal();
             else if(focused==g.id_path){const char *p=luna_get_value(g.id_path);navigate(p,1);}
             else if(focused!=g.id_search){int i=first_selected();if(i>=0)open_entry(i);}
         }
         else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_COMMA)open_settings_dialog();
-        else if(g.settings_open||g.open_with_open){}
+        else if(g.settings_open||g.open_with_open||g.desktop_edit_open){}
         else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_C&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(0);
         else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_X&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(1);
         else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_V&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)paste_clipboard();
@@ -3756,6 +4731,11 @@ static void platform_iconify(void){glfwIconifyWindow(g.window);}
 static void platform_maximize(void){if(glfwGetWindowAttrib(g.window,GLFW_MAXIMIZED))glfwRestoreWindow(g.window);else glfwMaximizeWindow(g.window);}
 static void platform_begin_move(void){
     if(!g.window)return;
+#ifdef LUNA_WM_CLIENT_H
+    /* Prefer compositor grab on Luna/Wayland; glfwSetWindowPos is unavailable. */
+    if(luna_wm_client_available() && luna_wm_client_start_move(g.window))
+        return;
+#endif
     glfwGetCursorPos(g.window,&g_window_drag_anchor_x,&g_window_drag_anchor_y);
     g_window_drag_last_x=g_window_drag_anchor_x;
     g_window_drag_last_y=g_window_drag_anchor_y;
@@ -3789,22 +4769,33 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResul
     if(result)memset(result,0,sizeof(*result));
     g_file_dialog_cancelled=0;
     g_file_dialog_pending_save[0]=0;
-    memset(&g,0,sizeof(g));g.anchor_entry=-1;g.context_entry=-1;g.modal_target=-1;g.open_with_target=-1;g.history_pos=-1;
+    memset(&g,0,sizeof(g));g.anchor_entry=-1;g.context_entry=-1;g.modal_target=-1;g.open_with_target=-1;g.volume_context=-1;g.history_pos=-1;
     load_settings();
     if(g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER){LunaWindowTheme system_theme;luna_window_theme_load_system(&system_theme);g.theme=system_theme.mode==LUNA_WINDOW_THEME_DARK?1:0;}
     g.window_width=g_file_dialog_config.width;g.window_height=g_file_dialog_config.height;
     apply_font_environment();
     if(!glfwInit()){log_error("GLFW initialization failed");return 1;}
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
-    /* Do not expose the platform's blank back buffer while fonts, DOM and the
-       first directory are still being prepared.  Show only after the first
-       complete Luna frame has been swapped. */
-    glfwWindowHint(GLFW_VISIBLE,GLFW_FALSE);
+    /* X11: keep hidden until the first Luna frame is ready.  Wayland: a hidden
+       GLFW window may never get a usable EGL/wl_shm buffer, so create visible
+       (same rule as luna_linux.h) and still wait for the first swap before
+       treating the dialog as shown. */
+    {
+        const char* session_type=getenv("XDG_SESSION_TYPE");
+        const char* wayland_display=getenv("WAYLAND_DISPLAY");
+        int wayland_session=
+            (session_type && strcmp(session_type,"wayland")==0) ||
+            (wayland_display && wayland_display[0] && !getenv("DISPLAY"));
+        glfwWindowHint(GLFW_VISIBLE, wayland_session ? GLFW_TRUE : GLFW_FALSE);
+    }
     glfwWindowHint(GLFW_DECORATED,g_file_dialog_config.client_chrome?GLFW_FALSE:GLFW_TRUE);
     g.window=glfwCreateWindow(g.window_width,g.window_height,g_file_dialog_config.title,NULL,NULL);
     if(!g.window){log_error("window creation failed");glfwTerminate();return 1;}
     glfwSetWindowSizeLimits(g.window,MIN_WINDOW_W,MIN_WINDOW_H,GLFW_DONT_CARE,GLFW_DONT_CARE);
     glfwMakeContextCurrent(g.window);glfwSwapInterval(1);
+#ifdef LUNA_WM_CLIENT_H
+    luna_wm_client_init(g.window);
+#endif
     g_hand_cursor=glfwCreateStandardCursor(GLFW_HAND_CURSOR);g_cursor_ibeam=glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
     g_cursor_crosshair=glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR);g_cursor_hresize=glfwCreateStandardCursor(GLFW_HRESIZE_CURSOR);g_cursor_vresize=glfwCreateStandardCursor(GLFW_VRESIZE_CURSOR);
     LunaPlatform p={0};p.get_time=glfwGetTime;p.get_proc=(LunaGetProcFn)glfwGetProcAddress;p.set_cursor=platform_cursor;p.request_close=platform_close;p.iconify=platform_iconify;p.maximize_toggle=platform_maximize;p.request_redraw=platform_redraw;p.begin_move=platform_begin_move;p.begin_resize=platform_begin_resize;p.set_title=platform_set_title;p.system_notify=platform_notify;p.struct_size=sizeof(p);p.api_version=LUNA_UI_API_VERSION;luna_set_platform(&p);
@@ -3828,11 +4819,13 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResul
         if(!g.redraw&&!settling){
             double wait=1.0;
             if(g.toast_until>0){double remain=g.toast_until-before;if(remain<wait)wait=remain;if(wait<0.01)wait=0.01;}
+            if(g.volumes_next_refresh>0){double remain=g.volumes_next_refresh-before;if(remain<wait)wait=remain;if(wait<0.05)wait=0.05;}
             glfwWaitEventsTimeout(wait);
         }else glfwPollEvents();
         apply_pending_resize();
         double now=glfwGetTime(),dt=now-prev;prev=now;if(dt>0.1)dt=0.1;
         luna_window_tick(dt);
+        if(g.volumes_next_refresh<=0.0||now>=g.volumes_next_refresh)refresh_volumes(0);
         const char *sv=luna_get_value(g.id_search);if(sv&&strcmp(sv,old_search)){safe_copy(old_search,sizeof(old_search),sv);safe_copy(g.search,sizeof(g.search),sv);render_files();}
         if(g.toast_until>0&&now>=g.toast_until){luna_add_class(g.id_toast,"hidden");g.toast_until=0;request_redraw();}
         apply_grid_scroll();
@@ -3861,6 +4854,9 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResul
     save_settings();
     luna_window_unbind();
     luna_shutdown();
+#ifdef LUNA_WM_CLIENT_H
+    luna_wm_client_shutdown();
+#endif
     if (g_hand_cursor) glfwDestroyCursor(g_hand_cursor);
     if (g_cursor_ibeam) glfwDestroyCursor(g_cursor_ibeam);
     if (g_cursor_crosshair) glfwDestroyCursor(g_cursor_crosshair);

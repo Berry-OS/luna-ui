@@ -38,6 +38,13 @@ typedef struct LunaLinuxOptions {
 
 void luna_linux_set_options(const LunaLinuxOptions* options);
 GLFWwindow* luna_linux_window(void);
+/* Apps that replace GLFW cursor/button callbacks must forward motion/release
+ * through these so client-side titlebar move/resize still runs (X11 and
+ * luna_wm set_position fallbacks). */
+void luna_linux_window_drag_motion(GLFWwindow* window, double x, double y);
+void luna_linux_window_drag_end(void);
+/* Ask the Luna shell for a window menu at surface-local (x, y). */
+int luna_linux_show_window_menu(int x, int y);
 
 #ifdef __cplusplus
 }
@@ -70,6 +77,290 @@ typedef struct LunaLinuxState {
 
 static LunaLinuxState luna_linux_state;
 static LunaLinuxOptions luna_linux_options;
+
+#if !defined(LUNA_LINUX_NO_WAYLAND)
+
+/* Wayland text-input-v3 IME. Stock GLFW 3.4 builds often omit this protocol,
+ * so Luna talks to the compositor directly using the same wl_display/surface. */
+#if !defined(LUNA_LINUX_WAYLAND_IME)
+#  define LUNA_LINUX_WAYLAND_IME 1
+#endif
+
+#if LUNA_LINUX_WAYLAND_IME
+#define GLFW_EXPOSE_NATIVE_WAYLAND
+#include <GLFW/glfw3native.h>
+#include <wayland-client.h>
+#include "text-input-unstable-v3-client-protocol.h"
+#include "text-input-unstable-v3-protocol.c"
+
+typedef struct LunaLinuxIme {
+    struct wl_display* display;
+    struct wl_registry* registry;
+    struct wl_seat* seat;
+    struct zwp_text_input_manager_v3* manager;
+    struct zwp_text_input_v3* text_input;
+    struct wl_surface* surface;
+    int enabled;
+    int entered;
+    int pending_enable;
+    int rect_x, rect_y, rect_w, rect_h;
+    char pending_preedit[1024];
+    int pending_preedit_begin;
+    int pending_preedit_end;
+    char pending_commit[1024];
+    unsigned pending_delete_before;
+    unsigned pending_delete_after;
+    int have_preedit;
+    int have_commit;
+    int have_delete;
+} LunaLinuxIme;
+
+static LunaLinuxIme luna_linux_ime;
+
+static void luna_linux_ime_emit_utf8(const char* text) {
+    const unsigned char* p = (const unsigned char*)(text ? text : "");
+    while (*p) {
+        unsigned cp;
+        if (*p < 0x80) {
+            cp = *p++;
+        } else if ((*p & 0xE0) == 0xC0 && p[1]) {
+            cp = ((unsigned)(p[0] & 0x1F) << 6) | (unsigned)(p[1] & 0x3F);
+            p += 2;
+        } else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) {
+            cp = ((unsigned)(p[0] & 0x0F) << 12) |
+                 ((unsigned)(p[1] & 0x3F) << 6) |
+                 (unsigned)(p[2] & 0x3F);
+            p += 3;
+        } else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) {
+            cp = ((unsigned)(p[0] & 0x07) << 18) |
+                 ((unsigned)(p[1] & 0x3F) << 12) |
+                 ((unsigned)(p[2] & 0x3F) << 6) |
+                 (unsigned)(p[3] & 0x3F);
+            p += 4;
+        } else {
+            p++;
+            continue;
+        }
+        luna_char(cp);
+    }
+}
+
+static void luna_linux_ime_text_enter(void* data, struct zwp_text_input_v3* text_input,
+                                      struct wl_surface* surface) {
+    (void)data; (void)text_input;
+    luna_linux_ime.entered = (surface == luna_linux_ime.surface);
+    if (luna_linux_ime.entered && luna_linux_ime.pending_enable) {
+        zwp_text_input_v3_enable(luna_linux_ime.text_input);
+        zwp_text_input_v3_set_cursor_rectangle(luna_linux_ime.text_input,
+            luna_linux_ime.rect_x, luna_linux_ime.rect_y,
+            luna_linux_ime.rect_w, luna_linux_ime.rect_h);
+        zwp_text_input_v3_commit(luna_linux_ime.text_input);
+        luna_linux_ime.enabled = 1;
+    }
+}
+
+static void luna_linux_ime_text_leave(void* data, struct zwp_text_input_v3* text_input,
+                                      struct wl_surface* surface) {
+    (void)data; (void)text_input; (void)surface;
+    luna_linux_ime.entered = 0;
+    luna_linux_ime.enabled = 0;
+    luna_ime_clear();
+}
+
+static void luna_linux_ime_preedit(void* data, struct zwp_text_input_v3* text_input,
+                                   const char* text, int32_t cursor_begin, int32_t cursor_end) {
+    (void)data; (void)text_input;
+    size_t n = text ? strlen(text) : 0;
+    if (n >= sizeof(luna_linux_ime.pending_preedit))
+        n = sizeof(luna_linux_ime.pending_preedit) - 1;
+    if (n) memcpy(luna_linux_ime.pending_preedit, text, n);
+    luna_linux_ime.pending_preedit[n] = '\0';
+    luna_linux_ime.pending_preedit_begin = cursor_begin;
+    luna_linux_ime.pending_preedit_end = cursor_end;
+    luna_linux_ime.have_preedit = 1;
+}
+
+static void luna_linux_ime_commit(void* data, struct zwp_text_input_v3* text_input,
+                                  const char* text) {
+    (void)data; (void)text_input;
+    size_t n = text ? strlen(text) : 0;
+    if (n >= sizeof(luna_linux_ime.pending_commit))
+        n = sizeof(luna_linux_ime.pending_commit) - 1;
+    if (n) memcpy(luna_linux_ime.pending_commit, text, n);
+    luna_linux_ime.pending_commit[n] = '\0';
+    luna_linux_ime.have_commit = 1;
+}
+
+static void luna_linux_ime_delete(void* data, struct zwp_text_input_v3* text_input,
+                                  uint32_t before_length, uint32_t after_length) {
+    (void)data; (void)text_input;
+    luna_linux_ime.pending_delete_before = before_length;
+    luna_linux_ime.pending_delete_after = after_length;
+    luna_linux_ime.have_delete = 1;
+}
+
+static void luna_linux_ime_done(void* data, struct zwp_text_input_v3* text_input,
+                                uint32_t serial) {
+    (void)data; (void)text_input; (void)serial;
+    if (luna_linux_ime.have_delete) {
+        luna_ime_delete_surrounding(luna_linux_ime.pending_delete_before,
+                                    luna_linux_ime.pending_delete_after);
+        luna_linux_ime.have_delete = 0;
+        luna_linux_ime.pending_delete_before = 0;
+        luna_linux_ime.pending_delete_after = 0;
+    }
+    if (luna_linux_ime.have_commit) {
+        luna_ime_clear();
+        luna_linux_ime_emit_utf8(luna_linux_ime.pending_commit);
+        luna_linux_ime.pending_commit[0] = '\0';
+        luna_linux_ime.have_commit = 0;
+        luna_linux_ime.have_preedit = 0;
+        luna_linux_ime.pending_preedit[0] = '\0';
+        luna_linux_state.redraw = 1;
+    } else if (luna_linux_ime.have_preedit) {
+        luna_ime_set_preedit(luna_linux_ime.pending_preedit,
+                             luna_linux_ime.pending_preedit_begin,
+                             luna_linux_ime.pending_preedit_end);
+        luna_linux_ime.have_preedit = 0;
+        luna_linux_state.redraw = 1;
+    } else {
+        luna_ime_clear();
+    }
+}
+
+static const struct zwp_text_input_v3_listener luna_linux_ime_text_listener = {
+    luna_linux_ime_text_enter,
+    luna_linux_ime_text_leave,
+    luna_linux_ime_preedit,
+    luna_linux_ime_commit,
+    luna_linux_ime_delete,
+    luna_linux_ime_done
+};
+
+static void luna_linux_ime_registry_global(void* data, struct wl_registry* registry,
+                                           uint32_t name, const char* interface,
+                                           uint32_t version) {
+    (void)data;
+    if (!interface) return;
+    if (strcmp(interface, "wl_seat") == 0) {
+        uint32_t ver = version < 7 ? version : 7;
+        if (!luna_linux_ime.seat)
+            luna_linux_ime.seat = wl_registry_bind(registry, name, &wl_seat_interface, ver);
+    } else if (strcmp(interface, zwp_text_input_manager_v3_interface.name) == 0) {
+        if (!luna_linux_ime.manager)
+            luna_linux_ime.manager = wl_registry_bind(registry, name,
+                &zwp_text_input_manager_v3_interface, 1);
+    }
+}
+
+static void luna_linux_ime_registry_global_remove(void* data, struct wl_registry* registry,
+                                                  uint32_t name) {
+    (void)data; (void)registry; (void)name;
+}
+
+static const struct wl_registry_listener luna_linux_ime_registry_listener = {
+    luna_linux_ime_registry_global,
+    luna_linux_ime_registry_global_remove
+};
+
+static void luna_linux_ime_init(GLFWwindow* window) {
+    memset(&luna_linux_ime, 0, sizeof(luna_linux_ime));
+    if (!luna_linux_state.wayland || !window) return;
+    luna_linux_ime.display = glfwGetWaylandDisplay();
+    luna_linux_ime.surface = glfwGetWaylandWindow(window);
+    if (!luna_linux_ime.display || !luna_linux_ime.surface) return;
+
+    luna_linux_ime.registry = wl_display_get_registry(luna_linux_ime.display);
+    if (!luna_linux_ime.registry) return;
+    wl_registry_add_listener(luna_linux_ime.registry, &luna_linux_ime_registry_listener, NULL);
+    wl_display_roundtrip(luna_linux_ime.display);
+    if (!luna_linux_ime.manager || !luna_linux_ime.seat) return;
+
+    luna_linux_ime.text_input = zwp_text_input_manager_v3_get_text_input(
+        luna_linux_ime.manager, luna_linux_ime.seat);
+    if (!luna_linux_ime.text_input) return;
+    zwp_text_input_v3_add_listener(luna_linux_ime.text_input,
+                                   &luna_linux_ime_text_listener, NULL);
+    wl_display_flush(luna_linux_ime.display);
+}
+
+static void luna_linux_ime_shutdown(void) {
+    if (luna_linux_ime.text_input) {
+        zwp_text_input_v3_destroy(luna_linux_ime.text_input);
+        luna_linux_ime.text_input = NULL;
+    }
+    if (luna_linux_ime.manager) {
+        zwp_text_input_manager_v3_destroy(luna_linux_ime.manager);
+        luna_linux_ime.manager = NULL;
+    }
+    if (luna_linux_ime.seat) {
+        wl_seat_destroy(luna_linux_ime.seat);
+        luna_linux_ime.seat = NULL;
+    }
+    if (luna_linux_ime.registry) {
+        wl_registry_destroy(luna_linux_ime.registry);
+        luna_linux_ime.registry = NULL;
+    }
+    memset(&luna_linux_ime, 0, sizeof(luna_linux_ime));
+}
+
+static void luna_linux_text_input_impl(int enabled, float x, float y, float w, float h) {
+    int rx = (int)floorf(x + 0.5f);
+    int ry = (int)floorf(y + 0.5f);
+    int rw = (int)ceilf(w);
+    int rh = (int)ceilf(h);
+    if (rw < 1) rw = 1;
+    if (rh < 1) rh = 1;
+
+    luna_linux_ime.pending_enable = enabled ? 1 : 0;
+    luna_linux_ime.rect_x = rx;
+    luna_linux_ime.rect_y = ry;
+    luna_linux_ime.rect_w = rw;
+    luna_linux_ime.rect_h = rh;
+
+    if (!luna_linux_ime.text_input) return;
+
+    if (enabled) {
+        zwp_text_input_v3_enable(luna_linux_ime.text_input);
+        zwp_text_input_v3_set_content_type(luna_linux_ime.text_input, 0, 0);
+        zwp_text_input_v3_set_cursor_rectangle(luna_linux_ime.text_input, rx, ry, rw, rh);
+        zwp_text_input_v3_commit(luna_linux_ime.text_input);
+        luna_linux_ime.enabled = 1;
+    } else {
+        zwp_text_input_v3_disable(luna_linux_ime.text_input);
+        zwp_text_input_v3_commit(luna_linux_ime.text_input);
+        luna_linux_ime.enabled = 0;
+        luna_ime_clear();
+    }
+    if (luna_linux_ime.display) wl_display_flush(luna_linux_ime.display);
+}
+#else
+static void luna_linux_ime_init(GLFWwindow* window) { (void)window; }
+static void luna_linux_ime_shutdown(void) {}
+static void luna_linux_text_input_impl(int enabled, float x, float y, float w, float h) {
+    (void)enabled; (void)x; (void)y; (void)w; (void)h;
+}
+#endif
+
+/* Luna compositor private absolute placement (luna_wm_v1). */
+#if !defined(GLFW_EXPOSE_NATIVE_WAYLAND)
+#define GLFW_EXPOSE_NATIVE_WAYLAND
+#include <GLFW/glfw3native.h>
+#endif
+#define LUNA_WM_CLIENT_IMPLEMENTATION
+#include "luna-wm-client.h"
+
+#else /* LUNA_LINUX_NO_WAYLAND — GLFW-only builds (no libwayland-client) */
+
+static void luna_linux_ime_init(GLFWwindow* window) { (void)window; }
+static void luna_linux_ime_shutdown(void) {}
+static void luna_linux_text_input_impl(int enabled, float x, float y, float w, float h) {
+    (void)enabled; (void)x; (void)y; (void)w; (void)h;
+}
+#define LUNA_WM_CLIENT_IMPLEMENTATION
+#include "luna-wm-client.h"
+
+#endif /* LUNA_LINUX_NO_WAYLAND */
 
 static void luna_linux_error_callback(int code, const char* description) {
     if (code == GLFW_FEATURE_UNAVAILABLE && description &&
@@ -160,12 +451,22 @@ static void luna_linux_maximize_impl(void) {
 
 static void luna_linux_begin_move_impl(void) {
     if (!luna_linux_state.window) return;
+    luna_linux_state.window_resize_edges = LUNA_RESIZE_EDGE_NONE;
+    /* Wayland: one compositor grab via luna_wm.start_move.  Streaming
+     * set_position every motion fought the grab, rewrote state.json, and
+     * made titlebar buttons / edge snap unreliable. */
+    if (luna_linux_state.wayland) {
+        luna_linux_state.window_drag_mode = 0;
+        if (luna_wm_client_start_move(luna_linux_state.window))
+            return;
+        /* No luna_wm: keep the button held; compositor CSD promotion may grab. */
+        return;
+    }
     glfwGetCursorPos(luna_linux_state.window, &luna_linux_state.drag_anchor_x,
                      &luna_linux_state.drag_anchor_y);
     luna_linux_state.drag_last_x = luna_linux_state.drag_anchor_x;
     luna_linux_state.drag_last_y = luna_linux_state.drag_anchor_y;
     luna_linux_state.window_drag_mode = 1;
-    luna_linux_state.window_resize_edges = LUNA_RESIZE_EDGE_NONE;
 }
 
 static void luna_linux_begin_resize_impl(int edge) {
@@ -228,58 +529,77 @@ static float luna_linux_scale_impl(void) {
 #endif
 }
 
-static void luna_linux_cursor_position_callback(GLFWwindow* window,
-                                                 double x, double y) {
-    if (luna_linux_state.window_drag_mode &&
-        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
-        int wx, wy, ww, wh;
-        int min_w = 160, min_h = 120;
-        if (luna_linux_state.wayland) {
-            wx = luna_linux_state.window_pos_x;
-            wy = luna_linux_state.window_pos_y;
-        } else {
-            glfwGetWindowPos(window, &wx, &wy);
+void luna_linux_window_drag_motion(GLFWwindow* window, double x, double y) {
+    if (!window || !luna_linux_state.window_drag_mode) return;
+    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) != GLFW_PRESS) {
+        luna_linux_state.window_drag_mode = 0;
+        luna_linux_state.window_resize_edges = LUNA_RESIZE_EDGE_NONE;
+        return;
+    }
+    int wx, wy, ww, wh;
+    int min_w = 160, min_h = 120;
+    if (luna_linux_state.wayland) {
+        wx = luna_linux_state.window_pos_x;
+        wy = luna_linux_state.window_pos_y;
+    } else {
+        glfwGetWindowPos(window, &wx, &wy);
+        luna_linux_state.window_pos_x = wx;
+        luna_linux_state.window_pos_y = wy;
+    }
+    glfwGetWindowSize(window, &ww, &wh);
+    if (luna_linux_state.window_drag_mode == 1) {
+        int dx = (int)llround(x - luna_linux_state.drag_anchor_x);
+        int dy = (int)llround(y - luna_linux_state.drag_anchor_y);
+        if (dx || dy) {
+            wx += dx;
+            wy += dy;
             luna_linux_state.window_pos_x = wx;
             luna_linux_state.window_pos_y = wy;
+            /* Wayland: prefer luna_wm_v1 absolute place; otherwise only
+             * Luna compositor CSD move promotion can relocate the window. */
+            if (!luna_wm_client_set_pos(window, wx, wy) &&
+                !luna_linux_state.wayland)
+                glfwSetWindowPos(window, wx, wy);
         }
-        glfwGetWindowSize(window, &ww, &wh);
-        if (luna_linux_state.window_drag_mode == 1) {
-            int dx = (int)llround(x - luna_linux_state.drag_anchor_x);
-            int dy = (int)llround(y - luna_linux_state.drag_anchor_y);
-            if (dx || dy) {
-                wx += dx;
-                wy += dy;
-                luna_linux_state.window_pos_x = wx;
-                luna_linux_state.window_pos_y = wy;
-                /* Wayland: Luna compositor promotes top-strip drags to
-                 * xdg_toplevel.move. Absolute SetWindowPos is unavailable. */
-                if (!luna_linux_state.wayland)
-                    glfwSetWindowPos(window, wx, wy);
-            }
-        } else {
-            int edge = luna_linux_state.window_resize_edges;
-            int dx_left = (int)llround(x - luna_linux_state.drag_anchor_x);
-            int dy_top = (int)llround(y - luna_linux_state.drag_anchor_y);
-            int dx_right = (int)llround(x - luna_linux_state.drag_last_x);
-            int dy_bottom = (int)llround(y - luna_linux_state.drag_last_y);
-            int nx = wx, ny = wy, nw = ww, nh = wh;
-            if (edge & LUNA_RESIZE_EDGE_LEFT) { nx += dx_left; nw -= dx_left; }
-            if (edge & LUNA_RESIZE_EDGE_TOP) { ny += dy_top; nh -= dy_top; }
-            if (edge & LUNA_RESIZE_EDGE_RIGHT) nw += dx_right;
-            if (edge & LUNA_RESIZE_EDGE_BOTTOM) nh += dy_bottom;
-            if (nw < min_w) { if (edge & LUNA_RESIZE_EDGE_LEFT) nx -= min_w - nw; nw = min_w; }
-            if (nh < min_h) { if (edge & LUNA_RESIZE_EDGE_TOP) ny -= min_h - nh; nh = min_h; }
-            if (nx != wx || ny != wy) {
-                luna_linux_state.window_pos_x = nx;
-                luna_linux_state.window_pos_y = ny;
-                if (!luna_linux_state.wayland)
-                    glfwSetWindowPos(window, nx, ny);
-            }
-            if (nw != ww || nh != wh) glfwSetWindowSize(window, nw, nh);
-            if (edge & LUNA_RESIZE_EDGE_RIGHT) luna_linux_state.drag_last_x = x;
-            if (edge & LUNA_RESIZE_EDGE_BOTTOM) luna_linux_state.drag_last_y = y;
+    } else {
+        int edge = luna_linux_state.window_resize_edges;
+        int dx_left = (int)llround(x - luna_linux_state.drag_anchor_x);
+        int dy_top = (int)llround(y - luna_linux_state.drag_anchor_y);
+        int dx_right = (int)llround(x - luna_linux_state.drag_last_x);
+        int dy_bottom = (int)llround(y - luna_linux_state.drag_last_y);
+        int nx = wx, ny = wy, nw = ww, nh = wh;
+        if (edge & LUNA_RESIZE_EDGE_LEFT) { nx += dx_left; nw -= dx_left; }
+        if (edge & LUNA_RESIZE_EDGE_TOP) { ny += dy_top; nh -= dy_top; }
+        if (edge & LUNA_RESIZE_EDGE_RIGHT) nw += dx_right;
+        if (edge & LUNA_RESIZE_EDGE_BOTTOM) nh += dy_bottom;
+        if (nw < min_w) { if (edge & LUNA_RESIZE_EDGE_LEFT) nx -= min_w - nw; nw = min_w; }
+        if (nh < min_h) { if (edge & LUNA_RESIZE_EDGE_TOP) ny -= min_h - nh; nh = min_h; }
+        if (nx != wx || ny != wy) {
+            luna_linux_state.window_pos_x = nx;
+            luna_linux_state.window_pos_y = ny;
+            if (!luna_wm_client_set_pos(window, nx, ny) &&
+                !luna_linux_state.wayland)
+                glfwSetWindowPos(window, nx, ny);
         }
+        if (nw != ww || nh != wh) glfwSetWindowSize(window, nw, nh);
+        if (edge & LUNA_RESIZE_EDGE_RIGHT) luna_linux_state.drag_last_x = x;
+        if (edge & LUNA_RESIZE_EDGE_BOTTOM) luna_linux_state.drag_last_y = y;
     }
+}
+
+void luna_linux_window_drag_end(void) {
+    luna_linux_state.window_drag_mode = 0;
+    luna_linux_state.window_resize_edges = LUNA_RESIZE_EDGE_NONE;
+}
+
+int luna_linux_show_window_menu(int x, int y) {
+    if (!luna_linux_state.window) return 0;
+    return luna_wm_client_show_window_menu(luna_linux_state.window, x, y);
+}
+
+static void luna_linux_cursor_position_callback(GLFWwindow* window,
+                                                 double x, double y) {
+    luna_linux_window_drag_motion(window, x, y);
     if (luna_mouse_move_changed(x, y)) luna_linux_state.redraw = 1;
 }
 
@@ -290,10 +610,8 @@ static void luna_linux_mouse_button_callback(GLFWwindow* window,
     glfwGetCursorPos(window, &x, &y);
     luna_mouse_button(button, action, mods, x, y);
     luna_linux_state.redraw = 1;
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE) {
-        luna_linux_state.window_drag_mode = 0;
-        luna_linux_state.window_resize_edges = LUNA_RESIZE_EDGE_NONE;
-    }
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE)
+        luna_linux_window_drag_end();
 }
 
 static void luna_linux_scroll_callback(GLFWwindow* window,
@@ -369,6 +687,8 @@ static void luna_linux_install_callbacks(GLFWwindow* window) {
 
 static void luna_linux_destroy_host(void) {
     int i;
+    luna_linux_ime_shutdown();
+    luna_wm_client_shutdown();
     for (i = 0; i < 6; ++i) {
         if (luna_linux_state.cursors[i]) {
             glfwDestroyCursor(luna_linux_state.cursors[i]);
@@ -549,7 +869,15 @@ int luna_app_run(const LunaAppConfig* user_config) {
     platform.begin_resize = luna_linux_begin_resize_impl;
     platform.set_title = luna_linux_set_title_impl;
     platform.system_notify = luna_linux_system_notify_impl;
+    platform.text_input = luna_linux_text_input_impl;
     luna_set_platform(&platform);
+
+    luna_linux_ime_init(window);
+    if (luna_linux_state.wayland) {
+        luna_wm_client_init(window);
+        if (luna_wm_client_available())
+            fprintf(stderr, "[luna-ui] luna_wm_v1 placement enabled\n");
+    }
 
     memset(&init, 0, sizeof(init));
     init.width = (float)luna_linux_state.window_width;

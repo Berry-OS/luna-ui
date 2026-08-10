@@ -5,6 +5,8 @@ CPPFLAGS ?= -I..
 CFLAGS   ?= -Os -Wall -Wextra
 GLFW_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 GLFW_LIBS   := $(shell pkg-config --libs glfw3 2>/dev/null)
+CPPFLAGS   += -DLUNA_LINUX_NO_WAYLAND
+LUNA_SHELL  ?= ../../luna-shell
 GEN         := ../../luna-shell/ui/gen_include.sh
 COMMON      := ../luna-ui.h ../stb_truetype.h ../stb_image_write.h
 

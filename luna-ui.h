@@ -475,10 +475,28 @@ int  luna_mouse_move_changed(double x, double y);
  * use this to postpone periodic maintenance and background animation so raw
  * motion-to-frame latency stays stable for the entire drag. */
 int  luna_pointer_dragging(void);
+void luna_get_pointer(double* x, double* y);
+/* Suppress the remainder of the current pointer press/release (e.g. right-click
+ * on_click walk) after a press hook handles the event itself. */
+void luna_consume_pointer_event(void);
 void luna_mouse_button(int button, int action, int mods, double x, double y);
 void luna_scroll(double xoff, double yoff);
 void luna_key(int key, int scancode, int action, int mods);
 void luna_char(unsigned int codepoint);
+typedef int (*LunaTextCommitFn)(unsigned int codepoint, void* userdata);
+void luna_set_text_commit_handler(LunaTextCommitFn fn, void* userdata);
+typedef void (*LunaImeDeleteFn)(unsigned before_bytes, unsigned after_bytes, void* userdata);
+void luna_set_ime_delete_handler(LunaImeDeleteFn fn, void* userdata);
+/* Enable/disable the platform IME and publish a caret rectangle in window
+ * coordinates. Custom editors call this while they own keyboard focus. */
+void luna_text_input(int enabled, float x, float y, float w, float h);
+/* Current IME preedit (composing) string; empty when inactive. */
+const char* luna_ime_preedit(void);
+int luna_ime_composing(void);
+/* Platform hosts push preedit / surrounding deletes through these. */
+void luna_ime_set_preedit(const char* text, int cursor_begin, int cursor_end);
+void luna_ime_delete_surrounding(unsigned before_bytes, unsigned after_bytes);
+void luna_ime_clear(void);
 const char* luna_get_value(int idx);
 void luna_set_value(int idx, const char* value);
 void luna_framebuffer_resized(void);
@@ -1805,7 +1823,7 @@ typedef struct {
 
 #define MAX_KF_ANIMS 48
 #define MAX_KF_STOPS 8
-#define MAX_JS_HANDLERS 64
+#define MAX_JS_HANDLERS 128
 
 /* Keep CSS positioning modes available to both style application and layout. */
 #define POS_UNSET     0
@@ -2251,6 +2269,7 @@ typedef struct {
 static LunaFocusTrapEntry g_focus_traps[LUNA_MAX_FOCUS_TRAPS];
 static int g_focus_trap_count = 0;
 static LunaMousePressHook g_mouse_press_hook = NULL;
+static int g_pointer_event_consumed = 0;
 static LunaMouseReleaseHook g_mouse_release_hook = NULL;
 static int g_luna_last_click_button = LUNA_MOUSE_BUTTON_LEFT;
 static int g_luna_last_click_mods = 0;
@@ -2620,10 +2639,12 @@ static stbtt_fontinfo* font_for_codepoint(int cp) {
     int cjk_has   = font_has_cp(&g_cjk_font_info,   g_cjk_font_info_ok,   cp);
     int mono_has  = font_has_cp(&g_mono_font_info,  g_mono_font_info_ok,  cp);
 
-    /* CSS font-family must win when both icon faces expose a codepoint. */
+    /* CSS font-family must win when both icon faces expose a codepoint.
+     * Monospace still yields to CJK for Japanese ranges so editors can show
+     * IME commits with the system CJK face. */
     if (g_font_face_hint == 1 && icon_has) return &g_icon_font_info;
     if (g_font_face_hint == 2 && brand_has) return &g_brand_font_info;
-    if (g_font_face_hint == 3 && mono_has) return &g_mono_font_info;
+    if (g_font_face_hint == 3 && mono_has && !prefer_cjk) return &g_mono_font_info;
     if (pua) {
         if (icon_has)  return &g_icon_font_info;
         if (brand_has) return &g_brand_font_info;
@@ -13152,6 +13173,13 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
                 }
             }
         }
+    } else if (action == LUNA_PRESS && button == LUNA_MOUSE_BUTTON_RIGHT) {
+        /* Titlebar / shell hooks need the press (not only the release on_click
+         * walk) so they can issue show_window_menu with a valid button serial. */
+        int hit = hit_test_at(mx, my);
+        g_luna_last_click_button = LUNA_MOUSE_BUTTON_RIGHT;
+        g_pointer_event_consumed = 0;
+        if (g_mouse_press_hook) g_mouse_press_hook(hit, button, mods);
     } else if (action == LUNA_RELEASE && button == LUNA_MOUSE_BUTTON_LEFT) {
         int hit = hit_test_at(mx, my);
 
@@ -13193,10 +13221,14 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
          * has a handler) so shells can open context menus. */
         int hit = hit_test_at(mx, my);
         g_luna_last_click_button = LUNA_MOUSE_BUTTON_RIGHT;
-        for (int i = hit; i != -1; i = elements[i].parent_idx) {
-            if (elements[i].on_click) {
-                elements[i].on_click(&elements[i]);
-                break;
+        if (g_pointer_event_consumed) {
+            g_pointer_event_consumed = 0;
+        } else {
+            for (int i = hit; i != -1; i = elements[i].parent_idx) {
+                if (elements[i].on_click) {
+                    elements[i].on_click(&elements[i]);
+                    break;
+                }
             }
         }
         if (g_mouse_release_hook)
@@ -13444,7 +13476,18 @@ static void input_update_scroll(LunaElement* e, float inner_w) {
     if (e->input_scroll_x < 0.0f) e->input_scroll_x = 0.0f;
 }
 
+static LunaTextCommitFn g_text_commit_handler = NULL;
+static void* g_text_commit_userdata = NULL;
+static LunaImeDeleteFn g_ime_delete_handler = NULL;
+static void* g_ime_delete_userdata = NULL;
+static char g_ime_preedit[1024];
+static int g_ime_preedit_begin = 0;
+static int g_ime_preedit_end = 0;
+
 static void char_callback_impl(unsigned int codepoint) {
+    if (g_text_commit_handler &&
+        g_text_commit_handler(codepoint, g_text_commit_userdata))
+        return;
     if (!focused_is_input()) return;
     if (codepoint < 32 && codepoint != '\n' && codepoint != '\t') return;
     LunaElement* e = &elements[g_focused_element_idx];
@@ -13452,6 +13495,70 @@ static void char_callback_impl(unsigned int codepoint) {
     char buf[8];
     int n = utf8_encode((int)codepoint, buf);
     input_insert_utf8(e, buf, n);
+}
+
+void luna_set_text_commit_handler(LunaTextCommitFn fn, void* userdata) {
+    g_text_commit_handler = fn;
+    g_text_commit_userdata = userdata;
+}
+
+void luna_set_ime_delete_handler(LunaImeDeleteFn fn, void* userdata) {
+    g_ime_delete_handler = fn;
+    g_ime_delete_userdata = userdata;
+}
+
+void luna_text_input(int enabled, float x, float y, float w, float h) {
+    if (!g_luna_platform.text_input) return;
+    if (enabled) {
+        if (w < 1.0f) w = 1.0f;
+        if (h < 1.0f) h = 1.0f;
+        g_luna_platform.text_input(1, x, y, w, h);
+    } else {
+        g_luna_platform.text_input(0, 0.0f, 0.0f, 0.0f, 0.0f);
+        g_ime_preedit[0] = '\0';
+        g_ime_preedit_begin = g_ime_preedit_end = 0;
+    }
+}
+
+const char* luna_ime_preedit(void) { return g_ime_preedit; }
+int luna_ime_composing(void) { return g_ime_preedit[0] != '\0'; }
+
+void luna_ime_set_preedit(const char* text, int cursor_begin, int cursor_end) {
+    if (!text) text = "";
+    size_t n = strlen(text);
+    if (n >= sizeof(g_ime_preedit)) n = sizeof(g_ime_preedit) - 1;
+    memcpy(g_ime_preedit, text, n);
+    g_ime_preedit[n] = '\0';
+    g_ime_preedit_begin = cursor_begin;
+    g_ime_preedit_end = cursor_end;
+    if (g_luna_platform.request_redraw) g_luna_platform.request_redraw();
+}
+
+void luna_ime_clear(void) {
+    if (!g_ime_preedit[0]) return;
+    g_ime_preedit[0] = '\0';
+    g_ime_preedit_begin = g_ime_preedit_end = 0;
+    if (g_luna_platform.request_redraw) g_luna_platform.request_redraw();
+}
+
+void luna_ime_delete_surrounding(unsigned before_bytes, unsigned after_bytes) {
+    if (g_ime_delete_handler) {
+        g_ime_delete_handler(before_bytes, after_bytes, g_ime_delete_userdata);
+        return;
+    }
+    if (!focused_is_input()) return;
+    LunaElement* e = &elements[g_focused_element_idx];
+    input_ensure_caret(e);
+    int caret = e->caret;
+    int start = caret - (int)before_bytes;
+    if (start < 0) start = 0;
+    int end = caret + (int)after_bytes;
+    int len = (int)strlen(e->text);
+    if (end > len) end = len;
+    if (end > start) {
+        memmove(e->text + start, e->text + end, (size_t)(len - end) + 1);
+        e->caret = start;
+    }
 }
 
 static void key_callback(void* window, int key, int scancode, int action, int mods) {
@@ -13863,6 +13970,7 @@ void luna_pop_focus_trap(int idx) {
 }
 
 void luna_set_mouse_press_hook(LunaMousePressHook fn) { g_mouse_press_hook = fn; }
+void luna_consume_pointer_event(void) { g_pointer_event_consumed = 1; }
 void luna_set_mouse_release_hook(LunaMouseReleaseHook fn) { g_mouse_release_hook = fn; }
 int luna_last_click_button(void) { return g_luna_last_click_button; }
 int luna_last_click_mods(void) { return g_luna_last_click_mods; }
@@ -14638,6 +14746,11 @@ static void repaint_stuck_sticky_layers(int fbw, int fbh) {
 
 int luna_pointer_dragging(void) {
     return g_scroll_drag_idx != -1 || drag_target_idx != -1;
+}
+
+void luna_get_pointer(double* x, double* y) {
+    if (x) *x = g_luna_mx;
+    if (y) *y = g_luna_my;
 }
 
 int luna_mouse_move_changed(double x, double y) {
