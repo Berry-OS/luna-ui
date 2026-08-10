@@ -100,6 +100,66 @@ typedef char GLchar;
 #ifndef GL_RED
 #define GL_RED 0x1903
 #endif
+#ifndef GL_FALSE
+#define GL_FALSE 0
+#endif
+#ifndef GL_TEXTURE_2D
+#define GL_TEXTURE_2D 0x0DE1
+#endif
+#ifndef GL_TEXTURE_MIN_FILTER
+#define GL_TEXTURE_MIN_FILTER 0x2801
+#endif
+#ifndef GL_TEXTURE_MAG_FILTER
+#define GL_TEXTURE_MAG_FILTER 0x2800
+#endif
+#ifndef GL_TEXTURE_WRAP_S
+#define GL_TEXTURE_WRAP_S 0x2802
+#endif
+#ifndef GL_TEXTURE_WRAP_T
+#define GL_TEXTURE_WRAP_T 0x2803
+#endif
+#ifndef GL_UNSIGNED_BYTE
+#define GL_UNSIGNED_BYTE 0x1401
+#endif
+#ifndef GL_FLOAT
+#define GL_FLOAT 0x1406
+#endif
+#ifndef GL_LINEAR
+#define GL_LINEAR 0x2601
+#endif
+#ifndef GL_RGBA
+#define GL_RGBA 0x1908
+#endif
+#ifndef GL_SCISSOR_TEST
+#define GL_SCISSOR_TEST 0x0C11
+#endif
+#ifndef GL_BLEND
+#define GL_BLEND 0x0BE2
+#endif
+#ifndef GL_SRC_ALPHA
+#define GL_SRC_ALPHA 0x0302
+#endif
+#ifndef GL_ONE_MINUS_SRC_ALPHA
+#define GL_ONE_MINUS_SRC_ALPHA 0x0303
+#endif
+#ifndef GL_ONE_MINUS_DST_COLOR
+#define GL_ONE_MINUS_DST_COLOR 0x0307
+#endif
+#ifndef GL_DST_COLOR
+#define GL_DST_COLOR 0x0306
+#endif
+#ifndef GL_ONE
+#define GL_ONE 1
+#endif
+#ifndef GL_COLOR_BUFFER_BIT
+#define GL_COLOR_BUFFER_BIT 0x00004000
+#endif
+#ifndef GL_TRIANGLES
+#define GL_TRIANGLES 0x0004
+#endif
+#ifndef GL_TRIANGLE_FAN
+#define GL_TRIANGLE_FAN 0x0006
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,6 +170,18 @@ extern "C" {
 #endif
 #ifndef LUNA_UI_MAX_RULES
 #define LUNA_UI_MAX_RULES 600
+#endif
+/* Large DOM/CSS records are grown on demand instead of reserving their full
+ * maximum in .bss. These values only control the first allocation; the public
+ * MAX limits above remain unchanged. */
+#ifndef LUNA_UI_INITIAL_ELEMENTS
+#define LUNA_UI_INITIAL_ELEMENTS 64
+#endif
+#ifndef LUNA_UI_INITIAL_RULES
+#define LUNA_UI_INITIAL_RULES 32
+#endif
+#ifndef LUNA_UI_INITIAL_DYN_GLYPHS
+#define LUNA_UI_INITIAL_DYN_GLYPHS 256
 #endif
 
 typedef struct LunaElement LunaElement;
@@ -827,7 +899,11 @@ const char* bg_fs =
     "        float b = uGradStops[i + 1];\n"
     "        if(t >= a && t <= b) {\n"
     "            float u = (b > a) ? (t - a) / (b - a) : 0.0;\n"
-    "            return mix(uGradColors[i], uGradColors[i + 1], u);\n"
+    "            vec4 ca = uGradColors[i]; vec4 cb = uGradColors[i + 1];\n"
+    "            float mixedAlpha = mix(ca.a, cb.a, u);\n"
+    "            vec3 premul = mix(ca.rgb * ca.a, cb.rgb * cb.a, u);\n"
+    "            vec3 mixedRgb = mixedAlpha > 0.00001 ? premul / mixedAlpha : vec3(0.0);\n"
+    "            return vec4(mixedRgb, mixedAlpha);\n"
     "        }\n"
     "    }\n"
     "    return uGradColors[uGradStopCount - 1];\n"
@@ -847,13 +923,18 @@ const char* bg_fs =
     "    }\n"
     "    vec4 baseColor;\n"
     "    if(uGradient == 1) {\n"
-    "        float ca = cos(uGradAngle); float sa = sin(uGradAngle);\n"
-    "        vec2 uv = FragPos / uSize;\n"
-    "        float t = dot(vec2(uv.x, 1.0-uv.y) - 0.5, vec2(sa, -ca)) + 0.5;\n"
+    "        vec2 direction = uGradCenter;\n"
+    "        vec2 fromCenter = FragPos - uSize * 0.5;\n"
+    "        float lineLength = max(abs(direction.x) * uSize.x + abs(direction.y) * uSize.y, 0.001);\n"
+    "        float t = dot(fromCenter, direction) / lineLength + 0.5;\n"
     "        baseColor = sampleGradient(t);\n"
     "    } else if(uGradient == 2) {\n"
     "        vec2 c = vec2(uGradCenter.x, 1.0-uGradCenter.y) * uSize;\n"
-    "        float radius = max(uGradRadius * max(uSize.x, uSize.y), 0.001);\n"
+    "        vec2 farthest = max(c, uSize - c);\n"
+    "        float radius = uGradRadius < 0.0\n"
+    "            ? length(farthest)\n"
+    "            : uGradRadius * max(uSize.x, uSize.y);\n"
+    "        radius = max(radius, 0.001);\n"
     "        float t = distance(FragPos, c) / radius;\n"
     "        baseColor = sampleGradient(t);\n"
     "    } else if(uGradient == 3) {\n"
@@ -1191,7 +1272,6 @@ typedef struct {
     float grad_rad_rx, grad_rad_ry; /* ellipse radii (fraction of elem size if _pct set) */
     int  grad_rad_rx_pct, grad_rad_ry_pct; /* 1 = rx/ry are fractions of elem w/h */
     int  has_color; float r, g, b, a;
-    int  has_bg_image; char image_path[256];
 } LunaBgLayer;
 
 /* One CSS box-shadow layer (multiple layers per element supported). */
@@ -1329,7 +1409,7 @@ struct LunaElement {
     int mix_blend_mode;
 
     /* Multiple background layers (background: grad1, grad2, ...) */
-    LunaBgLayer bg_layers[LUNA_MAX_BG_LAYERS];
+    LunaBgLayer* bg_layers;
     int bg_layer_count;
 
     /* backdrop-filter: blur() saturate() brightness() */
@@ -1362,6 +1442,11 @@ struct LunaElement {
        paint path can stay batched (no synthetic DOM node/allocation). */
     int has_inline_text_flow;
     float inline_text_x;
+    float inline_text_w;
+    /* The compact DOM keeps direct text on its owning element.  Remember
+       whether that run appeared before the first child so a flex/inline row
+       preserves source order (for example: `Click me <span>→</span>`). */
+    int direct_text_before_children;
 
     int box_sizing;
     float css_width, css_height;
@@ -1395,7 +1480,6 @@ struct LunaElement {
     int has_grid_auto_rows, has_grid_auto_columns;
 
     int grid_area_rows, grid_area_cols;
-    char grid_area_cell[MAX_GRID_AREA_ROWS][MAX_GRID_AREA_COLS][32];
     GridAreaRect grid_area_rects[MAX_GRID_AREAS];
     int grid_area_rect_count;
 
@@ -1593,7 +1677,8 @@ typedef struct {
     int   grid_row_count;
     int has_grid_template_areas;
     int grid_area_rows, grid_area_cols;
-    char grid_area_cell[MAX_GRID_AREA_ROWS][MAX_GRID_AREA_COLS][32];
+    GridAreaRect grid_area_rects[MAX_GRID_AREAS];
+    int grid_area_rect_count;
     int has_column_gap; float grid_col_gap;
     int has_row_gap; float grid_row_gap;
     int has_grid_auto_flow; int grid_auto_flow;
@@ -1658,7 +1743,7 @@ typedef struct {
     int  grad_rad_rx_pct, grad_rad_ry_pct;
 
     /* Multiple background layers */
-    LunaBgLayer bg_layers[LUNA_MAX_BG_LAYERS];
+    LunaBgLayer* bg_layers;
     int bg_layer_count;
 
     /* backdrop-filter */
@@ -1749,7 +1834,29 @@ typedef struct {
     EventHandler fn;
 } JsHandlerEntry;
 
-LunaElement  elements[MAX_ELEMENTS]; int elem_count = 0;
+LunaElement* elements = NULL;
+int elem_count = 0;
+static int g_elements_cap = 0;
+
+static int luna_ensure_element_capacity(int needed) {
+    if (needed <= g_elements_cap) return 1;
+    if (needed > MAX_ELEMENTS) return 0;
+    int cap = g_elements_cap > 0 ? g_elements_cap : LUNA_UI_INITIAL_ELEMENTS;
+    if (cap < 1) cap = 1;
+    while (cap < needed) {
+        int next = cap < MAX_ELEMENTS / 2 ? cap * 2 : MAX_ELEMENTS;
+        if (next <= cap) { cap = MAX_ELEMENTS; break; }
+        cap = next;
+    }
+    if (cap > MAX_ELEMENTS) cap = MAX_ELEMENTS;
+    LunaElement* grown = (LunaElement*)realloc(elements, sizeof(*elements) * (size_t)cap);
+    if (!grown) return 0;
+    if (cap > g_elements_cap)
+        memset(grown + g_elements_cap, 0, sizeof(*grown) * (size_t)(cap - g_elements_cap));
+    elements = grown;
+    g_elements_cap = cap;
+    return 1;
+}
 
 /* Hot-path registries.  Most frames have only a handful of active elements;
  * scanning the full DOM for scroll/keyframe/easing work made idle cost scale
@@ -1757,6 +1864,10 @@ LunaElement  elements[MAX_ELEMENTS]; int elem_count = 0;
  * while visual candidates remain active only until their interpolation settles. */
 static int g_scroll_tick_idx[MAX_ELEMENTS];
 static int g_scroll_tick_count = 0;
+/* Layout owns this list because it also owns scrollbar geometry.  Pointer and
+ * overlay paths then inspect only real scroll containers, not every element. */
+static int g_scroll_container_idx[MAX_ELEMENTS];
+static int g_scroll_container_count = 0;
 static int g_css_anim_idx[MAX_ELEMENTS];
 static int g_css_anim_count = 0;
 static int g_activity_registry_dirty = 1;
@@ -1793,7 +1904,33 @@ static void rebuild_activity_registries(void) {
     }
     g_activity_registry_dirty = 0;
 }
-StyleRule  css_rules[MAX_RULES];   int rule_count = 0;
+StyleRule* css_rules = NULL;
+int rule_count = 0;
+static int g_rules_cap = 0;
+
+static int luna_ensure_rule_capacity(int needed) {
+    if (needed <= g_rules_cap) return 1;
+    if (needed > MAX_RULES) return 0;
+    int cap = g_rules_cap > 0 ? g_rules_cap : LUNA_UI_INITIAL_RULES;
+    if (cap < 1) cap = 1;
+    while (cap < needed) {
+        int next = cap < MAX_RULES / 2 ? cap * 2 : MAX_RULES;
+        if (next <= cap) { cap = MAX_RULES; break; }
+        cap = next;
+    }
+    if (cap > MAX_RULES) cap = MAX_RULES;
+    StyleRule* grown = (StyleRule*)realloc(css_rules, sizeof(*css_rules) * (size_t)cap);
+    if (!grown) return 0;
+    if (cap > g_rules_cap)
+        memset(grown + g_rules_cap, 0, sizeof(*grown) * (size_t)(cap - g_rules_cap));
+    css_rules = grown;
+    g_rules_cap = cap;
+    return 1;
+}
+
+/* Keep large rule records stationary.  Cascade sorting moves only these small
+ * indices instead of repeatedly copying multi-kilobyte StyleRule values. */
+static int g_rule_order[MAX_RULES];
 /* parse_html only needs a final whole-document restyle when sibling-dependent
  * selectors exist.  Most application stylesheets do not use them. */
 static int g_has_structural_selectors = 0;
@@ -1801,6 +1938,40 @@ CssKeyframe g_keyframes[MAX_KF_ANIMS];
 int g_keyframe_count = 0;
 JsHandlerEntry g_js_handlers[MAX_JS_HANDLERS];
 int g_js_handler_count = 0;
+
+/* Multi-background storage is cold and rare.  Keeping twelve full layers in
+ * every element and every rule consumed several megabytes even when unused. */
+#define LUNA_RULE_BG_ALLOC_MAX (MAX_RULES * 2)
+static LunaBgLayer* g_rule_bg_allocs[LUNA_RULE_BG_ALLOC_MAX];
+static int g_rule_bg_alloc_count = 0;
+
+static LunaBgLayer* rule_bg_layers_acquire(void) {
+    if (g_rule_bg_alloc_count >= LUNA_RULE_BG_ALLOC_MAX) return NULL;
+    LunaBgLayer* layers = (LunaBgLayer*)calloc(LUNA_MAX_BG_LAYERS, sizeof(*layers));
+    if (layers) g_rule_bg_allocs[g_rule_bg_alloc_count++] = layers;
+    return layers;
+}
+
+static void rule_bg_layers_release(LunaBgLayer* layers) {
+    if (!layers) return;
+    for (int i = 0; i < g_rule_bg_alloc_count; i++) {
+        if (g_rule_bg_allocs[i] != layers) continue;
+        g_rule_bg_allocs[i] = g_rule_bg_allocs[--g_rule_bg_alloc_count];
+        free(layers);
+        return;
+    }
+}
+
+static void rule_bg_layers_release_all(void) {
+    while (g_rule_bg_alloc_count > 0)
+        free(g_rule_bg_allocs[--g_rule_bg_alloc_count]);
+}
+
+static int element_bg_layers_ensure(LunaElement* e) {
+    if (e->bg_layers) return 1;
+    e->bg_layers = (LunaBgLayer*)calloc(LUNA_MAX_BG_LAYERS, sizeof(*e->bg_layers));
+    return e->bg_layers != NULL;
+}
 
 /* CSS target prefilter. Rules are still applied in normal cascade order, but
  * expensive selector-chain matching is skipped when the target's required
@@ -1835,16 +2006,16 @@ static void rebuild_rule_index(void) {
     memset(g_rule_id, 0, sizeof(g_rule_id));
     memset(g_rule_type, 0, sizeof(g_rule_type));
     memset(g_rule_class, 0, sizeof(g_rule_class));
-    for (int i = 0; i < rule_count; i++) {
-        const SimpleSelector* t = &css_rules[i].target;
+    for (int order = 0; order < rule_count; order++) {
+        const SimpleSelector* t = &css_rules[g_rule_order[order]].target;
         if (t->sel_id[0])
-            rule_bit_set(g_rule_id[rule_hash_str(t->sel_id)], i);
+            rule_bit_set(g_rule_id[rule_hash_str(t->sel_id)], order);
         else if (t->sel_type[0])
-            rule_bit_set(g_rule_type[rule_hash_str(t->sel_type)], i);
+            rule_bit_set(g_rule_type[rule_hash_str(t->sel_type)], order);
         else if (t->sel_class_count > 0)
-            rule_bit_set(g_rule_class[rule_hash_str(t->sel_classes[0])], i);
+            rule_bit_set(g_rule_class[rule_hash_str(t->sel_classes[0])], order);
         else
-            rule_bit_set(g_rule_any, i);
+            rule_bit_set(g_rule_any, order);
     }
     g_rule_index_ready = 1;
 }
@@ -1878,6 +2049,33 @@ static void build_rule_candidates(const LunaElement* e, uint64_t* out) {
         while (*q && !rule_ws((unsigned char)*q)) q++;
         if (q > start)
             rule_mask_or(out, g_rule_class[rule_hash_span(start, (size_t)(q - start))]);
+    }
+}
+
+static unsigned luna_ctz64(uint64_t bits) {
+#if defined(__GNUC__) || defined(__clang__)
+    return (unsigned)__builtin_ctzll((unsigned long long)bits);
+#else
+    unsigned n = 0;
+    while ((bits & UINT64_C(1)) == 0) { bits >>= 1; n++; }
+    return n;
+#endif
+}
+
+/* Return the next set bit after `previous`, or -1. Candidate bits use cascade
+ * order, so walking only set bits remains both fast and CSS-correct. */
+static int rule_candidate_next(const uint64_t* bits, int previous) {
+    int pos = previous + 1;
+    int word = pos >> 6;
+    if (word >= LUNA_RULE_WORDS) return -1;
+    uint64_t pending = bits[word] & (~UINT64_C(0) << (pos & 63));
+    for (;;) {
+        if (pending) {
+            int next = (word << 6) + (int)luna_ctz64(pending);
+            return next < rule_count ? next : -1;
+        }
+        if (++word >= LUNA_RULE_WORDS) return -1;
+        pending = bits[word];
     }
 }
 
@@ -2037,6 +2235,9 @@ static int    g_drag_mode  = 0;
 static double g_press_x = 0, g_press_y = 0;
 static unsigned g_hover_epoch = 1;
 static unsigned g_hover_mark[MAX_ELEMENTS];
+static int    g_hover_chain[MAX_ELEMENTS];
+static int    g_hover_next[MAX_ELEMENTS];
+static int    g_hover_chain_count = 0;
 static int    g_focused_idx = -1;
 static int    g_focused_element_idx = -1;
 static int    g_focus_before_trap = -1;
@@ -2125,7 +2326,7 @@ typedef struct {
     int   next;
 } LunaDynGlyph;
 
-static unsigned char g_dyn_pixels[LUNA_DYN_ATLAS_W * LUNA_DYN_ATLAS_H];
+static unsigned char* g_dyn_pixels = NULL;
 static GLuint g_dyn_tex = 0;
 static int    g_dyn_dirty = 0;
 /* Incremented whenever packing is reset.  Text preparation uses this to detect
@@ -2150,9 +2351,42 @@ static void dyn_mark_rows(int y0, int y1) {
     g_dyn_dirty = 1;
 }
 static int    g_dyn_pack_x = 1, g_dyn_pack_y = 1, g_dyn_pack_row_h = 0;
-static LunaDynGlyph g_dyn_glyphs[LUNA_MAX_DYN_GLYPHS];
+static LunaDynGlyph* g_dyn_glyphs = NULL;
 static int g_dyn_glyph_count = 0;
+static int g_dyn_glyph_cap = 0;
 static int g_dyn_hash[LUNA_GLYPH_HASH];
+static int g_dyn_hash_ready = 0;
+
+static void dyn_hash_ensure(void) {
+    if (g_dyn_hash_ready) return;
+    for (int i = 0; i < LUNA_GLYPH_HASH; i++) g_dyn_hash[i] = -1;
+    g_dyn_hash_ready = 1;
+}
+
+static int dyn_pixels_ensure(void) {
+    if (g_dyn_pixels) return 1;
+    g_dyn_pixels = (unsigned char*)calloc((size_t)LUNA_DYN_ATLAS_W,
+                                          (size_t)LUNA_DYN_ATLAS_H);
+    return g_dyn_pixels != NULL;
+}
+
+static int dyn_glyph_capacity_ensure(int needed) {
+    if (needed <= g_dyn_glyph_cap) return 1;
+    if (needed > LUNA_MAX_DYN_GLYPHS) return 0;
+    int cap = g_dyn_glyph_cap > 0 ? g_dyn_glyph_cap : LUNA_UI_INITIAL_DYN_GLYPHS;
+    if (cap < 1) cap = 1;
+    while (cap < needed) {
+        int next = cap < LUNA_MAX_DYN_GLYPHS / 2 ? cap * 2 : LUNA_MAX_DYN_GLYPHS;
+        if (next <= cap) { cap = LUNA_MAX_DYN_GLYPHS; break; }
+        cap = next;
+    }
+    if (cap > LUNA_MAX_DYN_GLYPHS) cap = LUNA_MAX_DYN_GLYPHS;
+    LunaDynGlyph* grown = (LunaDynGlyph*)realloc(g_dyn_glyphs, sizeof(*g_dyn_glyphs) * (size_t)cap);
+    if (!grown) return 0;
+    g_dyn_glyphs = grown;
+    g_dyn_glyph_cap = cap;
+    return 1;
+}
 
 static int utf8_decode(const char** pp) {
     const unsigned char* s = (const unsigned char*)*pp;
@@ -2304,12 +2538,15 @@ static int font_path_score_brands(const char* path) {
 
 static void dyn_atlas_reset(void) {
     if (++g_dyn_generation == 0) g_dyn_generation = 1;
-    memset(g_dyn_pixels, 0, sizeof(g_dyn_pixels));
+    if (g_dyn_pixels)
+        memset(g_dyn_pixels, 0, (size_t)LUNA_DYN_ATLAS_W * (size_t)LUNA_DYN_ATLAS_H);
     g_dyn_pack_x = 1; g_dyn_pack_y = 1; g_dyn_pack_row_h = 0;
     g_dyn_glyph_count = 0;
+    dyn_hash_ensure();
     for (int i = 0; i < LUNA_GLYPH_HASH; i++) g_dyn_hash[i] = -1;
     g_dyn_dirty = 0;
-    dyn_mark_rows(0, LUNA_DYN_ATLAS_H);   /* the clear itself has to reach GL */
+    if (g_dyn_pixels && g_dyn_tex)
+        dyn_mark_rows(0, LUNA_DYN_ATLAS_H); /* an existing GL atlas needs the clear */
 }
 
 static float text_device_scale(void) {
@@ -2343,6 +2580,7 @@ static unsigned dyn_glyph_hash(int cp, int css_px_q2, int dpr_q2) {
 }
 
 static LunaDynGlyph* dyn_find_glyph(int cp, int css_px_q2, int dpr_q2) {
+    dyn_hash_ensure();
     unsigned h = dyn_glyph_hash(cp, css_px_q2, dpr_q2);
     for (int i = g_dyn_hash[h]; i >= 0; i = g_dyn_glyphs[i].next) {
         LunaDynGlyph* g = &g_dyn_glyphs[i];
@@ -2426,9 +2664,10 @@ static LunaDynGlyph* dyn_bake_glyph(int cp, float css_px) {
 
     LunaDynGlyph* hit = dyn_find_glyph(cp, css_px_q2, dpr_q2);
     if (hit) return hit;
-    if (g_dyn_glyph_count >= LUNA_MAX_DYN_GLYPHS) {
+    if (g_dyn_glyph_count >= LUNA_MAX_DYN_GLYPHS)
         dyn_atlas_reset();
-    }
+    if (!dyn_pixels_ensure() || !dyn_glyph_capacity_ensure(g_dyn_glyph_count + 1))
+        return NULL;
 
     /* Rasterise at framebuffer resolution, but store all layout metrics in
      * CSS pixels.  On a scale-2 Wayland output this produces a true 2x glyph
@@ -2489,6 +2728,7 @@ static LunaDynGlyph* dyn_bake_glyph(int cp, float css_px) {
 }
 
 static void dyn_flush_atlas(void) {
+    if (!g_dyn_pixels) return;
     if (!g_dyn_tex) {
         glGenTextures(1, &g_dyn_tex);
         glBindTexture(GL_TEXTURE_2D, g_dyn_tex);
@@ -2690,6 +2930,12 @@ void parse_color(const char* val, float* r, float* g, float* b, float* a) {
             unsigned int rv, gv, bv;
             if (sscanf(val, "#%1x%1x%1x", &rv, &gv, &bv) == 3) {
                 *r = (rv * 17) / 255.0f; *g = (gv * 17) / 255.0f; *b = (bv * 17) / 255.0f;
+            }
+        } else if (len == 5) {
+            unsigned int rv, gv, bv, av;
+            if (sscanf(val, "#%1x%1x%1x%1x", &rv, &gv, &bv, &av) == 4) {
+                *r = (rv * 17) / 255.0f; *g = (gv * 17) / 255.0f;
+                *b = (bv * 17) / 255.0f; *a = (av * 17) / 255.0f;
             }
         } else if (len == 7) {
             unsigned int rv, gv, bv;
@@ -3113,12 +3359,20 @@ static void parse_linear_gradient(const char* val, StyleRule* rule) {
 
     float angle = 180.0f;
     if (strncmp(p, "to ", 3) == 0) {
-        if (strstr(p, "top"))         angle = 0.0f;
-        else if (strstr(p, "right"))  angle = 90.0f;
-        else if (strstr(p, "bottom")) angle = 180.0f;
-        else if (strstr(p, "left"))   angle = 270.0f;
         const char* comma = strchr(p, ',');
         if (!comma) return;
+        int to_top = strstr(p, "top") && strstr(p, "top") < comma;
+        int to_right = strstr(p, "right") && strstr(p, "right") < comma;
+        int to_bottom = strstr(p, "bottom") && strstr(p, "bottom") < comma;
+        int to_left = strstr(p, "left") && strstr(p, "left") < comma;
+        if      (to_top && to_right)    angle = 45.0f;
+        else if (to_bottom && to_right) angle = 135.0f;
+        else if (to_bottom && to_left)  angle = 225.0f;
+        else if (to_top && to_left)     angle = 315.0f;
+        else if (to_top)                angle = 0.0f;
+        else if (to_right)              angle = 90.0f;
+        else if (to_bottom)             angle = 180.0f;
+        else if (to_left)               angle = 270.0f;
         p = comma + 1;
     } else if (isdigit((unsigned char)*p) || *p == '-' || *p == '.') {
         char* endp;
@@ -3134,7 +3388,11 @@ static void parse_linear_gradient(const char* val, StyleRule* rule) {
     parse_gradient_stops(&p, rule);
     if (rule->grad_stop_count < 2) return;
 
-    apply_gradient_rule(rule, GRAD_LINEAR, angle * (float)M_PI / 180.0f, 0.5f, 0.5f, 0.75f);
+    float radians = angle * (float)M_PI / 180.0f;
+    /* The centre uniform is unused by linear gradients; cache the direction
+       there so the fragment shader does no trigonometry per pixel. */
+    apply_gradient_rule(rule, GRAD_LINEAR, radians,
+                        sinf(radians), cosf(radians), 0.75f);
 }
 
 // Parse radial-gradient(shape at cx cy, stops...)
@@ -3145,7 +3403,10 @@ static void parse_radial_gradient(const char* val, StyleRule* rule) {
     p++;
     while (isspace((unsigned char)*p)) p++;
 
-    float cx = 0.5f, cy = 0.5f, radius = 0.75f;
+    /* A negative radius is the CSS default `farthest-corner`.  It is resolved
+       against the actual paint box in the shader, including off-centre
+       gradients; a fixed fraction cannot reproduce that geometry. */
+    float cx = 0.5f, cy = 0.5f, radius = -1.0f;
     float rx = 0.0f, ry = 0.0f; /* ellipse radii (fraction if pct, pixels otherwise) */
     int rx_pct = 0, ry_pct = 0;
     int is_ellipse = 0;
@@ -3352,9 +3613,6 @@ static void rule_to_bg_layer(const StyleRule* rule, LunaBgLayer* layer) {
     layer->has_color = rule->has_bg;
     layer->r = rule->bg_r; layer->g = rule->bg_g;
     layer->b = rule->bg_b; layer->a = rule->bg_a;
-    layer->has_bg_image = rule->has_bg_image;
-    if (rule->has_bg_image)
-        snprintf(layer->image_path, sizeof(layer->image_path), "%s", rule->bg_image_path);
 }
 
 /* Split a CSS value string on top-level commas (commas inside () are not separators).
@@ -3434,6 +3692,8 @@ static void parse_background_shorthand(const char* val, StyleRule* rule) {
     /* Multiple layers */
     rule->has_bg = 1;
     rule->bg_layer_count = 0;
+    if (!rule->bg_layers) rule->bg_layers = rule_bg_layers_acquire();
+    if (!rule->bg_layers) return;
     for (int li = 0; li < n && li < LUNA_MAX_BG_LAYERS; li++) {
         char* piece = pieces[li];
         trim_whitespace(piece);
@@ -3818,9 +4078,10 @@ static void parse_single_grid_track(const char* val, float* size, int* type, flo
 }
 
 static void parse_grid_template_areas(const char* val, StyleRule* rule) {
-    memset(rule->grid_area_cell, 0, sizeof(rule->grid_area_cell));
+    char cells[MAX_GRID_AREA_ROWS][MAX_GRID_AREA_COLS][32] = {{{0}}};
     rule->grid_area_rows = 0;
     rule->grid_area_cols = 0;
+    rule->grid_area_rect_count = 0;
     const char* p = val;
     while (*p && rule->grid_area_rows < MAX_GRID_AREA_ROWS) {
         while (*p && isspace((unsigned char)*p)) p++;
@@ -3834,7 +4095,7 @@ static void parse_grid_template_areas(const char* val, StyleRule* rule) {
         int col = 0;
         char* tok = strtok(rowbuf, " \t");
         while (tok && col < MAX_GRID_AREA_COLS) {
-            strncpy(rule->grid_area_cell[rule->grid_area_rows][col], tok, 31);
+            strncpy(cells[rule->grid_area_rows][col], tok, 31);
             tok = strtok(NULL, " \t");
             col++;
         }
@@ -3842,25 +4103,21 @@ static void parse_grid_template_areas(const char* val, StyleRule* rule) {
         rule->grid_area_rows++;
     }
     rule->has_grid_template_areas = (rule->grid_area_rows > 0);
-}
 
-static void compile_grid_area_rects(LunaElement* cont) {
-    cont->grid_area_rect_count = 0;
-    int rows = cont->grid_area_rows, cols = cont->grid_area_cols;
-    if (rows < 1 || cols < 1) return;
+    int rows = rule->grid_area_rows, cols = rule->grid_area_cols;
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
-            char* name = cont->grid_area_cell[r][c];
+            const char* name = cells[r][c];
             if (!name[0] || strcmp(name, ".") == 0) continue;
             int found = 0;
-            for (int i = 0; i < cont->grid_area_rect_count; i++) {
-                if (strcmp(cont->grid_area_rects[i].name, name) == 0) { found = 1; break; }
+            for (int i = 0; i < rule->grid_area_rect_count; i++) {
+                if (strcmp(rule->grid_area_rects[i].name, name) == 0) { found = 1; break; }
             }
             if (found) continue;
             int minc = c, maxc = c, minr = r, maxr = r;
             for (int r2 = 0; r2 < rows; r2++) {
                 for (int c2 = 0; c2 < cols; c2++) {
-                    if (strcmp(cont->grid_area_cell[r2][c2], name) == 0) {
+                    if (strcmp(cells[r2][c2], name) == 0) {
                         if (c2 < minc) minc = c2;
                         if (c2 > maxc) maxc = c2;
                         if (r2 < minr) minr = r2;
@@ -3868,9 +4125,10 @@ static void compile_grid_area_rects(LunaElement* cont) {
                     }
                 }
             }
-            if (cont->grid_area_rect_count >= MAX_GRID_AREAS) continue;
-            GridAreaRect* ar = &cont->grid_area_rects[cont->grid_area_rect_count++];
+            if (rule->grid_area_rect_count >= MAX_GRID_AREAS) continue;
+            GridAreaRect* ar = &rule->grid_area_rects[rule->grid_area_rect_count++];
             strncpy(ar->name, name, 31);
+            ar->name[31] = '\0';
             ar->col = minc; ar->row = minr;
             ar->col_span = maxc - minc + 1;
             ar->row_span = maxr - minr + 1;
@@ -4136,6 +4394,11 @@ static void apply_element_inline_style(LunaElement* e) {
             e->grad_rad_cy = rule.grad_rad_cy;
             e->grad_rad_r = rule.grad_rad_r;
         }
+        if (rule.bg_layer_count > 0 && rule.bg_layers && element_bg_layers_ensure(e)) {
+            e->bg_layer_count = rule.bg_layer_count;
+            memcpy(e->bg_layers, rule.bg_layers,
+                   (size_t)rule.bg_layer_count * sizeof(rule.bg_layers[0]));
+        }
     }
     if (rule.has_color) {
         e->t_r = rule.c_r; e->t_g = rule.c_g; e->t_b = rule.c_b; e->t_a = rule.c_a;
@@ -4230,6 +4493,7 @@ static void apply_element_inline_style(LunaElement* e) {
     if (rule.has_line_clamp) e->line_clamp = rule.line_clamp;
     if (rule.has_text_transform) e->text_transform = rule.text_transform;
     if (rule.has_text_decoration) e->text_decoration = rule.text_decoration;
+    rule_bg_layers_release(rule.bg_layers);
     g_layout_dirty = 1; g_render_order_dirty = 1;
 }
 
@@ -4248,10 +4512,15 @@ static const char* class_next_token(const char* p, char* out, size_t out_n) {
 
 int element_has_class(LunaElement* e, const char* cls) {
     if (!e || !cls || !*cls) return 0;
-    char tok[96];
+    size_t wanted = strlen(cls);
     const char* p = e->class_name;
-    while ((p = class_next_token(p, tok, sizeof(tok))) != NULL)
-        if (!strcmp(tok, cls)) return 1;
+    while (*p) {
+        while (*p && rule_ws((unsigned char)*p)) p++;
+        const char* start = p;
+        while (*p && !rule_ws((unsigned char)*p)) p++;
+        if ((size_t)(p - start) == wanted && memcmp(start, cls, wanted) == 0)
+            return 1;
+    }
     return 0;
 }
 
@@ -4596,8 +4865,8 @@ static void apply_one_declaration(const char* key, const char* val, StyleRule* r
     if (key_len > SIZE_MAX - 4 || val_len > SIZE_MAX - 4 - key_len) return;
 
     size_t len = key_len + val_len + 4; /* ": " + ';' + NUL */
-    char* buf = (char*)malloc(len);
-    if (!buf) return;
+    char buf[CSS_MAX_STR + CSS_MAX_VALUE + 4];
+    if (len > sizeof(buf)) return;
 
     memcpy(buf, key, key_len);
     buf[key_len] = ':';
@@ -4606,7 +4875,6 @@ static void apply_one_declaration(const char* key, const char* val, StyleRule* r
     buf[key_len + 2 + val_len] = ';';
     buf[key_len + 3 + val_len] = 0;
     parse_declarations(buf, rule);
-    free(buf);
 }
 
 /* Map the CSS family stack to one of Luna UI's loaded font roles.
@@ -5851,14 +6119,19 @@ void parse_declarations(char* declarations, StyleRule* rule) {
     }
 }
 
-int cmp_rules_by_specificity(const void* a, const void* b) {
-    const StyleRule* ra = (const StyleRule*)a;
-    const StyleRule* rb = (const StyleRule*)b;
+static int cmp_rule_order(const void* a, const void* b) {
+    const StyleRule* ra = &css_rules[*(const int*)a];
+    const StyleRule* rb = &css_rules[*(const int*)b];
     if (ra->specificity != rb->specificity)
         return ra->specificity < rb->specificity ? -1 : 1;
     if (ra->source_order != rb->source_order)
         return ra->source_order < rb->source_order ? -1 : 1;
     return 0;
+}
+
+static void rebuild_rule_order(void) {
+    for (int i = 0; i < rule_count; i++) g_rule_order[i] = i;
+    qsort(g_rule_order, (size_t)rule_count, sizeof(g_rule_order[0]), cmp_rule_order);
 }
 
 /* ── Build a StyleRule from one parsed CSSRule ──────────────────────── */
@@ -5990,15 +6263,21 @@ static int simple_selector_spec(const SimpleSelector *ss) {
 /* Ingest one cssparser.h CSSRule into the global css_rules[] array.
    For each selector in the rule a separate StyleRule entry is created. */
 static void ingest_parsed_rule(const CSSRule *pr) {
-    /* Build declaration-derived template once */
-    StyleRule tmpl; memset(&tmpl, 0, sizeof(tmpl));
-    int has_important = 0;
+    /* Importance belongs to each declaration, not to the selector/rule.  Two
+       compact templates preserve that boundary without adding per-property
+       cascade bookkeeping to LunaElement's hot style path. */
+    StyleRule tmpl[2]; memset(tmpl, 0, sizeof(tmpl));
+    int template_used[2] = {0, 0};
     for (int di = 0; di < pr->decl_count; di++) {
-        apply_one_declaration(pr->decls[di].property, pr->decls[di].value, &tmpl);
-        if (pr->decls[di].important) has_important = 1;
+        int importance = pr->decls[di].important ? 1 : 0;
+        apply_one_declaration(pr->decls[di].property, pr->decls[di].value,
+                              &tmpl[importance]);
+        template_used[importance] = 1;
     }
 
-    for (int si = 0; si < pr->selector_count && rule_count < MAX_RULES; si++) {
+    for (int importance = 0; importance < 2; importance++) {
+      if (!template_used[importance]) continue;
+      for (int si = 0; si < pr->selector_count && rule_count < MAX_RULES; si++) {
         const CSSSelector *cs = &pr->selectors[si];
         if (cs->compound_count == 0) continue;
 
@@ -6024,7 +6303,7 @@ static void ingest_parsed_rule(const CSSRule *pr) {
             if (pseudo_elem_type == -1) continue; /* drop unsupported pseudo-elements */
         }
 
-        StyleRule rule = tmpl;
+        StyleRule rule = tmpl[importance];
         rule.pseudo_elem = pseudo_elem_type;
         int is_hover = 0, is_active = 0, is_focus = 0, is_fvis = 0, is_fwithin = 0;
 
@@ -6066,7 +6345,7 @@ static void ingest_parsed_rule(const CSSRule *pr) {
         if (is_fvis)     spec += 10;
         if (is_fwithin)  spec += 10;
         if (is_focus && !is_fvis) spec += 10;
-        if (has_important) spec += 10000; /* !important boosts over any selector specificity */
+        if (importance) spec += 10000; /* !important beats every normal declaration */
         rule.specificity = spec;
 
         /* Store selector string for debugging */
@@ -6081,7 +6360,9 @@ static void ingest_parsed_rule(const CSSRule *pr) {
                 g_has_structural_selectors = 1;
 
         rule.source_order = rule_count;
+        if (!luna_ensure_rule_capacity(rule_count + 1)) return;
         css_rules[rule_count++] = rule;
+      }
     }
 }
 
@@ -6122,6 +6403,7 @@ static void keyframe_stop_from_rule(const CSSRule* kr, KeyframeStop* stop) {
             /* orb-pulse style animations use box-shadow blur */
             (void)tmp;
         }
+        rule_bg_layers_release(tmp.bg_layers);
     }
 }
 
@@ -6246,7 +6528,7 @@ void parse_css(const char* css_text) {
     ingest_keyframes_from_sheet(sheet);
 
     css_free(sheet);
-    qsort(css_rules, rule_count, sizeof(StyleRule), cmp_rules_by_specificity);
+    rebuild_rule_order();
     rebuild_rule_index();
 }
 
@@ -6275,6 +6557,8 @@ static void update_focus_within_styles(int idx) {
 void update_element_style(LunaElement* e) {
     /* Preserve an unchanged animation timeline across unrelated hover/focus
      * style resolutions; restart only when its definition changes. */
+    int prev_scroll_activity = e->scroll_smooth || e->scroll_snap_type;
+    int prev_css_activity = e->has_css_animation && e->anim_name[0] && !e->anim_finished;
     char prev_anim_name[64];
     snprintf(prev_anim_name, sizeof(prev_anim_name), "%s", e->anim_name);
     int prev_has_animation = e->has_css_animation;
@@ -6319,6 +6603,8 @@ void update_element_style(LunaElement* e) {
     e->has_flex_basis = 0;
     e->flex_basis = 0.0f;
     e->flex_basis_auto = 1;
+    e->has_inline_text_flow = 0;
+    e->inline_text_x = e->inline_text_w = 0.0f;
     /* Browser UA styles size form controls with border-box semantics.  Keep
        ordinary elements content-box unless author CSS overrides box-sizing. */
     e->box_sizing = (strcmp(e->type, "button") == 0 ||
@@ -6346,7 +6632,6 @@ void update_element_style(LunaElement* e) {
     e->grid_auto_col_min = 0.0f;
     e->grid_area_rows = e->grid_area_cols = 0;
     e->grid_area_rect_count = 0;
-    memset(e->grid_area_cell, 0, sizeof(e->grid_area_cell));
     /* Scroll offsets, destinations, and measured content extents are runtime
      * state, not computed CSS.  Restyling for :hover, :focus, class changes,
      * or dialog visibility must preserve them.  apply_scroll_metrics()
@@ -6415,6 +6700,20 @@ void update_element_style(LunaElement* e) {
             e->t_r = parent->t_r; e->t_g = parent->t_g;
             e->t_b = parent->t_b; e->t_a = parent->t_a;
         }
+    }
+    /* Chromium/WebKit expose buttons as inline-block controls whose contents
+       use one centered inline row and the small-control system font.  Luna's
+       outer formatting code already shrink-wraps controls; using the flex-row
+       inner path gives nested spans the same one-line measurement/order while
+       staying allocation-free.  Author display/font/alignment rules below
+       remain able to override every one of these UA defaults. */
+    if (strcmp(e->type, "button") == 0) {
+        e->display_mode = DISPLAY_FLEX;
+        e->flex_direction = FLEX_DIR_ROW;
+        e->justify_content = FLEX_JUSTIFY_CENTER;
+        e->align_items = FLEX_ALIGN_CENTER;
+        e->font_size = 13.333333f;
+        e->line_height = 0.0f;
     }
     /* Compact browser-UA defaults.  They live below author rules in the
      * cascade, so a longhand such as `h1 { margin-bottom:12px }` must not
@@ -6487,10 +6786,10 @@ void update_element_style(LunaElement* e) {
     int author_margin_bottom = 0, author_margin_left = 0;
     uint64_t rule_candidates[LUNA_RULE_WORDS];
     build_rule_candidates(e, rule_candidates);
-    for (int i = 0; i < rule_count; i++) {
-        if (!(rule_candidates[(unsigned)i >> 6] &
-              (UINT64_C(1) << ((unsigned)i & 63u)))) continue;
-        StyleRule* r = &css_rules[i];
+    for (int order = rule_candidate_next(rule_candidates, -1);
+         order >= 0;
+         order = rule_candidate_next(rule_candidates, order)) {
+        StyleRule* r = &css_rules[g_rule_order[order]];
         if (!selector_matches(r, e)) continue;
         if (r->is_hover  && !e->is_hovered) continue;
         if (r->is_active && !e->is_active)  continue;
@@ -6543,7 +6842,7 @@ void update_element_style(LunaElement* e) {
                 e->grad_rad_ry = 0.0f;
             }
             /* Copy multiple background layers */
-            if (r->bg_layer_count > 0) {
+            if (r->bg_layer_count > 0 && r->bg_layers && element_bg_layers_ensure(e)) {
                 e->bg_layer_count = r->bg_layer_count;
                 for (int li = 0; li < r->bg_layer_count && li < LUNA_MAX_BG_LAYERS; li++)
                     e->bg_layers[li] = r->bg_layers[li];
@@ -6776,7 +7075,9 @@ void update_element_style(LunaElement* e) {
         if (r->has_grid_template_areas) {
             e->grid_area_rows = r->grid_area_rows;
             e->grid_area_cols = r->grid_area_cols;
-            memcpy(e->grid_area_cell, r->grid_area_cell, sizeof(e->grid_area_cell));
+            e->grid_area_rect_count = r->grid_area_rect_count;
+            memcpy(e->grid_area_rects, r->grid_area_rects,
+                   (size_t)r->grid_area_rect_count * sizeof(r->grid_area_rects[0]));
             if (!r->has_grid_template_columns && r->grid_area_cols > 0) {
                 e->grid_col_count = r->grid_area_cols;
                 for (int t = 0; t < e->grid_col_count; t++) {
@@ -6793,7 +7094,6 @@ void update_element_style(LunaElement* e) {
                     e->grid_row_min[t] = 0.0f;
                 }
             }
-            compile_grid_area_rects(e);
         }
         if (r->has_column_gap) e->grid_col_gap = r->grid_col_gap;
         if (r->has_row_gap) e->grid_row_gap = r->grid_row_gap;
@@ -6951,15 +7251,15 @@ void update_element_style(LunaElement* e) {
     /* ::before/::after must not steal clicks; style reset clears the flag. */
     if (e->generated_pseudo) e->pointer_events_none = 1;
     if (e->z_override_valid) e->z_index = e->z_override;
-    g_activity_registry_dirty = 1;
+    if (prev_scroll_activity != (e->scroll_smooth || e->scroll_snap_type) ||
+        prev_css_activity != (e->has_css_animation && e->anim_name[0] && !e->anim_finished))
+        g_activity_registry_dirty = 1;
     visual_activate_idx((int)(e - elements));
 }
 
 
-/* Computed CSS and runtime layout state used to be mixed together.  A hover or
- * class restyle could therefore require a layout but there was no reliable way
- * to know it.  Compare only geometry/intrinsic-size inputs: visual-only state
- * (colors, opacity, shadows, transforms) stays on the cheap paint path. */
+/* Compare only geometry/intrinsic-size inputs: visual-only state (colors,
+ * opacity, shadows and transforms) stays on the cheap paint path. */
 static int layout_style_changed(const LunaElement* a, const LunaElement* b) {
 #define LUNA_LAYOUT_DIFF(f) do { if (a->f != b->f) return 1; } while (0)
 #define LUNA_LAYOUT_MEM(f)  do { if (memcmp(&a->f, &b->f, sizeof(a->f)) != 0) return 1; } while (0)
@@ -7019,7 +7319,11 @@ static int layout_style_changed(const LunaElement* a, const LunaElement* b) {
     LUNA_LAYOUT_DIFF(grid_auto_row_min); LUNA_LAYOUT_DIFF(grid_auto_col_min);
     LUNA_LAYOUT_DIFF(has_grid_auto_rows); LUNA_LAYOUT_DIFF(has_grid_auto_columns);
     LUNA_LAYOUT_DIFF(grid_area_rows); LUNA_LAYOUT_DIFF(grid_area_cols);
-    LUNA_LAYOUT_MEM(grid_area_cell);
+    LUNA_LAYOUT_DIFF(grid_area_rect_count);
+    if (a->grid_area_rect_count > 0 &&
+        memcmp(a->grid_area_rects, b->grid_area_rects,
+               (size_t)a->grid_area_rect_count * sizeof(a->grid_area_rects[0])) != 0)
+        return 1;
     LUNA_LAYOUT_DIFF(grid_col); LUNA_LAYOUT_DIFF(grid_row);
     LUNA_LAYOUT_DIFF(grid_col_span); LUNA_LAYOUT_DIFF(grid_row_span);
     LUNA_LAYOUT_DIFF(has_grid_col); LUNA_LAYOUT_DIFF(has_grid_row);
@@ -7068,10 +7372,10 @@ static void generate_pseudo_elements(void) {
         /* Check only rules whose target key can match this host. */
         uint64_t rule_candidates[LUNA_RULE_WORDS];
         build_rule_candidates(host, rule_candidates);
-        for (int ri = 0; ri < rule_count && elem_count < MAX_ELEMENTS; ri++) {
-            if (!(rule_candidates[(unsigned)ri >> 6] &
-                  (UINT64_C(1) << ((unsigned)ri & 63u)))) continue;
-            StyleRule* r = &css_rules[ri];
+        for (int order = rule_candidate_next(rule_candidates, -1);
+             order >= 0 && elem_count < MAX_ELEMENTS;
+             order = rule_candidate_next(rule_candidates, order)) {
+            StyleRule* r = &css_rules[g_rule_order[order]];
             if (!r->pseudo_elem) continue; /* not a pseudo-element rule */
             /* Skip hover/focus/active-only pseudo rules for now */
             if (r->is_hover || r->is_active || r->is_focus) continue;
@@ -7096,7 +7400,10 @@ static void generate_pseudo_elements(void) {
             }
             if (existing >= 0) continue; /* already created */
 
-            /* Spawn a synthetic element */
+            /* Spawn a synthetic element. realloc may move the DOM, so refresh
+             * host after growing before any further host access. */
+            if (!luna_ensure_element_capacity(elem_count + 1)) break;
+            host = &elements[ei];
             int ni = elem_count++;
             LunaElement* pe = &elements[ni];
             memset(pe, 0, sizeof(*pe));
@@ -7417,6 +7724,10 @@ void parse_html(const char* html) {
             for (int i = 0; i < elem_count; i++)
                 if (strcmp(elements[i].type, "body") == 0) { existing = i; break; }
             if (existing == -1 && elem_count < MAX_ELEMENTS) {
+                if (!luna_ensure_element_capacity(elem_count + 1)) {
+                    p = tag_end + 1;
+                    continue;
+                }
                 int bi = elem_count++;
                 memset(&elements[bi], 0, sizeof(LunaElement));
                 elements[bi].tabindex = -2;
@@ -7546,6 +7857,7 @@ void parse_html(const char* html) {
         snprintf(e.class_name, sizeof(e.class_name), "%s", class_name);
         snprintf(e.id, sizeof(e.id), "%s", id);
         snprintf(e.text, sizeof(e.text), "%s", text);
+        e.direct_text_before_children = text[0] != '\0';
         if (onclick_expr[0]) parse_onclick_expr(onclick_expr, e.onclick, (int)sizeof(e.onclick));
         if (data_tab[0]) snprintf(e.data_tab, sizeof(e.data_tab), "%s", data_tab);
         if (style_attr[0]) {
@@ -7598,6 +7910,7 @@ void parse_html(const char* html) {
             if (e.is_input && !e.input_multiline) e.white_space = 1; /* nowrap */
         }
 
+        if (!luna_ensure_element_capacity(elem_count + 1)) break;
         elements[elem_count] = e;
         update_element_style(&elements[elem_count]);
 
@@ -7699,9 +8012,6 @@ static float intrinsic_grid_content_height(LunaElement* grid,
                                            int n) {
     float row_h[MAX_GRID_AREA_ROWS] = {0};
     unsigned char occupied[MAX_GRID_AREA_ROWS][MAX_GRID_AREA_COLS] = {{0}};
-
-    if (grid->grid_area_rect_count == 0 && grid->grid_area_rows > 0)
-        compile_grid_area_rects(grid);
 
     int cols = grid->grid_col_count;
     int rows = grid->grid_row_count;
@@ -7859,6 +8169,39 @@ static float css_used_line_height(const LunaElement* e) {
     if (lh < 0.0f) lh = -lh * fs;
     if (lh <= 0.0f) lh = css_normal_line_height(fs);
     return lh;
+}
+
+static int utf8_codepoint_count(const char* text) {
+    int count = 0;
+    const char* p = text ? text : "";
+    while (*p) { (void)utf8_decode(&p); count++; }
+    return count;
+}
+
+/* Width of the direct text run only (no padding/border).  Keeping this helper
+   shared by intrinsic sizing and inline-row placement prevents the two paths
+   from disagreeing by the old four-pixel safety fudge. */
+static float element_text_run_width(const LunaElement* e) {
+    if (!e || !e->text[0]) return 0.0f;
+    if (font_loaded) {
+        FontAtlas* atlas = get_atlas(e->font_size, e->font_bold, NULL);
+        text_metrics_begin(e->font_size, e->font_bold, e->font_face, atlas);
+        g_text_letter_spacing = e->letter_spacing;
+        float width = measure_text_width(atlas, e->text);
+        g_text_letter_spacing = 0.0f;
+        text_metrics_end();
+        return width;
+    }
+    return (float)utf8_codepoint_count(e->text) * e->font_size * 0.55f;
+}
+
+/* CSS adjoining vertical margins collapse to the largest positive margin plus
+   the most-negative margin.  This handles positive, negative, and mixed pairs
+   without branches in the block layout hot path. */
+static float collapse_vertical_margins(float a, float b) {
+    float positive = fmaxf(fmaxf(a, b), 0.0f);
+    float negative = fminf(fminf(a, b), 0.0f);
+    return positive + negative;
 }
 
 static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
@@ -8050,8 +8393,28 @@ static float flow_content_height(LunaElement* e) {
             } else {
                 inner = maxh;
             }
+        } else if (row) {
+            inner = maxh;
+        } else if (e->display_mode == DISPLAY_FLEX) {
+            /* Flex-item margins never collapse. */
+            inner = total + (n > 1 ? e->flex_gap * (float)(n - 1) : 0.0f);
         } else {
-            inner = row ? maxh : (total + (n > 1 ? e->flex_gap * (float)(n - 1) : 0.0f));
+            /* Adjoining block margins share one margin area.  kid_h contains
+               both margins, so peel them off and rebuild the block-axis sum
+               with CSS margin collapsing. */
+            inner = 0.0f;
+            float previous_bottom = 0.0f;
+            for (int k = 0; k < n; k++) {
+                LunaElement* ch = &elements[kids[k]];
+                float border_h = kid_h[k] - ch->margin_top - ch->margin_bottom;
+                if (border_h < 0.0f) border_h = 0.0f;
+                inner += (k == 0)
+                    ? ch->margin_top
+                    : collapse_vertical_margins(previous_bottom, ch->margin_top);
+                inner += border_h;
+                previous_bottom = ch->margin_bottom;
+            }
+            inner += previous_bottom;
         }
         return inner + e->pad_t + e->pad_b + e->border_width * 2.0f;
     }
@@ -8094,18 +8457,8 @@ static float intrinsic_content_width(LunaElement* e) {
            overlay.  Include it in intrinsic sizing so min-width does not
            clip icon labels such as Wi-Fi or AC power state. */
         if (row && e->text[0]) {
-            float tw;
-            if (font_loaded) {
-                FontAtlas* atlas = get_atlas(e->font_size, e->font_bold, NULL);
-                text_metrics_begin(e->font_size, e->font_bold, e->font_face, atlas);
-                g_text_letter_spacing = e->letter_spacing;
-                tw = measure_text_width(atlas, e->text);
-                g_text_letter_spacing = 0.0f;
-                text_metrics_end();
-            } else {
-                tw = strlen(e->text) * (float)e->font_size * 0.55f;
-            }
-            inner += tw;
+            inner += element_text_run_width(e);
+            if (n > 0) inner += e->flex_gap;
         }
         result = inner + e->pad_l + e->pad_r + e->border_width * 2.0f;
         goto done;
@@ -8126,15 +8479,17 @@ static float intrinsic_content_width(LunaElement* e) {
             tbuf[n] = '\0';
             txt = tbuf;
         }
-        float tw = measure_text_width(atlas, txt) + e->pad_l + e->pad_r + 4.0f;
+        float tw = measure_text_width(atlas, txt) + e->pad_l + e->pad_r +
+                   e->border_width * 2.0f;
         g_text_letter_spacing = 0.0f;
         text_metrics_end();
         result = tw;
         goto done;
     }
     if (e->text[0]) {
-        result = strlen(e->text) * (float)(e->font_size > 0 ? e->font_size : 12) * 0.55f +
-                 e->pad_l + e->pad_r + 4.0f;
+        result = (float)utf8_codepoint_count(e->text) *
+                 (float)(e->font_size > 0 ? e->font_size : 12) * 0.55f +
+                 e->pad_l + e->pad_r + e->border_width * 2.0f;
         goto done;
     }
     if (e->w > 0.0f && e->w < 200.0f && e->w != 100.0f)
@@ -8176,7 +8531,12 @@ static float min_content_width(LunaElement* e) {
     }
     if (n > 0) {
         int row = (e->display_mode == DISPLAY_FLEX && e->flex_direction == FLEX_DIR_ROW);
-        result = (row ? total + e->flex_gap * (float)(n - 1) : maxw) +
+        float inner = row ? total + e->flex_gap * (float)(n - 1) : maxw;
+        if (row && e->text[0]) {
+            inner += element_text_run_width(e);
+            if (n > 0) inner += e->flex_gap;
+        }
+        result = inner +
                  e->pad_l + e->pad_r + e->border_width * 2.0f;
     } else if (e->text[0]) {
         FontAtlas* atlas = font_loaded ? get_atlas(e->font_size, e->font_bold, NULL) : NULL;
@@ -8206,7 +8566,7 @@ static float min_content_width(LunaElement* e) {
         }
         g_text_letter_spacing = 0.0f;
         if (font_loaded) text_metrics_end();
-        result = longest + e->pad_l + e->pad_r + e->border_width * 2.0f + 4.0f;
+        result = longest + e->pad_l + e->pad_r + e->border_width * 2.0f;
     } else {
         result = e->pad_l + e->pad_r + e->border_width * 2.0f;
     }
@@ -8242,6 +8602,8 @@ static void layout_block_container(int container_idx) {
     if (inner_w < 0.0f) inner_w = 0.0f;
     if (inner_h < 0.0f) inner_h = 0.0f;
     float y = cont->border_width + cont->pad_t;
+    float previous_bottom = 0.0f;
+    int have_previous = 0;
 
     for (int c = 0; c < elem_count; c++) {
         if (elements[c].parent_idx != container_idx) continue;
@@ -8274,7 +8636,6 @@ static void layout_block_container(int container_idx) {
 
         if (!ch->has_css_height && !ch->pct_h) {
             ch->h = flow_content_height(ch);
-            if (ch->h < 14.0f) ch->h = 14.0f;
         }
         if (ch->has_min_height) {
             float min_h = css_outer_height(ch, ch->css_min_height);
@@ -8299,9 +8660,19 @@ static void layout_block_container(int container_idx) {
             auto_left = auto_space;
 
         ch->rel_x = cont->border_width + cont->pad_l + auto_left;
-        ch->rel_y = y;
-        y += ch->margin_top + ch->h + ch->margin_bottom;
+        float collapsed_before = have_previous
+            ? collapse_vertical_margins(previous_bottom, ch->margin_top)
+            : ch->margin_top;
+        float border_y = y + collapsed_before;
+        /* Global position resolution adds margin_top once.  Store the
+           pre-margin coordinate so the final border edge lands at border_y. */
+        ch->rel_y = border_y - ch->margin_top;
+        y = border_y + ch->h;
+        previous_bottom = ch->margin_bottom;
+        have_previous = 1;
     }
+
+    if (have_previous) y += previous_bottom;
 
     /* height:auto on absolute/fixed → shrink-wrap in-flow children (browser parity).
        Without this, menus/panels keep a collapsed height and only paint a short
@@ -8814,34 +9185,47 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
 static void layout_inline_text_after_flex(LunaElement* cont, const int* kids, int n) {
     cont->has_inline_text_flow = 0;
     cont->inline_text_x = 0.0f;
+    cont->inline_text_w = 0.0f;
     if (cont->flex_direction != FLEX_DIR_ROW || !cont->text[0] || n <= 0) return;
 
-    FontAtlas* atlas = get_atlas(cont->font_size, cont->font_bold, NULL);
-    if (font_loaded)
-        text_metrics_begin(cont->font_size, cont->font_bold, cont->font_face, atlas);
-    g_text_letter_spacing = cont->letter_spacing;
-    float text_w = font_loaded ? measure_text_width(atlas, cont->text)
-                              : strlen(cont->text) * cont->font_size * 0.55f;
-    g_text_letter_spacing = 0.0f;
-    if (font_loaded) text_metrics_end();
+    float text_w = element_text_run_width(cont);
     if (text_w <= 0.0f) return;
 
+    /* Direct text is an anonymous flex item in source order.  layout_flex_line
+       initially positions only materialized element children; translate that
+       group by exactly the missing anonymous-item width (and one gap) rather
+       than allocating a synthetic DOM node. */
+    float anonymous_main = text_w + cont->flex_gap;
     float shift = 0.0f;
-    if (cont->justify_content == FLEX_JUSTIFY_CENTER) shift = -text_w * 0.5f;
-    else if (cont->justify_content == FLEX_JUSTIFY_END) shift = -text_w;
+    if (cont->direct_text_before_children) {
+        if (cont->justify_content == FLEX_JUSTIFY_START) shift = anonymous_main;
+        else if (cont->justify_content == FLEX_JUSTIFY_CENTER) shift = anonymous_main * 0.5f;
+    } else {
+        if (cont->justify_content == FLEX_JUSTIFY_CENTER) shift = -anonymous_main * 0.5f;
+        else if (cont->justify_content == FLEX_JUSTIFY_END) shift = -anonymous_main;
+    }
     if (shift != 0.0f) {
         for (int k = 0; k < n; k++)
             if (!(elements[kids[k]].css_positioned & 1)) elements[kids[k]].rel_x += shift;
     }
 
-    float right = cont->pad_l;
+    float left = 1.0e30f;
+    float right = -1.0e30f;
     for (int k = 0; k < n; k++) {
         LunaElement* ch = &elements[kids[k]];
         if (ch->css_positioned & 1) continue;
-        float edge = ch->rel_x + ch->w + ch->margin_right;
-        if (edge > right) right = edge;
+        /* rel_x is the margin-box start; global position resolution adds the
+           leading margin before reaching the child's border box. */
+        float child_left = ch->rel_x;
+        float child_right = ch->rel_x + ch->margin_left + ch->w + ch->margin_right;
+        if (child_left < left) left = child_left;
+        if (child_right > right) right = child_right;
     }
-    cont->inline_text_x = right;
+    if (left > right) return;
+    cont->inline_text_x = cont->direct_text_before_children
+        ? left - cont->flex_gap - text_w
+        : right + cont->flex_gap;
+    cont->inline_text_w = text_w;
     cont->has_inline_text_flow = 1;
 }
 
@@ -9135,9 +9519,6 @@ typedef struct {
 
 static void layout_grid_container(int container_idx) {
     LunaElement* cont = &elements[container_idx];
-    if (cont->grid_area_rect_count == 0 && cont->grid_area_rows > 0)
-        compile_grid_area_rects(cont);
-
     int tmpl_cols = cont->grid_col_count;
     int tmpl_rows = cont->grid_row_count;
     if (tmpl_cols < 1) tmpl_cols = cont->has_grid_auto_columns ? 0 : 1;
@@ -9570,6 +9951,7 @@ static void apply_scroll_offsets(void) {
 
 static void apply_scroll_metrics(void) {
     unsigned char visible[MAX_ELEMENTS];
+    g_scroll_container_count = 0;
 
     /* Parent indices are normally earlier than children, so visibility can be
      * propagated while clearing each scroll container's measured extent. */
@@ -9579,6 +9961,7 @@ static void apply_scroll_metrics(void) {
                      (p < 0 ? 1 : (p < i ? visible[p] : is_visible(i))));
         if (overflow_scrollable(elements[i].overflow_y) ||
             overflow_scrollable(elements[i].overflow_x)) {
+            g_scroll_container_idx[g_scroll_container_count++] = i;
             elements[i].scroll_content_h = 0.0f;
             elements[i].scroll_content_w = 0.0f;
         }
@@ -9597,9 +9980,9 @@ static void apply_scroll_metrics(void) {
         if (right  > c->scroll_content_w) c->scroll_content_w = right;
     }
 
-    for (int i = 0; i < elem_count; i++) {
+    for (int si = 0; si < g_scroll_container_count; si++) {
+        int i = g_scroll_container_idx[si];
         LunaElement* c = &elements[i];
-        if (!overflow_scrollable(c->overflow_y) && !overflow_scrollable(c->overflow_x)) continue;
         float inner_h = c->h - c->pad_t - c->pad_b;
         float inner_w = c->w - c->pad_l - c->pad_r;
         if (inner_h < 0.0f) inner_h = 0.0f;
@@ -9696,6 +10079,7 @@ static int ensure_overlay_element(const char* id, const char* classes, int host,
     int idx = get_element_by_id(id);
     if (idx == -1) {
         if (elem_count >= MAX_ELEMENTS) return -1;
+        if (!luna_ensure_element_capacity(elem_count + 1)) return -1;
         idx = elem_count++;
         memset(&elements[idx], 0, sizeof(LunaElement));
         elements[idx].tabindex = -2;
@@ -9768,6 +10152,8 @@ static void sync_css_overlay_elements(void) {
             place_overlay_rect(g_sb_slots[i][1], ux, uy, uw, uh, vis);
         }
 
+        /* ensure_overlay_element() may realloc elements[]. */
+        c = &elements[i];
         scrollbar_geom_x(c, &tx, &ty, &tw, &th, &ux, &uy, &uw, &uh, &vis);
         if (vis && !g_sb_slots[i][2]) {
             char id[48];
@@ -9783,7 +10169,8 @@ static void sync_css_overlay_elements(void) {
     }
 
     int a11y = get_element_by_id("luna_a11y_bar");
-    if (a11y == -1 && elem_count < MAX_ELEMENTS) {
+    if (a11y == -1 && elem_count < MAX_ELEMENTS &&
+        luna_ensure_element_capacity(elem_count + 1)) {
         a11y = elem_count++;
         memset(&elements[a11y], 0, sizeof(LunaElement));
         elements[a11y].tabindex = -2;
@@ -11048,23 +11435,37 @@ static int take_screenshot(const char* path) {
     if (fbw <= 0 || fbh <= 0) return 0;
     size_t npix = (size_t)fbw * (size_t)fbh;
     unsigned char* pixels = (unsigned char*)malloc(npix * 4);
-    unsigned char* flipped = (unsigned char*)malloc(npix * 3);
-    if (!pixels || !flipped) { free(pixels); free(flipped); return 0; }
+    if (!pixels) return 0;
     glReadPixels(0, 0, fbw, fbh, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    for (int y = 0; y < fbh; y++) {
-        const unsigned char* src = pixels + (size_t)(fbh - 1 - y) * (size_t)fbw * 4;
-        unsigned char* dst = flipped + (size_t)y * (size_t)fbw * 3;
+
+    /* Flip RGBA rows in-place. Screenshot capture is infrequent, so swapping
+     * pixels costs far less than retaining a second full-frame RGB buffer. */
+    for (int y = 0; y < fbh / 2; y++) {
+        unsigned char* top = pixels + (size_t)y * (size_t)fbw * 4;
+        unsigned char* bot = pixels + (size_t)(fbh - 1 - y) * (size_t)fbw * 4;
         for (int x = 0; x < fbw; x++) {
-            dst[x * 3 + 0] = src[x * 4 + 0];
-            dst[x * 3 + 1] = src[x * 4 + 1];
-            dst[x * 3 + 2] = src[x * 4 + 2];
+            for (int c = 0; c < 4; c++) {
+                unsigned char t = top[x * 4 + c];
+                top[x * 4 + c] = bot[x * 4 + c];
+                bot[x * 4 + c] = t;
+            }
         }
     }
+
+    /* Compact RGBA to RGB in the same allocation. The destination always
+     * trails the unread source, so a forward pass is overlap-safe. */
+    for (size_t i = 0; i < npix; i++) {
+        unsigned char r = pixels[i * 4 + 0];
+        unsigned char g = pixels[i * 4 + 1];
+        unsigned char b = pixels[i * 4 + 2];
+        pixels[i * 3 + 0] = r;
+        pixels[i * 3 + 1] = g;
+        pixels[i * 3 + 2] = b;
+    }
     int ok = g_luna_platform.save_png
-        ? g_luna_platform.save_png(path, fbw, fbh, 3, flipped, fbw * 3)
-        : stbi_write_png(path, fbw, fbh, 3, flipped, fbw * 3);
+        ? g_luna_platform.save_png(path, fbw, fbh, 3, pixels, fbw * 3)
+        : stbi_write_png(path, fbw, fbh, 3, pixels, fbw * 3);
     free(pixels);
-    free(flipped);
     if (ok) fprintf(stderr, "[vespera] Screenshot saved: %s (%dx%d)\n", path, fbw, fbh);
     else fprintf(stderr, "[vespera] Screenshot failed: %s\n", path);
     return ok != 0;
@@ -11121,61 +11522,58 @@ static void build_render_order() {
 // Font loading
 // ============================================================
 
-int bake_font_set(const unsigned char* ttf_buffer, FontAtlas* atlases) {
+static int bake_font_atlas(const unsigned char* ttf_buffer, FontAtlas* atlas, float font_size) {
+    if (!ttf_buffer || !atlas) return 0;
+    if (atlas->loaded) return 1;
     int offset = stbtt_GetFontOffsetForIndex(ttf_buffer, 0);
     if (offset < 0) offset = 0;
     stbtt_fontinfo info;
     if (!stbtt_InitFont(&info, ttf_buffer, offset)) return 0;
-    for (int i = 0; i < NUM_FONT_SIZES; i++) {
-        static unsigned char temp_bitmap[LUNA_ASCII_ATLAS_SIZE * LUNA_ASCII_ATLAS_SIZE];
-        memset(temp_bitmap, 0, sizeof(temp_bitmap));
-        memset(atlases[i].cdata, 0, sizeof(atlases[i].cdata));
+    unsigned char* temp_bitmap = (unsigned char*)calloc(
+        (size_t)LUNA_ASCII_ATLAS_SIZE, (size_t)LUNA_ASCII_ATLAS_SIZE);
+    if (!temp_bitmap) return 0;
+    memset(atlas->cdata, 0, sizeof(atlas->cdata));
 
-        float raster_scale = stbtt_ScaleForMappingEmToPixels(&info, font_sizes[i]);
-        int pack_x = 1, pack_y = 1, row_h = 0;
-        for (int cp = 32; cp < 128; cp++) {
-            int x0, y0, x1, y1, advance, lsb;
-            stbtt_GetCodepointBitmapBox(&info, cp, raster_scale, raster_scale,
-                                        &x0, &y0, &x1, &y1);
-            stbtt_GetCodepointHMetrics(&info, cp, &advance, &lsb);
-            int gw = x1 - x0, gh = y1 - y0;
-            if (gw < 1) gw = 1;
-            if (gh < 1) gh = 1;
-            if (pack_x + gw + 2 >= LUNA_ASCII_ATLAS_SIZE) {
-                pack_x = 1;
-                pack_y += row_h + 2;
-                row_h = 0;
-            }
-            if (pack_y + gh + 2 >= LUNA_ASCII_ATLAS_SIZE) return 0;
-
-            int ax = pack_x + 1, ay = pack_y + 1;
-            stbtt_MakeCodepointBitmap(&info,
-                &temp_bitmap[ay * LUNA_ASCII_ATLAS_SIZE + ax], gw, gh,
-                LUNA_ASCII_ATLAS_SIZE,
-                raster_scale, raster_scale, cp);
-            stbtt_bakedchar* bc = &atlases[i].cdata[cp - 32];
-            bc->x0 = (unsigned short)ax;
-            bc->y0 = (unsigned short)ay;
-            bc->x1 = (unsigned short)(ax + gw);
-            bc->y1 = (unsigned short)(ay + gh);
-            bc->xoff = (float)x0;
-            bc->yoff = (float)y0;
-            bc->xadvance = (float)advance * raster_scale;
-            pack_x += gw + 3;
-            if (gh > row_h) row_h = gh;
-            (void)lsb;
+    float raster_scale = stbtt_ScaleForMappingEmToPixels(&info, font_size);
+    int pack_x = 1, pack_y = 1, row_h = 0;
+    for (int cp = 32; cp < 128; cp++) {
+        int x0, y0, x1, y1, advance, lsb;
+        stbtt_GetCodepointBitmapBox(&info, cp, raster_scale, raster_scale,
+                                    &x0, &y0, &x1, &y1);
+        stbtt_GetCodepointHMetrics(&info, cp, &advance, &lsb);
+        int gw = x1 - x0, gh = y1 - y0;
+        if (gw < 1) gw = 1;
+        if (gh < 1) gh = 1;
+        if (pack_x + gw + 2 >= LUNA_ASCII_ATLAS_SIZE) {
+            pack_x = 1; pack_y += row_h + 2; row_h = 0;
         }
-        glGenTextures(1, &atlases[i].tex);
-        glBindTexture(GL_TEXTURE_2D, atlases[i].tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RED,
-                     LUNA_ASCII_ATLAS_SIZE, LUNA_ASCII_ATLAS_SIZE, 0,
-                     GL_RED, GL_UNSIGNED_BYTE, temp_bitmap);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        atlases[i].loaded = 1;
+        if (pack_y + gh + 2 >= LUNA_ASCII_ATLAS_SIZE) {
+            free(temp_bitmap);
+            return 0;
+        }
+        int ax = pack_x + 1, ay = pack_y + 1;
+        stbtt_MakeCodepointBitmap(&info,
+            &temp_bitmap[(size_t)ay * LUNA_ASCII_ATLAS_SIZE + ax], gw, gh,
+            LUNA_ASCII_ATLAS_SIZE, raster_scale, raster_scale, cp);
+        stbtt_bakedchar* bc = &atlas->cdata[cp - 32];
+        bc->x0 = (unsigned short)ax; bc->y0 = (unsigned short)ay;
+        bc->x1 = (unsigned short)(ax + gw); bc->y1 = (unsigned short)(ay + gh);
+        bc->xoff = (float)x0; bc->yoff = (float)y0;
+        bc->xadvance = (float)advance * raster_scale;
+        pack_x += gw + 3;
+        if (gh > row_h) row_h = gh;
+        (void)lsb;
     }
+    glGenTextures(1, &atlas->tex);
+    glBindTexture(GL_TEXTURE_2D, atlas->tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, LUNA_ASCII_ATLAS_SIZE,
+                 LUNA_ASCII_ATLAS_SIZE, 0, GL_RED, GL_UNSIGNED_BYTE, temp_bitmap);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    free(temp_bitmap);
+    atlas->loaded = 1;
     return 1;
 }
 
@@ -11404,7 +11802,6 @@ void init_font() {
         g_brand_font_ttf = try_load_font_list(&reg, font_path_score_brands, &brand_sz);
 
     if (reg_buf) {
-        bake_font_set(reg_buf, font_regular);
         g_font_ttf = reg_buf;
         int off = stbtt_GetFontOffsetForIndex(g_font_ttf, 0);
         if (off < 0) off = 0;
@@ -11416,7 +11813,6 @@ void init_font() {
     }
 
     if (g_bold_font_ttf) {
-        bake_font_set(g_bold_font_ttf, font_bold_atlas);
         int off = stbtt_GetFontOffsetForIndex(g_bold_font_ttf, 0);
         if (off < 0) off = 0;
         g_bold_font_info_ok = stbtt_InitFont(&g_bold_font_info, g_bold_font_ttf, off) ? 1 : 0;
@@ -11462,11 +11858,15 @@ FontAtlas* get_atlas(float size, int bold, int* out_is_fake_bold) {
         float d = fabsf(font_sizes[i] - size);
         if (d < best_diff) { best_diff = d; best = i; }
     }
-    if (bold && bold_font_loaded) {
-        if (out_is_fake_bold) *out_is_fake_bold = 0;
-        return &font_bold_atlas[best];
+    if (bold && bold_font_loaded && g_bold_font_ttf) {
+        if (bake_font_atlas(g_bold_font_ttf, &font_bold_atlas[best], font_sizes[best])) {
+            if (out_is_fake_bold) *out_is_fake_bold = 0;
+            return &font_bold_atlas[best];
+        }
     }
     if (out_is_fake_bold) *out_is_fake_bold = bold ? 1 : 0;
+    if (g_font_ttf)
+        (void)bake_font_atlas(g_font_ttf, &font_regular[best], font_sizes[best]);
     return &font_regular[best];
 }
 
@@ -11481,7 +11881,7 @@ static void text_metrics_begin(float css_px, int bold, int face, FontAtlas* atla
     g_text_css_px = css_px > 0.0f ? css_px : 16.0f;
     g_font_face_hint = face;
     g_font_bold_hint = (bold && bold_font_loaded) ? 1 : 0;
-    g_text_dynamic_ascii = (face == 3) ||
+    g_text_dynamic_ascii = (face == 3) || !atlas || !atlas->loaded ||
                            fabsf(atlas_nominal_size(atlas) - g_text_css_px) > 0.01f ||
                            text_device_scale() > 1.01f;
 }
@@ -11635,6 +12035,41 @@ static void draw_image(float x, float y, float w, float h, float radius, GLuint 
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+/* CSS lengths on gradient stops are measured on the gradient line, not on an
+   arbitrary side of the element.  Resolve that line once per draw and reuse
+   it for every stop.  This keeps the per-fragment shader small and fixes
+   angled gradients on non-square boxes. */
+static float gradient_stop_basis(int type, float angle,
+                                 float cx, float cy, float radius,
+                                 float ellipse_rx, float ellipse_ry,
+                                 float w, float h) {
+    (void)ellipse_ry;
+    if (type == GRAD_LINEAR) {
+        (void)angle;
+        float dx = cx;
+        float dy = cy;
+        float length = fabsf(dx) * w + fabsf(dy) * h;
+        return length > 0.001f ? length : 0.001f;
+    }
+    if (type == GRAD_RADIAL) {
+        if (radius >= 0.0f) {
+            float length = radius * (w > h ? w : h);
+            return length > 0.001f ? length : 0.001f;
+        }
+        float px = cx * w;
+        float py = cy * h;
+        float far_x = fmaxf(px, w - px);
+        float far_y = fmaxf(py, h - py);
+        float length = hypotf(far_x, far_y);
+        return length > 0.001f ? length : 0.001f;
+    }
+    if (type == GRAD_ELLIPSE) {
+        float length = ellipse_rx > 0.0f ? ellipse_rx : w * 0.5f;
+        return length > 0.001f ? length : 0.001f;
+    }
+    return 1.0f;
+}
+
 /* Draw one LunaBgLayer on top of the current framebuffer at (x,y,w,h).
    Used by luna_render to render stacked background layers. */
 static void draw_bg_layer(float x, float y, float w, float h,
@@ -11665,6 +12100,11 @@ static void draw_bg_layer(float x, float y, float w, float h,
     uni4f(bg_loc.uRadius4, &bg_uni.uRadius4, c4[0], c4[1], c4[2], c4[3]);
     uni1i(bg_loc.uGradient, &bg_uni.uGradient, grad_mode);
     if (layer->has_gradient) {
+        float erx = layer->grad_rad_rx_pct ? layer->grad_rad_rx * w : layer->grad_rad_rx;
+        float ery = layer->grad_rad_ry_pct ? layer->grad_rad_ry * h : layer->grad_rad_ry;
+        float stop_basis = gradient_stop_basis(layer->grad_type, layer->grad_angle,
+                                               layer->grad_rad_cx, layer->grad_rad_cy,
+                                               layer->grad_rad_r, erx, ery, w, h);
         int sc = layer->grad_stop_count;
         if (sc < 2) sc = 2;
         if (sc > MAX_GRAD_STOPS) sc = MAX_GRAD_STOPS;
@@ -11675,11 +12115,7 @@ static void draw_bg_layer(float x, float y, float w, float h,
                 pr=layer->grad_stop_r[i]; pg=layer->grad_stop_g[i];
                 pb=layer->grad_stop_b[i]; pa=layer->grad_stop_a[i];
                 pp=layer->grad_stop_pos[i];
-                if (layer->grad_stop_px_mask & (1u << i)) {
-                    float basis = layer->grad_rad_r * (w > h ? w : h);
-                    if (basis < 0.001f) basis = (w > h ? w : h);
-                    pp /= basis;
-                }
+                if (layer->grad_stop_px_mask & (1u << i)) pp /= stop_basis;
                 pa *= eff_op;
             }
             uni4f(bg_loc.uGradColors[i], &bg_uni.uGradColors[i], pr, pg, pb, pa);
@@ -11688,9 +12124,6 @@ static void draw_bg_layer(float x, float y, float w, float h,
         uni1f(bg_loc.uGradAngle,  &bg_uni.uGradAngle,  layer->grad_angle);
         uni2f(bg_loc.uGradCenter, &bg_uni.uGradCenter, layer->grad_rad_cx, layer->grad_rad_cy);
         uni1f(bg_loc.uGradRadius, &bg_uni.uGradRadius, layer->grad_rad_r);
-        /* Resolve percentage ellipse radii to pixels at draw time */
-        float erx = layer->grad_rad_rx_pct ? layer->grad_rad_rx * w : layer->grad_rad_rx;
-        float ery = layer->grad_rad_ry_pct ? layer->grad_rad_ry * h : layer->grad_rad_ry;
         uni1f(bg_loc.uGradRadRx, &bg_uni.uGradRadRx, erx);
         uni1f(bg_loc.uGradRadRy, &bg_uni.uGradRadRy, ery);
     } else {
@@ -11745,6 +12178,11 @@ void draw_rect_full(float x, float y, float w, float h,
     uni4f(bg_loc.uRadius4, &bg_uni.uRadius4, c4[0], c4[1], c4[2], c4[3]);
     uni1i(bg_loc.uGradient, &bg_uni.uGradient, grad_mode);
     if (ge && ge->has_gradient) {
+        float erx = ge->grad_rad_rx_pct ? ge->grad_rad_rx * w : ge->grad_rad_rx;
+        float ery = ge->grad_rad_ry_pct ? ge->grad_rad_ry * h : ge->grad_rad_ry;
+        float stop_basis = gradient_stop_basis(ge->grad_type, ge->grad_angle,
+                                               ge->grad_rad_cx, ge->grad_rad_cy,
+                                               ge->grad_rad_r, erx, ery, w, h);
         int sc = ge->grad_stop_count;
         if (sc < 2) sc = 2;
         if (sc > MAX_GRAD_STOPS) sc = MAX_GRAD_STOPS;
@@ -11755,11 +12193,7 @@ void draw_rect_full(float x, float y, float w, float h,
                 pr = ge->grad_stop_r[i]; pg = ge->grad_stop_g[i];
                 pb = ge->grad_stop_b[i]; pa = ge->grad_stop_a[i];
                 pp = ge->grad_stop_pos[i];
-                if (ge->grad_stop_px_mask & (1u << i)) {
-                    float basis = ge->grad_rad_r * (w > h ? w : h);
-                    if (basis < 0.001f) basis = (w > h ? w : h);
-                    pp /= basis;
-                }
+                if (ge->grad_stop_px_mask & (1u << i)) pp /= stop_basis;
             }
             uni4f(bg_loc.uGradColors[i], &bg_uni.uGradColors[i], pr, pg, pb, pa);
             uni1f(bg_loc.uGradStops[i],  &bg_uni.uGradStops[i],  pp);
@@ -11767,8 +12201,6 @@ void draw_rect_full(float x, float y, float w, float h,
         uni1f(bg_loc.uGradAngle,  &bg_uni.uGradAngle,  ge->grad_angle);
         uni2f(bg_loc.uGradCenter, &bg_uni.uGradCenter, ge->grad_rad_cx, ge->grad_rad_cy);
         uni1f(bg_loc.uGradRadius, &bg_uni.uGradRadius, ge->grad_rad_r);
-        float erx = ge->grad_rad_rx_pct ? ge->grad_rad_rx * w : ge->grad_rad_rx;
-        float ery = ge->grad_rad_ry_pct ? ge->grad_rad_ry * h : ge->grad_rad_ry;
         uni1f(bg_loc.uGradRadRx, &bg_uni.uGradRadRx, erx);
         uni1f(bg_loc.uGradRadRy, &bg_uni.uGradRadRy, ery);
     } else {
@@ -12473,11 +12905,16 @@ static int hit_test_at(double xpos, double ypos) {
     for (int ri = elem_count - 1; ri >= 0; ri--) {
         int i = render_order[ri];
         LunaElement* e = &elements[i];
-        if (!is_rendered(i) || e->pointer_events_none || element_is_inert(i)) continue;
+        /* Reject by the cheap box test first.  Visibility, clipping and focus
+         * traps walk ancestors; doing those walks for every off-pointer node
+         * made raw mouse motion scale with the entire DOM. */
+        if (e->pointer_events_none || e->display_none || e->visibility_hidden ||
+            e->w <= 0.0f || e->h <= 0.0f) continue;
         float bx, by, bw, bh;
         get_element_hit_bounds(e, &bx, &by, &bw, &bh);
-        if (xpos >= bx && xpos <= bx + bw &&
-            ypos >= by && ypos <= by + bh) return i;
+        if (xpos < bx || xpos > bx + bw || ypos < by || ypos > by + bh) continue;
+        if (!is_rendered(i) || element_is_inert(i)) continue;
+        return i;
     }
     return -1;
 }
@@ -12494,7 +12931,8 @@ void recompute_hover(void* window, double xpos, double ypos) {
     int old_scroll_hover_axis = g_scroll_hover_axis;
     g_scroll_hover_idx = -1;
     g_scroll_hover_axis = -1;
-    for (int si = 0; si < elem_count; si++) {
+    for (int pos = 0; pos < g_scroll_container_count; pos++) {
+        int si = g_scroll_container_idx[pos];
         int axis = hit_scrollbar_axis(si, xpos, ypos);
         if (axis >= 0) {
             g_scroll_hover_idx = si;
@@ -12512,23 +12950,38 @@ void recompute_hover(void* window, double xpos, double ypos) {
         memset(g_hover_mark, 0, sizeof(g_hover_mark));
         g_hover_epoch = 1;
     }
-    for (int a = hit; a != -1; a = elements[a].parent_idx)
+    int next_count = 0;
+    for (int a = hit; a != -1 && next_count < MAX_ELEMENTS;
+         a = elements[a].parent_idx) {
         g_hover_mark[a] = g_hover_epoch;
+        g_hover_next[next_count++] = a;
+    }
 
     int best_cursor = 0;
     if (g_scroll_hover_axis == 0) best_cursor = 5;
     else if (g_scroll_hover_axis == 1) best_cursor = 4;
-    for (int i = 0; i < elem_count; i++) {
+
+    /* Only the old and new ancestor chains can change hover state.  Walking
+     * the entire document for every high-rate pointer sample was pure work. */
+    for (int pos = 0; pos < g_hover_chain_count; pos++) {
+        int i = g_hover_chain[pos];
+        if (g_hover_mark[i] == g_hover_epoch || !elements[i].is_hovered) continue;
+        elements[i].is_hovered = 0;
+        (void)restyle_element_checked(&elements[i]);
+        g_pointer_visual_revision++;
+    }
+    for (int pos = 0; pos < next_count; pos++) {
+        int i = g_hover_next[pos];
         LunaElement* e = &elements[i];
-        int should_hover = g_hover_mark[i] == g_hover_epoch;
-        if (should_hover != e->is_hovered) {
-            e->is_hovered = should_hover;
+        if (!e->is_hovered) {
+            e->is_hovered = 1;
             (void)restyle_element_checked(e);
             g_pointer_visual_revision++;
         }
-        if (should_hover && e->cursor_type > best_cursor)
-            best_cursor = e->cursor_type;
+        if (e->cursor_type > best_cursor) best_cursor = e->cursor_type;
     }
+    memcpy(g_hover_chain, g_hover_next, (size_t)next_count * sizeof(g_hover_chain[0]));
+    g_hover_chain_count = next_count;
 
     set_window_cursor(window, best_cursor);
 }
@@ -12633,7 +13086,8 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
         g_press_x = mx;
         g_press_y = my;
 
-        for (int si = 0; si < elem_count; si++) {
+        for (int pos = 0; pos < g_scroll_container_count; pos++) {
+            int si = g_scroll_container_idx[pos];
             if (hit_scrollbar_thumb_y(si, mx, my)) {
                 g_scroll_drag_idx = si;
                 g_scroll_drag_axis = 0;
@@ -13358,11 +13812,13 @@ int luna_load_css_file(const char* p) {
     return 1;
 }
 void luna_reset_css(void) {
+    rule_bg_layers_release_all();
+    free(css_rules);
+    css_rules = NULL;
+    g_rules_cap = 0;
     rule_count = 0;
     g_keyframe_count = 0;
     g_css_from_document = 0;
-    memset(css_rules, 0, sizeof(css_rules));
-    memset(g_keyframes, 0, sizeof(g_keyframes));
     g_rule_index_ready = 0;
     g_has_structural_selectors = 0;
 }
@@ -13455,6 +13911,7 @@ void luna_inject_body_background(void) {
         g_visual_scan_needed = 1;
         return;
     }
+    if (!luna_ensure_element_capacity(elem_count + 1)) return;
     LunaElement body_e;
     memset(&body_e, 0, sizeof(body_e));
     body_e.tabindex = -2;
@@ -13963,7 +14420,7 @@ void luna_render(int fbw, int fbh) {
             rc_set_element_scissor(i, fbw, fbh);
         }
         /* Multiple background layers (bottom to top = last to first in CSS order) */
-        if (e->bg_layer_count > 1) {
+        if (e->bg_layer_count > 1 && e->bg_layers) {
             for (int li = e->bg_layer_count - 1; li >= 0; li--)
                 draw_bg_layer(dx, dy, dw, dh, rad4, eff_op, &e->bg_layers[li]);
             /* After drawing layers, still let draw_rect_full handle border + text bg */
@@ -14059,10 +14516,10 @@ void luna_render(int fbw, int fbh) {
                    as an anonymous flex item during layout. */
                 if (e->has_inline_text_flow) {
                     tx = dx + e->inline_text_x * scale;
-                    /* The element scissor already clips to the border box.
-                       Do not subtract padding a second time here: doing so
-                       clipped the last glyph in short status labels. */
-                    inner_w = dw - e->inline_text_x * scale;
+                    /* Use the measured anonymous item width, not all remaining
+                       space.  Otherwise a leading text run is re-centered in
+                       front of its child even after layout placed it exactly. */
+                    inner_w = e->inline_text_w * scale + 0.5f;
                     align = 0;
                 }
                 if (tbuf[0])
@@ -14340,6 +14797,14 @@ int luna_init(const LunaInitConfig* cfg) {
     return 1;
 }
 void luna_shutdown(void) {
+    rule_bg_layers_release_all();
+    for (int i = 0; i < elem_count; i++) {
+        free(elements[i].bg_layers);
+        elements[i].bg_layers = NULL;
+        elements[i].bg_layer_count = 0;
+    }
+    free(elements); elements = NULL; g_elements_cap = 0; elem_count = 0;
+    free(css_rules); css_rules = NULL; g_rules_cap = 0; rule_count = 0;
     for (int i = 0; i < g_tex_count; ++i)
         if (g_tex_cache[i].tex) glDeleteTextures(1, &g_tex_cache[i].tex);
     g_tex_count = 0;
@@ -14374,6 +14839,9 @@ void luna_shutdown(void) {
     free(g_mono_font_ttf); g_mono_font_ttf = NULL;
     free(g_icon_font_ttf); g_icon_font_ttf = NULL;
     free(g_brand_font_ttf); g_brand_font_ttf = NULL;
+    free(g_dyn_pixels); g_dyn_pixels = NULL;
+    free(g_dyn_glyphs); g_dyn_glyphs = NULL; g_dyn_glyph_cap = 0; g_dyn_glyph_count = 0;
+    g_dyn_hash_ready = 0;
     memset(font_regular, 0, sizeof(font_regular));
     memset(font_bold_atlas, 0, sizeof(font_bold_atlas));
     bg_program = text_program = shadow_program = img_program = 0;

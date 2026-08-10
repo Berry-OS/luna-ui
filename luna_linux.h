@@ -56,6 +56,9 @@ typedef struct LunaLinuxState {
     int framebuffer_height;
     int glfw_initialized;
     int visible_at_create;
+    int wayland;
+    int window_pos_x;
+    int window_pos_y;
     int redraw;
     int window_drag_mode;
     int window_resize_edges;
@@ -69,6 +72,9 @@ static LunaLinuxState luna_linux_state;
 static LunaLinuxOptions luna_linux_options;
 
 static void luna_linux_error_callback(int code, const char* description) {
+    if (code == GLFW_FEATURE_UNAVAILABLE && description &&
+        strstr(description, "window position"))
+        return;
     fprintf(stderr, "[luna-ui] GLFW error %d: %s\n", code,
             description ? description : "unknown error");
 }
@@ -228,12 +234,28 @@ static void luna_linux_cursor_position_callback(GLFWwindow* window,
         glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
         int wx, wy, ww, wh;
         int min_w = 160, min_h = 120;
-        glfwGetWindowPos(window, &wx, &wy);
+        if (luna_linux_state.wayland) {
+            wx = luna_linux_state.window_pos_x;
+            wy = luna_linux_state.window_pos_y;
+        } else {
+            glfwGetWindowPos(window, &wx, &wy);
+            luna_linux_state.window_pos_x = wx;
+            luna_linux_state.window_pos_y = wy;
+        }
         glfwGetWindowSize(window, &ww, &wh);
         if (luna_linux_state.window_drag_mode == 1) {
             int dx = (int)llround(x - luna_linux_state.drag_anchor_x);
             int dy = (int)llround(y - luna_linux_state.drag_anchor_y);
-            if (dx || dy) glfwSetWindowPos(window, wx + dx, wy + dy);
+            if (dx || dy) {
+                wx += dx;
+                wy += dy;
+                luna_linux_state.window_pos_x = wx;
+                luna_linux_state.window_pos_y = wy;
+                /* Wayland: Luna compositor promotes top-strip drags to
+                 * xdg_toplevel.move. Absolute SetWindowPos is unavailable. */
+                if (!luna_linux_state.wayland)
+                    glfwSetWindowPos(window, wx, wy);
+            }
         } else {
             int edge = luna_linux_state.window_resize_edges;
             int dx_left = (int)llround(x - luna_linux_state.drag_anchor_x);
@@ -247,7 +269,12 @@ static void luna_linux_cursor_position_callback(GLFWwindow* window,
             if (edge & LUNA_RESIZE_EDGE_BOTTOM) nh += dy_bottom;
             if (nw < min_w) { if (edge & LUNA_RESIZE_EDGE_LEFT) nx -= min_w - nw; nw = min_w; }
             if (nh < min_h) { if (edge & LUNA_RESIZE_EDGE_TOP) ny -= min_h - nh; nh = min_h; }
-            if (nx != wx || ny != wy) glfwSetWindowPos(window, nx, ny);
+            if (nx != wx || ny != wy) {
+                luna_linux_state.window_pos_x = nx;
+                luna_linux_state.window_pos_y = ny;
+                if (!luna_linux_state.wayland)
+                    glfwSetWindowPos(window, nx, ny);
+            }
             if (nw != ww || nh != wh) glfwSetWindowSize(window, nw, nh);
             if (edge & LUNA_RESIZE_EDGE_RIGHT) luna_linux_state.drag_last_x = x;
             if (edge & LUNA_RESIZE_EDGE_BOTTOM) luna_linux_state.drag_last_y = y;
@@ -446,6 +473,18 @@ int luna_app_run(const LunaAppConfig* user_config) {
         return 1;
     }
     luna_linux_state.glfw_initialized = 1;
+#if defined(GLFW_PLATFORM_WAYLAND) && \
+    (GLFW_VERSION_MAJOR > 3 || (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 4))
+    luna_linux_state.wayland = glfwGetPlatform() == GLFW_PLATFORM_WAYLAND;
+#else
+    {
+        const char* session_type = getenv("XDG_SESSION_TYPE");
+        const char* wayland_display = getenv("WAYLAND_DISPLAY");
+        luna_linux_state.wayland =
+            (session_type && strcmp(session_type, "wayland") == 0) ||
+            (wayland_display && wayland_display[0] && !getenv("DISPLAY"));
+    }
+#endif
 
     glfwDefaultWindowHints();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
