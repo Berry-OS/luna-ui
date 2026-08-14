@@ -165,10 +165,30 @@ static int luna_ios_setup_core(LunaIOSView* view){
 - (void)insertText:(NSString*)text{NSUInteger i=0;while(i<text.length){unichar a=[text characterAtIndex:i++];uint32_t cp=a;if(a>=0xD800&&a<=0xDBFF&&i<text.length){unichar b=[text characterAtIndex:i];if(b>=0xDC00&&b<=0xDFFF){i++;cp=0x10000+((a-0xD800)<<10)+(b-0xDC00);}}luna_char(cp);}}
 - (void)deleteBackward{luna_key(LUNA_KEY_BACKSPACE,0,LUNA_PRESS,0);luna_key(LUNA_KEY_BACKSPACE,0,LUNA_RELEASE,0);}
 - (UIKeyboardType)keyboardType{return UIKeyboardTypeDefault;}
-- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{(void)event;UITouch*t=touches.anyObject;CGPoint p=[t locationInView:self];luna_mouse_move(p.x,p.y);luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_PRESS,0,p.x,p.y);}
-- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{(void)event;UITouch*t=touches.anyObject;CGPoint p=[t locationInView:self];luna_mouse_move(p.x,p.y);}
-- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{(void)event;UITouch*t=touches.anyObject;CGPoint p=[t locationInView:self];luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_RELEASE,0,p.x,p.y);}
-- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{[self touchesEnded:touches withEvent:event];}
+- (void)lunaEmitTouches:(NSSet<UITouch*>*)touches phase:(int)phase{
+    for(UITouch*t in touches){
+        CGPoint p=[t locationInView:self];LunaTouchEvent event;memset(&event,0,sizeof(event));
+        event.id=(int64_t)(intptr_t)(__bridge void*)t;event.phase=phase;
+        event.tool=LUNA_TOUCH_TOOL_FINGER;
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 90000
+        if(t.type==UITouchTypeStylus)event.tool=LUNA_TOUCH_TOOL_STYLUS;
+#endif
+        event.x=p.x;event.y=p.y;event.radius_x=event.radius_y=(float)t.majorRadius;
+        event.pressure=t.maximumPossibleForce>0?(float)(t.force/t.maximumPossibleForce):1.0f;
+        if(phase==LUNA_TOUCH_UP||phase==LUNA_TOUCH_CANCEL)event.pressure=0.0f;
+        if(event.tool==LUNA_TOUCH_TOOL_STYLUS){
+            CGFloat altitude=t.altitudeAngle,azimuth=[t azimuthAngleInView:self];
+            float tilt=(float)((M_PI_2-altitude)*180.0/M_PI);
+            event.tilt_x=tilt*(float)cos(azimuth);event.tilt_y=tilt*(float)sin(azimuth);
+        }
+        if(!luna_ios.config.on_touch||
+           !luna_ios.config.on_touch(&event,luna_ios.config.userdata))luna_touch(&event);
+    }
+}
+- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{(void)event;[self lunaEmitTouches:touches phase:LUNA_TOUCH_DOWN];}
+- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{(void)event;[self lunaEmitTouches:touches phase:LUNA_TOUCH_MOVE];}
+- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{(void)event;[self lunaEmitTouches:touches phase:LUNA_TOUCH_UP];}
+- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{(void)event;[self lunaEmitTouches:touches phase:LUNA_TOUCH_CANCEL];}
 - (void)dealloc{[_displayLink invalidate];if(luna_ios.initialized){if(luna_ios.config.on_shutdown)luna_ios.config.on_shutdown(luna_ios.config.userdata);[EAGLContext setCurrentContext:self.context];luna_shutdown();luna_ios.initialized=0;}if(_framebuffer)glDeleteFramebuffers(1,&_framebuffer);if(_colorRenderbuffer)glDeleteRenderbuffers(1,&_colorRenderbuffer);}
 @end
 

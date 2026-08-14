@@ -89,7 +89,25 @@ EMSCRIPTEN_KEEPALIVE void luna_web_commit_utf8(const char*s){luna_web_emit_utf8(
 static EM_BOOL luna_web_mouse(int type,const EmscriptenMouseEvent*e,void*ud){(void)ud;double x=e->targetX,y=e->targetY;luna_mouse_move(x,y);int b=e->button==0?LUNA_MOUSE_BUTTON_LEFT:e->button==2?LUNA_MOUSE_BUTTON_RIGHT:LUNA_MOUSE_BUTTON_MIDDLE;int mods=luna_web_mods(e->shiftKey,e->ctrlKey,e->altKey,e->metaKey);if(type==EMSCRIPTEN_EVENT_MOUSEDOWN)luna_mouse_button(b,LUNA_PRESS,mods,x,y);else if(type==EMSCRIPTEN_EVENT_MOUSEUP)luna_mouse_button(b,LUNA_RELEASE,mods,x,y);return EM_TRUE;}
 static EM_BOOL luna_web_wheel(int type,const EmscriptenWheelEvent*e,void*ud){(void)type;(void)ud;luna_scroll(-e->deltaX/100.0,-e->deltaY/100.0);return EM_TRUE;}
 static EM_BOOL luna_web_key(int type,const EmscriptenKeyboardEvent*e,void*ud){(void)ud;int action=type==EMSCRIPTEN_EVENT_KEYUP?LUNA_RELEASE:(e->repeat?LUNA_REPEAT:LUNA_PRESS);luna_key(luna_web_keycode(e),e->which,action,luna_web_mods(e->shiftKey,e->ctrlKey,e->altKey,e->metaKey));return e->keyCode==9||e->keyCode==8||e->keyCode>=33&&e->keyCode<=40;}
-static EM_BOOL luna_web_touch(int type,const EmscriptenTouchEvent*e,void*ud){(void)ud;if(e->numTouches<=0)return EM_FALSE;const EmscriptenTouchPoint*p=&e->touches[0];double x=p->targetX,y=p->targetY;luna_mouse_move(x,y);if(type==EMSCRIPTEN_EVENT_TOUCHSTART)luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_PRESS,0,x,y);else if(type==EMSCRIPTEN_EVENT_TOUCHEND||type==EMSCRIPTEN_EVENT_TOUCHCANCEL)luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_RELEASE,0,x,y);return EM_TRUE;}
+static EM_BOOL luna_web_touch(int type,const EmscriptenTouchEvent*e,void*ud){
+    (void)ud;
+    int phase=type==EMSCRIPTEN_EVENT_TOUCHSTART?LUNA_TOUCH_DOWN:
+              type==EMSCRIPTEN_EVENT_TOUCHMOVE?LUNA_TOUCH_MOVE:
+              type==EMSCRIPTEN_EVENT_TOUCHEND?LUNA_TOUCH_UP:LUNA_TOUCH_CANCEL;
+    int emitted=0;
+    for(int i=0;i<e->numTouches;i++){
+        const EmscriptenTouchPoint*p=&e->touches[i];
+        if(!p->isChanged)continue;
+        LunaTouchEvent event;memset(&event,0,sizeof(event));
+        event.id=(int64_t)p->identifier;event.phase=phase;
+        event.tool=LUNA_TOUCH_TOOL_FINGER;event.x=p->targetX;event.y=p->targetY;
+        event.pressure=(phase==LUNA_TOUCH_UP||phase==LUNA_TOUCH_CANCEL)?0.0f:1.0f;
+        if(!luna_web.config.on_touch||
+           !luna_web.config.on_touch(&event,luna_web.config.userdata))luna_touch(&event);
+        emitted=1;
+    }
+    return emitted?EM_TRUE:EM_FALSE;
+}
 static EM_BOOL luna_web_resize(int type,const EmscriptenUiEvent*e,void*ud){(void)type;(void)e;(void)ud;double w,h,dpr=luna_web_js_scale();emscripten_get_element_css_size(LUNA_WEB_CANVAS,&w,&h);if(w<=0)w=luna_web.config.width;if(h<=0)h=luna_web.config.height;emscripten_set_canvas_element_size(LUNA_WEB_CANVAS,(int)(w*dpr),(int)(h*dpr));luna_web.css_width=(int)w;luna_web.css_height=(int)h;luna_resize((float)w,(float)h);luna_framebuffer_resized();return EM_TRUE;}
 
 static void luna_web_frame(void*ud){(void)ud;if(!luna_web.running)return;double now=luna_web_time_impl(),dt=now-luna_web.previous;luna_web.previous=now;if(dt<0||dt>.25)dt=1.0/60.0;if(luna_web.config.on_frame)luna_web.config.on_frame(dt,luna_web.config.userdata);luna_update(now,dt);int w=0,h=0;emscripten_get_canvas_element_size(LUNA_WEB_CANVAS,&w,&h);if(w>0&&h>0){luna_render(w,h);if(luna_web.config.on_render)luna_web.config.on_render(w,h,luna_web.config.userdata);}}

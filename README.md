@@ -88,9 +88,10 @@ HTML/CSS can be supplied either as strings (`html`, `css`) or paths (`html_path`
 
 The repository currently consists of a shared UI/rendering core plus header-only platform hosts:
 
-- `luna-ui.h` — DOM, CSS, layout, input, OpenGL renderer, public UI API, and `LunaPlatform` host ABI v2.
+- `luna-ui.h` — DOM, CSS, layout, input, OpenGL renderer, public UI API, and `LunaPlatform` host ABI v3.
 - `luna_windows.h` — Win32 + WGL/OpenGL host.
-- `luna_linux.h` — GLFW + OpenGL host. Luna UI does not call X11/GLX directly from this backend.
+- `luna_glfw.h` — GLFW + OpenGL Linux host (the default). Luna UI does not call X11, Wayland, GLX, or EGL directly from this backend.
+- `luna_kms.h` — bare-console Linux host: DRM/KMS + GBM + EGL + libinput, no display server. Selected with `-DLUNA_UI_BACKEND_KMS`.
 - `luna_macos.h` — Cocoa + OpenGL host.
 - `luna_ios.h` — UIKit + OpenGL ES host.
 - `luna_android.h` — NativeActivity + EGL/OpenGL ES host.
@@ -102,7 +103,7 @@ There is no separate `luna_platform.h`. Platform selection is performed from `lu
 
 ## 🪟 Window and platform services
 
-The built-in hosts provide the native window/context lifecycle and connect platform services to the shared `LunaPlatform` ABI. The current v2 ABI includes hooks for:
+The built-in hosts provide the native window/context lifecycle and connect platform services to the shared `LunaPlatform` ABI. The current v3 ABI includes hooks for:
 
 - OpenGL procedure lookup and monotonic time
 - resource and font loading
@@ -114,7 +115,7 @@ The built-in hosts provide the native window/context lifecycle and connect platf
 - PNG saving
 - system notifications
 
-`LunaPlatform` includes both `struct_size` and `api_version` (`LUNA_UI_API_VERSION` is currently `0x00020000`) so custom hosts can validate the host structure they provide.
+`LunaPlatform` includes both `struct_size` and `api_version` (`LUNA_UI_API_VERSION` is currently `0x00030000`) so custom hosts can validate the host structure they provide.
 
 Common helpers include:
 
@@ -124,6 +125,20 @@ char* luna_clipboard_get(void);
 void  luna_clipboard_free(char* utf8);
 float luna_platform_scale(void);
 ```
+
+## 👆 Touch and tablet input
+
+`LunaTouchEvent` carries a stable contact ID, phase, logical coordinates,
+pressure, contact radius, tool type (finger, stylus, or eraser), and stylus
+tilt. Native hosts forward it with `luna_touch()`; applications that need raw
+gestures can install `LunaAppConfig.on_touch` and consume selected events.
+
+The built-in recognizer supports taps, control dragging, one-finger scrolling,
+and multiple active contacts. iOS, Android, Web, and Windows (`WM_POINTER`)
+provide native touch data. GLFW has no touch API, so the Linux GLFW host receives
+the compatibility mouse events supplied by the window system. A Linux native
+host can define `LUNA_UI_NO_PLATFORM` and feed libinput/Wayland contacts directly
+to `luna_touch()` without adding those dependencies to Luna UI.
 
 ## 🎨 `luna-window.h`
 
@@ -155,7 +170,7 @@ The file-dialog API supports file manager, open file(s), select folder, and save
 
 ### Linux
 
-The current Linux host uses GLFW for windowing/input and OpenGL for rendering:
+The default Linux host uses GLFW for windowing/input and OpenGL for rendering:
 
 ```sh
 cc -O2 -std=c11 examples/example.c -o luna-example \
@@ -163,6 +178,46 @@ cc -O2 -std=c11 examples/example.c -o luna-example \
 ```
 
 No direct `-lX11` dependency is required by Luna UI itself. The GLFW package used by your system may of course depend on X11 or Wayland internally.
+
+For a machine with no display server — a kiosk or a shell that starts right
+after boot — build the same source against the KMS host instead. It takes the
+DRM master's primary plane, page-flips scanout buffers straight out of EGL/GBM,
+draws the pointer on the hardware cursor plane, and reads the seat through
+libinput:
+
+```sh
+cc -O2 -std=c11 -DLUNA_UI_BACKEND_KMS examples/example.c -o luna-example \
+  $(pkg-config --cflags libdrm xkbcommon) \
+  -lEGL -lgbm -ldrm -linput -ludev -lxkbcommon -lm
+```
+
+It needs read/write access to `/dev/dri/cardN` (the `video` group, or root) and
+a seat it can claim through seatd/logind. `LUNA_DRM_DEVICE` picks a specific
+node and `LUNA_SEAT` a specific seat.
+
+#### Embedding a host in your own main loop
+
+`luna_app_run()` owns the loop, which is what an application wants. A shell
+usually cannot give that up: it has to wait on its own descriptors, decide its
+own repaint cadence, and pick a backend at runtime. Such an embedder defines
+`LUNA_UI_NO_PLATFORM`, includes the host headers itself with
+`LUNA_UI_HOST_PRELUDE` / `LUNA_UI_HOST_BODY`, and drives `LunaHostOps`:
+
+```c
+const LunaHostOps* host = use_kms ? luna_host_kms() : luna_host_glfw();
+if (!host->start(&host_cfg)) return 1;   /* installs LunaPlatform too */
+luna_init(&(LunaInitConfig){ w, h, luna_platform_get_proc(), 0 });
+while (!host->should_close()) {
+    host->wait_events(timeout_ms, my_fds, my_fd_count);
+    luna_render(w, h);
+    host->swap_buffers();
+}
+```
+
+`wait_events()` sleeps on host input *and* the caller's descriptors at once,
+returning which of them became readable. The built-in `luna_app_run()` loops are
+written on exactly these ops, so both paths share one implementation of each
+backend. `apps/luna-shell` is the worked example.
 
 ### Windows / MSVC
 

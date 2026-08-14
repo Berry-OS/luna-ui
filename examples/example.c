@@ -1,4 +1,4 @@
-// gcc -o example example.c -lGL -lm -lglfw
+// Build with `make example`; Linux selects native Wayland or X11 at runtime.
 #include <stdio.h>
 
 #define LUNA_UI_IMPLEMENTATION

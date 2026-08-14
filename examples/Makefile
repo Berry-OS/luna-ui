@@ -1,36 +1,25 @@
-# Build the standalone Luna UI demos.
+# Native Luna UI example. Linux uses GLFW as its only window-system boundary.
+CC ?= cc
+.DEFAULT_GOAL := all
+CFLAGS ?= -O2 -std=gnu11 -Wall -Wextra
+CPPFLAGS += -I..
 
-CC       ?= gcc
-CPPFLAGS ?= -I..
-CFLAGS   ?= -Os -Wall -Wextra
+TARGET := example
 GLFW_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
-GLFW_LIBS   := $(shell pkg-config --libs glfw3 2>/dev/null)
-CPPFLAGS   += -DLUNA_LINUX_NO_WAYLAND
-LUNA_SHELL  ?= ../../luna-shell
-GEN         := ../../luna-shell/ui/gen_include.sh
-COMMON      := ../luna-ui.h ../stb_truetype.h ../stb_image_write.h
+GLFW_LIBS := $(shell pkg-config --libs glfw3 2>/dev/null)
+LIBS := $(GLFW_LIBS) -lGL -lm
 
-.PHONY: all clean
+.PHONY: all check css-parity clean
+all: $(TARGET)
 
-all: opengl_gui luna-ui sample_01 sample_02
+$(TARGET): example.c ../luna-ui.h ../luna_glfw.h ../luna-keys.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(GLFW_CFLAGS) -o $@ $< $(LIBS)
 
-demo.css.h demo.html.h: demo.css demo.html $(GEN)
-	$(GEN) demo.css demo.html
+css-parity: ../css_parity.c ../luna-ui.h example.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ ../css_parity.c -lGL -lm
 
-luna-ui.css.h luna-ui.html.h: luna-ui.css luna-ui.html $(GEN)
-	$(GEN) luna-ui.css luna-ui.html
-
-opengl_gui: opengl_gui.c $(COMMON) demo.css.h demo.html.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(GLFW_CFLAGS) $< -o $@ -lm -lGL $(GLFW_LIBS)
-
-luna-ui: luna-ui.c $(COMMON) luna-ui.css.h luna-ui.html.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(GLFW_CFLAGS) $< -o $@ -lm -lGL $(GLFW_LIBS)
-
-sample_01: sample_01.c $(COMMON)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(GLFW_CFLAGS) $< -o $@ -lm -lGL $(GLFW_LIBS)
-
-sample_02: sample_02.c $(COMMON)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(GLFW_CFLAGS) $< -o $@ -lm -lGL $(GLFW_LIBS)
+check: css-parity
+	./css-parity
 
 clean:
-	rm -f opengl_gui luna-ui sample_01 sample_02 demo.css.h demo.html.h luna-ui.css.h luna-ui.html.h
+	rm -f $(TARGET) css-parity

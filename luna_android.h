@@ -201,7 +201,52 @@ static void luna_android_egl_shutdown(void){if(luna_android.display!=EGL_NO_DISP
 
 static int luna_android_core_init(void){LunaPlatform p;LunaInitConfig i;memset(&p,0,sizeof(p));p.struct_size=sizeof(p);p.api_version=LUNA_UI_API_VERSION;p.get_time=luna_android_time_impl;p.get_proc=luna_android_get_proc;p.set_cursor=luna_android_set_cursor;p.request_close=luna_android_close;p.iconify=luna_android_iconify;p.maximize_toggle=luna_android_maximize;p.request_redraw=luna_android_redraw;p.read_resource=luna_android_read_resource;p.load_font=luna_android_load_font;p.set_clipboard=luna_android_set_clipboard;p.get_clipboard=luna_android_get_clipboard;p.text_input=luna_android_text_input;p.get_scale=luna_android_scale;p.begin_move=luna_android_begin_move;p.begin_resize=luna_android_begin_resize;p.set_title=luna_android_set_title;p.system_notify=luna_android_system_notify;luna_set_platform(&p);memset(&i,0,sizeof(i));i.width=(float)luna_android.fb_width;i.height=(float)luna_android.fb_height;i.get_proc=luna_android_get_proc;i.frameless=1;if(!luna_init(&i))return 0;if(luna_android.config.html)luna_parse_html(luna_android.config.html);else if(luna_android.config.html_path)luna_load_html_file(luna_android.config.html_path);if(luna_android.config.css)luna_parse_css(luna_android.config.css);else if(luna_android.config.css_path)luna_load_css_file(luna_android.config.css_path);luna_inject_body_background();if(luna_android.config.on_init)luna_android.config.on_init(luna_android.config.userdata);luna_wire_onclick_handlers();luna_android.core_initialized=1;return 1;}
 
-static int luna_android_process_input(AInputEvent*e){int type=AInputEvent_getType(e);if(type==AINPUT_EVENT_TYPE_MOTION){int action=AMotionEvent_getAction(e),masked=action&AMOTION_EVENT_ACTION_MASK;float x=AMotionEvent_getX(e,0),y=AMotionEvent_getY(e,0);luna_mouse_move(x,y);if(masked==AMOTION_EVENT_ACTION_DOWN||masked==AMOTION_EVENT_ACTION_POINTER_DOWN)luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_PRESS,0,x,y);else if(masked==AMOTION_EVENT_ACTION_UP||masked==AMOTION_EVENT_ACTION_POINTER_UP||masked==AMOTION_EVENT_ACTION_CANCEL)luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_RELEASE,0,x,y);else if(masked==AMOTION_EVENT_ACTION_SCROLL)luna_scroll(AMotionEvent_getAxisValue(e,AMOTION_EVENT_AXIS_HSCROLL,0),AMotionEvent_getAxisValue(e,AMOTION_EVENT_AXIS_VSCROLL,0));return 1;}if(type==AINPUT_EVENT_TYPE_KEY){int act=AKeyEvent_getAction(e),key=AKeyEvent_getKeyCode(e),meta=AKeyEvent_getMetaState(e);int la=act==AKEY_EVENT_ACTION_DOWN?(AKeyEvent_getRepeatCount(e)?LUNA_REPEAT:LUNA_PRESS):LUNA_RELEASE;luna_key(luna_android_keycode(key),AKeyEvent_getScanCode(e),la,luna_android_mods(meta));if(la==LUNA_PRESS){int cp=luna_android_unicode_char(key,meta);if(cp>0)luna_char((unsigned)cp);}return 1;}return 0;}
+static int luna_android_touch_tool(int tool){
+    if(tool==AMOTION_EVENT_TOOL_TYPE_STYLUS)return LUNA_TOUCH_TOOL_STYLUS;
+    if(tool==AMOTION_EVENT_TOOL_TYPE_ERASER)return LUNA_TOUCH_TOOL_ERASER;
+    return LUNA_TOUCH_TOOL_FINGER;
+}
+static void luna_android_emit_touch(AInputEvent*e,size_t index,int phase){
+    LunaTouchEvent event;memset(&event,0,sizeof(event));
+    event.id=(int64_t)AMotionEvent_getPointerId(e,index);event.phase=phase;
+    event.tool=luna_android_touch_tool(AMotionEvent_getToolType(e,index));
+    event.x=AMotionEvent_getX(e,index);event.y=AMotionEvent_getY(e,index);
+    event.pressure=(phase==LUNA_TOUCH_UP||phase==LUNA_TOUCH_CANCEL)?0.0f:AMotionEvent_getPressure(e,index);
+    event.radius_x=AMotionEvent_getTouchMajor(e,index)*0.5f;
+    event.radius_y=AMotionEvent_getTouchMinor(e,index)*0.5f;
+    if(!luna_android.config.on_touch||
+       !luna_android.config.on_touch(&event,luna_android.config.userdata))luna_touch(&event);
+}
+static int luna_android_process_input(AInputEvent*e){
+    int type=AInputEvent_getType(e);
+    if(type==AINPUT_EVENT_TYPE_MOTION){
+        int action=AMotionEvent_getAction(e),masked=action&AMOTION_EVENT_ACTION_MASK;
+        size_t count=AMotionEvent_getPointerCount(e);
+        size_t index=(size_t)((action&AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)>>AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+        int tool=count?AMotionEvent_getToolType(e,index<count?index:0):AMOTION_EVENT_TOOL_TYPE_UNKNOWN;
+        if(masked==AMOTION_EVENT_ACTION_SCROLL){
+            luna_scroll(AMotionEvent_getAxisValue(e,AMOTION_EVENT_AXIS_HSCROLL,0),
+                        AMotionEvent_getAxisValue(e,AMOTION_EVENT_AXIS_VSCROLL,0));return 1;
+        }
+        if(tool==AMOTION_EVENT_TOOL_TYPE_MOUSE){
+            float x=AMotionEvent_getX(e,0),y=AMotionEvent_getY(e,0);luna_mouse_move(x,y);
+            if(masked==AMOTION_EVENT_ACTION_DOWN)luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_PRESS,0,x,y);
+            else if(masked==AMOTION_EVENT_ACTION_UP||masked==AMOTION_EVENT_ACTION_CANCEL)luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,LUNA_RELEASE,0,x,y);
+            return 1;
+        }
+        if(masked==AMOTION_EVENT_ACTION_MOVE){
+            for(size_t i=0;i<count;i++)luna_android_emit_touch(e,i,LUNA_TOUCH_MOVE);
+        }else if(masked==AMOTION_EVENT_ACTION_CANCEL){
+            for(size_t i=0;i<count;i++)luna_android_emit_touch(e,i,LUNA_TOUCH_CANCEL);
+        }else if(index<count){
+            int phase=(masked==AMOTION_EVENT_ACTION_DOWN||masked==AMOTION_EVENT_ACTION_POINTER_DOWN)?LUNA_TOUCH_DOWN:LUNA_TOUCH_UP;
+            luna_android_emit_touch(e,index,phase);
+        }
+        return 1;
+    }
+    if(type==AINPUT_EVENT_TYPE_KEY){int act=AKeyEvent_getAction(e),key=AKeyEvent_getKeyCode(e),meta=AKeyEvent_getMetaState(e);int la=act==AKEY_EVENT_ACTION_DOWN?(AKeyEvent_getRepeatCount(e)?LUNA_REPEAT:LUNA_PRESS):LUNA_RELEASE;luna_key(luna_android_keycode(key),AKeyEvent_getScanCode(e),la,luna_android_mods(meta));if(la==LUNA_PRESS){int cp=luna_android_unicode_char(key,meta);if(cp>0)luna_char((unsigned)cp);}return 1;}
+    return 0;
+}
 
 static void*luna_android_thread(void*unused){(void)unused;luna_android.looper=ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);double prev=luna_android_time_impl();AInputQueue*attached=NULL;while(1){ANativeWindow*window;AInputQueue*input;pthread_mutex_lock(&luna_android.mutex);while(!luna_android.destroy_requested&&!luna_android.window&&!luna_android.input)pthread_cond_wait(&luna_android.cond,&luna_android.mutex);window=luna_android.window;input=luna_android.input;pthread_mutex_unlock(&luna_android.mutex);if(luna_android.destroy_requested)break;if(input!=attached){if(attached)AInputQueue_detachLooper(attached);attached=input;if(attached)AInputQueue_attachLooper(attached,luna_android.looper,1,NULL,NULL);}int ident;while((ident=ALooper_pollAll(0,NULL,NULL,NULL))>=0){(void)ident;if(attached){AInputEvent*e;while(AInputQueue_getEvent(attached,&e)>=0){if(AInputQueue_preDispatchEvent(attached,e))continue;int handled=luna_android_process_input(e);AInputQueue_finishEvent(attached,e,handled);}}}
         if(window&&luna_android.surface==EGL_NO_SURFACE){if(luna_android_egl_init(window)&&luna_android_core_init())prev=luna_android_time_impl();}

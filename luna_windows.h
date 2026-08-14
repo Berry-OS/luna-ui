@@ -426,8 +426,64 @@ static float luna_win_scale(void) {
     return fn ? (float)fn(luna_win.hwnd) / 96.0f : 1.0f;
 }
 
+#ifdef WM_POINTERDOWN
+static int luna_win_pointer_event(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    UINT32 id = GET_POINTERID_WPARAM(wp);
+    POINTER_INPUT_TYPE pointer_type;
+    LunaTouchEvent event;
+    POINT point;
+    if (!GetPointerType(id, &pointer_type) ||
+        (pointer_type != PT_TOUCH && pointer_type != PT_PEN)) return 0;
+    memset(&event, 0, sizeof(event));
+    event.id = (int64_t)id;
+    event.phase = msg == WM_POINTERDOWN ? LUNA_TOUCH_DOWN :
+                  msg == WM_POINTERUP ? LUNA_TOUCH_UP :
+                  msg == WM_POINTERCAPTURECHANGED ? LUNA_TOUCH_CANCEL : LUNA_TOUCH_MOVE;
+    event.tool = pointer_type == PT_PEN ? LUNA_TOUCH_TOOL_STYLUS
+                                        : LUNA_TOUCH_TOOL_FINGER;
+    point.x = GET_X_LPARAM(lp); point.y = GET_Y_LPARAM(lp);
+    ScreenToClient(hwnd, &point);
+    event.x = point.x; event.y = point.y;
+    event.pressure = event.phase == LUNA_TOUCH_UP || event.phase == LUNA_TOUCH_CANCEL
+                         ? 0.0f : 1.0f;
+    if (pointer_type == PT_TOUCH) {
+        POINTER_TOUCH_INFO info;
+        if (GetPointerTouchInfo(id, &info)) {
+            POINT a = {info.rcContact.left, info.rcContact.top};
+            POINT b = {info.rcContact.right, info.rcContact.bottom};
+            ScreenToClient(hwnd, &a); ScreenToClient(hwnd, &b);
+            event.radius_x = (float)abs(b.x - a.x) * 0.5f;
+            event.radius_y = (float)abs(b.y - a.y) * 0.5f;
+            if (info.touchMask & TOUCH_MASK_PRESSURE)
+                event.pressure = (float)info.pressure / 1024.0f;
+        }
+    } else {
+        POINTER_PEN_INFO info;
+        if (GetPointerPenInfo(id, &info)) {
+            if (info.penFlags & PEN_FLAG_ERASER) event.tool = LUNA_TOUCH_TOOL_ERASER;
+            if (info.penMask & PEN_MASK_PRESSURE)
+                event.pressure = (float)info.pressure / 1024.0f;
+            if (info.penMask & PEN_MASK_TILT_X) event.tilt_x = (float)info.tiltX;
+            if (info.penMask & PEN_MASK_TILT_Y) event.tilt_y = (float)info.tiltY;
+        }
+    }
+    if (!luna_win.config.on_touch ||
+        !luna_win.config.on_touch(&event, luna_win.config.userdata)) luna_touch(&event);
+    luna_win.redraw = 1;
+    return 1;
+}
+#endif
+
 static LRESULT CALLBACK luna_win_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+#ifdef WM_POINTERDOWN
+        case WM_POINTERDOWN:
+        case WM_POINTERUPDATE:
+        case WM_POINTERUP:
+        case WM_POINTERCAPTURECHANGED:
+            if (luna_win_pointer_event(hwnd, msg, wp, lp)) return 0;
+            break;
+#endif
         case WM_CLOSE:
             luna_win.running = 0;
             DestroyWindow(hwnd);

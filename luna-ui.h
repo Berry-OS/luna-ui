@@ -35,7 +35,14 @@
 #  elif defined(_WIN32)
 #    include "luna_windows.h"
 #  elif defined(__linux__)
-#    include "luna_linux.h"
+/* GLFW is the portable desktop default.  Build with -DLUNA_UI_BACKEND_KMS to
+ * target a bare console instead: DRM/KMS + GBM + EGL and libinput, no display
+ * server involved. */
+#    if defined(LUNA_UI_BACKEND_KMS)
+#      include "luna_kms.h"
+#    else
+#      include "luna_glfw.h"
+#    endif
 #  else
 #    error "Luna UI: unsupported platform; define LUNA_UI_NO_PLATFORM for a custom host"
 #  endif
@@ -191,7 +198,32 @@ typedef void (*LunaTrapDismissFn)(int trap_idx);
 typedef void (*LunaMousePressHook)(int hit, int button, int mods);
 typedef void (*LunaMouseReleaseHook)(int hit, int drag_moved);
 
-#define LUNA_UI_API_VERSION 0x00020000u
+enum {
+    LUNA_TOUCH_DOWN = 0,
+    LUNA_TOUCH_MOVE,
+    LUNA_TOUCH_UP,
+    LUNA_TOUCH_CANCEL
+};
+
+enum {
+    LUNA_TOUCH_TOOL_FINGER = 0,
+    LUNA_TOUCH_TOOL_STYLUS,
+    LUNA_TOUCH_TOOL_ERASER
+};
+
+typedef struct LunaTouchEvent {
+    int64_t id;       /* stable for the lifetime of one contact */
+    int phase;        /* LUNA_TOUCH_* */
+    int tool;         /* LUNA_TOUCH_TOOL_* */
+    double x, y;      /* logical window coordinates */
+    float pressure;   /* normalized 0..1; 1 when unavailable */
+    float radius_x, radius_y;
+    float tilt_x, tilt_y; /* stylus degrees, otherwise zero */
+} LunaTouchEvent;
+
+typedef int (*LunaTouchFn)(const LunaTouchEvent* event, void* userdata);
+
+#define LUNA_UI_API_VERSION 0x00030000u
 
 enum {
     LUNA_FONT_REGULAR = 0,
@@ -243,6 +275,43 @@ typedef void (*LunaSetTitleFn)(const char* title);
 typedef int (*LunaSystemNotifyFn)(const char* app_name, int kind,
                                   const char* title, const char* message);
 
+/*
+ * Window decoration ownership.  Values match zxdg_toplevel_decoration_v1's
+ * mode enum so the Wayland host can pass them through unchanged.
+ */
+enum {
+    LUNA_DECORATION_UNKNOWN = 0, /* not negotiated / host has no opinion */
+    LUNA_DECORATION_CLIENT  = 1, /* the application draws its own titlebar */
+    LUNA_DECORATION_SERVER  = 2  /* the compositor or WM draws it */
+};
+
+/* ── Host ABI v3 ──────────────────────────────────────────────────────────
+ * Application-facing capabilities that used to require reaching past Luna to
+ * the windowing library directly.  Hosts written against v2 leave these NULL;
+ * every luna_platform_* wrapper below null-checks before dispatching.
+ */
+/* paths are valid only for the duration of the call. */
+typedef void (*LunaDropCallbackFn)(int count, const char** paths, void* userdata);
+typedef void (*LunaFocusCallbackFn)(int focused, void* userdata);
+/* Return 0 to veto the close (unsaved changes), non-zero to allow it. */
+typedef int  (*LunaCloseCallbackFn)(void* userdata);
+
+typedef void (*LunaSetDropHandlerFn)(LunaDropCallbackFn cb, void* userdata);
+typedef void (*LunaSetFocusHandlerFn)(LunaFocusCallbackFn cb, void* userdata);
+typedef void (*LunaSetCloseHandlerFn)(LunaCloseCallbackFn cb, void* userdata);
+/* LUNA_DONT_CARE for any bound that should stay unconstrained. */
+typedef void (*LunaSetSizeLimitsFn)(int min_w, int min_h, int max_w, int max_h);
+typedef int  (*LunaGetKeyFn)(int key);            /* LUNA_PRESS / LUNA_RELEASE */
+typedef int  (*LunaGetMouseButtonFn)(int button); /* LUNA_PRESS / LUNA_RELEASE */
+typedef void (*LunaGetCursorPosFn)(double* x, double* y);
+typedef void (*LunaSetFullscreenFn)(int enable);  /* monitor containing window */
+typedef int  (*LunaIsFullscreenFn)(void);
+typedef void (*LunaGetWindowRectFn)(int* x, int* y, int* w, int* h);
+typedef void (*LunaSetWindowRectFn)(int x, int y, int w, int h); /* -1 = keep */
+typedef int  (*LunaGetDecorationModeFn)(void);       /* LUNA_DECORATION_* */
+typedef void (*LunaSetDecorationPrefFn)(int mode);   /* LUNA_DECORATION_* */
+typedef void (*LunaShowWindowMenuFn)(int x, int y);  /* window-local coords */
+
 typedef struct LunaPlatform {
     /* Host ABI v2. All built-in hosts populate this complete layout. */
     LunaGetTimeFn          get_time;
@@ -263,6 +332,22 @@ typedef struct LunaPlatform {
     LunaBeginResizeFn      begin_resize;
     LunaSetTitleFn         set_title;
     LunaSystemNotifyFn     system_notify;
+    /* Host ABI v3.  Appended only — never reorder the fields above, they are
+     * the v2 layout and hosts are matched by struct_size, not by version. */
+    LunaSetDropHandlerFn    set_drop_handler;
+    LunaSetFocusHandlerFn   set_focus_handler;
+    LunaSetCloseHandlerFn   set_close_handler;
+    LunaSetSizeLimitsFn     set_size_limits;
+    LunaGetKeyFn            get_key;
+    LunaGetMouseButtonFn    get_mouse_button;
+    LunaGetCursorPosFn      get_cursor_pos;
+    LunaSetFullscreenFn     set_fullscreen;
+    LunaIsFullscreenFn      is_fullscreen;
+    LunaGetWindowRectFn     get_window_rect;
+    LunaSetWindowRectFn     set_window_rect;
+    LunaGetDecorationModeFn get_decoration_mode;
+    LunaSetDecorationPrefFn set_decoration_pref;
+    LunaShowWindowMenuFn    show_window_menu;
     uint32_t               struct_size;
     uint32_t               api_version;
 } LunaPlatform;
@@ -287,10 +372,34 @@ typedef struct LunaAppConfig {
      * native host swaps buffers. Useful for applications that mix Luna DOM
      * chrome with a specialized OpenGL surface (editor, canvas, viewport). */
     void (*on_render)(int framebuffer_width, int framebuffer_height, void* userdata);
+    /* Set when on_render draws the whole frame itself.  The host then skips its
+     * own luna_render() call: luna_render() clears the framebuffer, so an
+     * application that paints an image or canvas *under* the DOM has to control
+     * the order and use luna_render_region() for the overlay. */
+    int custom_render;
     /* on_frame historically means continuous animation. Keep 0 for that
      * behavior. A positive value makes the native host sleep between idle
      * ticks while still waking immediately for input/redraw events. */
     double frame_interval;
+    /*
+     * Raw input, delivered before Luna's own handling.  Return non-zero to
+     * consume the event and stop it reaching the document.
+     *
+     * This is what an application that owns a canvas needs — panning, zooming,
+     * a custom titlebar drag — and without it such an application has to
+     * install its own windowing-library callbacks and stops being portable
+     * across hosts.  Coordinates are in logical pixels, buttons and keys are
+     * LUNA_MOUSE_BUTTON_* / LUNA_KEY_*.
+     */
+    int (*on_mouse_button)(int button, int action, int mods,
+                           double x, double y, void* userdata);
+    int (*on_mouse_move)(double x, double y, void* userdata);
+    int (*on_scroll)(double xoffset, double yoffset, void* userdata);
+    int (*on_key)(int key, int scancode, int action, int mods, void* userdata);
+    int (*on_char)(unsigned int codepoint, void* userdata);
+    /* Raw touch/tablet input. Return non-zero to consume the contact before
+     * Luna turns it into taps, drags, and one-finger scrolling. */
+    LunaTouchFn on_touch;
 } LunaAppConfig;
 
 typedef struct LunaInitConfig {
@@ -306,11 +415,94 @@ int   luna_app_run(const LunaAppConfig* cfg);
 void  luna_app_quit(void);
 void  luna_app_request_redraw(void);
 void* luna_app_native_handle(void);
+
+/* ── Embedding host ops ───────────────────────────────────────────────────
+ * luna_app_run() owns the main loop, which is what an application wants and
+ * what every host above provides.  A shell does not: it has to wait on its
+ * own descriptors (a compositor state stream, worker eventfds), decide its
+ * own repaint cadence, and pick its display backend at runtime.  Such an
+ * embedder defines LUNA_UI_NO_PLATFORM, includes the host headers it wants
+ * with LUNA_UI_HOST_PRELUDE / LUNA_UI_HOST_BODY, and drives LunaHostOps
+ * directly.  The ops are exactly what the built-in loops are written on, so
+ * both paths share one implementation of each backend.
+ */
+
+/* Paint one cursor image for the host's hardware/compositor cursor.  Lets an
+ * embedder supply a themed pointer without the host knowing about themes.
+ * Write w×h ARGB (premultiplied, stride in pixels), report the hotspot, and
+ * return non-zero.  Return 0 to fall back to the host's built-in glyph. */
+typedef int (*LunaHostCursorPaintFn)(uint32_t* argb, int w, int h,
+                                     int stride_px, int cursor_type,
+                                     int* hot_x, int* hot_y, void* userdata);
+
+typedef struct LunaHostConfig {
+    const char* title;
+    int width, height;   /* requested size; ignored by hosts that own the screen */
+    int resizable;
+    int frameless;
+    int transparent;
+    int fullscreen;
+    int vsync;
+    /* Raw input, delivered before Luna's own handling.  Same contract as the
+     * LunaAppConfig hooks: return non-zero to consume the event. */
+    int (*on_mouse_button)(int button, int action, int mods,
+                           double x, double y, void* userdata);
+    int (*on_mouse_move)(double x, double y, void* userdata);
+    int (*on_scroll)(double xoffset, double yoffset, void* userdata);
+    int (*on_key)(int key, int scancode, int action, int mods, void* userdata);
+    int (*on_char)(unsigned int codepoint, void* userdata);
+    LunaTouchFn on_touch;
+    LunaHostCursorPaintFn cursor_paint;
+    /* Invoked by start() with the host's fully populated LunaPlatform, just
+     * before it is installed, so an embedder can override individual entries
+     * (a shell's own notification surface, its font resolver) without having
+     * to rebuild the whole table. */
+    void (*configure_platform)(LunaPlatform* platform, void* userdata);
+    void* userdata;
+} LunaHostConfig;
+
+/* Set in the wait_events() result when host input was dispatched. */
+#define LUNA_HOST_WAIT_INPUT 0x80000000u
+/* Descriptors an embedder may hand to wait_events() in one call. */
+#define LUNA_HOST_MAX_WAIT_FDS 8
+
+typedef struct LunaHostOps {
+    const char* name;
+    /* Bring up the display and input, make a GL context current, and install
+     * the LunaPlatform for this backend.  luna_init() remains the caller's
+     * call, so it can size the document from get_fb_size().  0 on failure. */
+    int  (*start)(const LunaHostConfig* cfg);
+    void (*get_fb_size)(int* w, int* h);
+    void (*swap_buffers)(void);
+    /*
+     * Sleep up to timeout_ms (negative blocks) waking on host input or on any
+     * of the caller's descriptors becoming readable, then dispatch whatever
+     * host events arrived.  Returns a mask: bit i for fds[i], plus
+     * LUNA_HOST_WAIT_INPUT when input was dispatched.  A descriptor is only
+     * reported, never read — draining it stays with the caller.
+     */
+    unsigned (*wait_events)(int timeout_ms, const int* fds, int nfds);
+    void (*set_cursor)(int cursor_type);
+    int  (*should_close)(void);
+    void (*terminate)(void);
+} LunaHostOps;
+
+/* Non-NULL only for hosts compiled into this translation unit. */
+const LunaHostOps* luna_host_glfw(void);   /* luna_glfw.h */
+const LunaHostOps* luna_host_kms(void);    /* luna_kms.h  */
+
+/* set_cursor() ignores a request for the type already on screen, which is what
+ * a hover-driven caller wants.  An embedder animating a themed cursor needs the
+ * opposite: repaint the same type because its frame advanced. */
+void luna_host_kms_refresh_cursor(int cursor_type);
 void  luna_clipboard_set(const char* utf8);
 char* luna_clipboard_get(void); /* free with luna_clipboard_free() */
 void  luna_clipboard_free(char* utf8);
 float luna_platform_scale(void);
 double luna_platform_time(void);
+/* The installed host's GL loader.  An embedder that calls luna_init() itself
+ * needs it for LunaInitConfig without keeping its own copy. */
+LunaGetProcFn luna_platform_get_proc(void);
 void luna_platform_request_close(void);
 void luna_platform_iconify(void);
 void luna_platform_maximize_toggle(void);
@@ -321,39 +513,41 @@ void luna_platform_set_title(const char* title);
 int  luna_platform_system_notify(const char* app_name, int kind,
                                  const char* title, const char* message);
 
+/* ABI v3.  Each is a no-op (or returns a benign default) on hosts that do not
+ * implement it, so applications may call them unconditionally. */
+void luna_platform_set_drop_handler(LunaDropCallbackFn cb, void* userdata);
+void luna_platform_set_focus_handler(LunaFocusCallbackFn cb, void* userdata);
+void luna_platform_set_close_handler(LunaCloseCallbackFn cb, void* userdata);
+void luna_platform_set_size_limits(int min_w, int min_h, int max_w, int max_h);
+int  luna_platform_get_key(int key);
+int  luna_platform_get_mouse_button(int button);
+void luna_platform_get_cursor_pos(double* x, double* y);
+void luna_platform_set_fullscreen(int enable);
+int  luna_platform_is_fullscreen(void);
+void luna_platform_get_window_rect(int* x, int* y, int* w, int* h);
+void luna_platform_set_window_rect(int x, int y, int w, int h);
+int  luna_platform_decoration_mode(void);
+void luna_platform_set_decoration_pref(int mode);
+void luna_platform_show_window_menu(int x, int y);
+
 /*
- * Host-neutral input constants. Values intentionally match GLFW so existing
- * GLFW hosts remain source-compatible while Wayland/EGL hosts need no GLFW
- * headers or library.
+ * Decoration ownership can change while the window is open — a compositor may
+ * renegotiate, and under luna-session switching to a skin with prefer_ssd=1
+ * does exactly that.  luna-window.h registers a handler so it can show or hide
+ * its own titlebar in response; without it a window ends up wearing both the
+ * compositor's bar and its own.  mode is LUNA_DECORATION_*.
  */
-enum {
-    LUNA_RELEASE = 0,
-    LUNA_PRESS = 1,
-    LUNA_REPEAT = 2,
-    LUNA_MOUSE_BUTTON_LEFT = 0,
-    LUNA_MOUSE_BUTTON_RIGHT = 1,
-    LUNA_MOUSE_BUTTON_MIDDLE = 2,
-    LUNA_MOD_SHIFT = 0x0001,
-    LUNA_MOD_CONTROL = 0x0002,
-    LUNA_MOD_ALT = 0x0004,
-    LUNA_MOD_SUPER = 0x0008,
-    LUNA_KEY_SPACE = 32,
-    LUNA_KEY_ESCAPE = 256,
-    LUNA_KEY_ENTER = 257,
-    LUNA_KEY_TAB = 258,
-    LUNA_KEY_BACKSPACE = 259,
-    LUNA_KEY_DELETE = 261,
-    LUNA_KEY_RIGHT = 262,
-    LUNA_KEY_LEFT = 263,
-    LUNA_KEY_DOWN = 264,
-    LUNA_KEY_UP = 265,
-    LUNA_KEY_PAGE_UP = 266,
-    LUNA_KEY_PAGE_DOWN = 267,
-    LUNA_KEY_HOME = 268,
-    LUNA_KEY_END = 269,
-    LUNA_KEY_F12 = 301,
-    LUNA_KEY_KP_ENTER = 335
-};
+typedef void (*LunaDecorationChangedFn)(int mode, void* userdata);
+void luna_set_decoration_handler(LunaDecorationChangedFn fn, void* userdata);
+/* Called by the platform host when the compositor answers. */
+void luna_notify_decoration_changed(int mode);
+
+/*
+ * Host-neutral input constants (LUNA_KEY_*, LUNA_MOUSE_BUTTON_*, LUNA_MOD_*,
+ * LUNA_PRESS/RELEASE/REPEAT).  A leaf header so platform hosts can also pull
+ * it into their prelude pass, before this file's body is even declared.
+ */
+#include "luna-keys.h"
 
 void luna_set_platform(const LunaPlatform* p);
 int  luna_init(const LunaInitConfig* cfg);
@@ -367,6 +561,14 @@ int  luna_load_css_file(const char* path);
 void luna_reset_css(void);
 void luna_parse_html(const char* html);
 void luna_parse_css(const char* css);
+typedef struct LunaCssVariable {
+    const char* name;  /* with or without the leading "--" */
+    const char* value;
+} LunaCssVariable;
+/* Update custom properties in-place and restyle; no stylesheet parsing and no
+ * new cascade rules are created. */
+void luna_css_set_variables(const LunaCssVariable* variables, int count);
+uint32_t luna_css_generation(void);
 void luna_inject_body_background(void);
 void luna_wire_onclick_handlers(void);
 void luna_push_focus_trap(int idx, LunaTrapDismissFn on_dismiss, int backdrop_dismiss);
@@ -379,22 +581,19 @@ int  luna_last_click_button(void);
 int  luna_last_click_mods(void);
 void luna_resize(float w, float h);
 void luna_mark_layout_dirty(void);
+enum {
+    LUNA_REDRAW_LAYOUT = 1 << 0,
+    LUNA_REDRAW_PAINT  = 1 << 1,
+    LUNA_REDRAW_ANIM   = 1 << 2
+};
+/* Advance layout/animation state once and summarize why another frame is needed. */
+int  luna_needs_redraw(double now, double dt);
+/* Multi-surface form. out_flags[k] receives LUNA_REDRAW_* for roots[k]. */
+int  luna_needs_redraw_mask(double now, double dt, const int* roots,
+                            int nroots, unsigned* out_flags);
+/* Native EGL hosts call this before luna_init; custom hosts default to GL. */
+void luna_set_gles3(int enabled);
 void luna_update(double now, double dt);
-/* Update and return whether interactive easing still changes pixels. */
-int  luna_update_settling(double now, double dt);
-/* Update once and produce per-root settling bits in the same element pass. */
-int  luna_update_settling_mask(double now, double dt,
-                               const int* roots, int nroots, unsigned* out_mask);
-/* 1 while color/scale easing still changes pixels (CSS @keyframes excluded). */
-int  luna_visuals_settling(void);
-/* Same, but only for root and its descendants. root_idx < 0 → whole tree. */
-int  luna_visuals_settling_under(int root_idx);
-/* Batched form: bit k of *out_mask = roots[k]'s subtree is settling (root -1 =
- * whole tree).  Returns 1 when anything is settling.  One pass for all roots —
- * hosts with many surfaces should prefer this over calling _under() per root. */
-int  luna_visuals_settling_mask(const int* roots, int nroots, unsigned* out_mask);
-/* 1 when a CSS @keyframes animation is actually running under root_idx. */
-int  luna_css_anim_running_under(int root_idx);
 /* Forget cached OpenGL bindings before a host/custom renderer hands control
  * back to Luna UI. Safe to call once at the start of every frame. */
 void luna_invalidate_gl_state(void);
@@ -403,21 +602,21 @@ void luna_render(int fbw, int fbh);
  * each drawn element per render, which only pays for itself on hosts that can
  * forward the result — a Wayland client posting surface damage.  A host that
  * repaints one framebuffer wholesale should leave it off. */
-void luna_set_damage_tracking(int enabled);
+void luna_redraw_track_damage(int enabled);
 /* Region of the most recent luna_render()/luna_render_region() whose pixels
  * differ from the previous render of the same root, in surface coordinates
  * (x right, y down, origin at the region origin passed to _region).
  * Returns 1 with the four out-params filled in, 0 when nothing changed.  Hosts
  * can hand this straight to eglSwapBuffersWithDamage / wl_surface.damage. */
-int  luna_render_damage(float* x, float* y, float* w, float* h);
+int  luna_redraw_damage_region(float* x, float* y, float* w, float* h);
 /* Walk the current render root and report whether a paint would change any
  * pixels, without issuing GL draws or updating the damage records.  Used by
  * hosts that mark a surface dirty on a timer (clock, stats) but often find
  * the document unchanged — skipping the GL clear/draw/swap removes the
  * periodic hitch those timers produced on the console session. */
-int  luna_probe_damage(int root_idx, int fbw, int fbh,
-                       float origin_x, float origin_y,
-                       float region_w, float region_h);
+int  luna_redraw_probe_region(int root_idx, int fbw, int fbh,
+                              float origin_x, float origin_y,
+                              float region_w, float region_h);
 void luna_render_region(int root_idx, int fbw, int fbh,
                         float origin_x, float origin_y,
                         float region_w, float region_h);
@@ -439,6 +638,7 @@ void luna_context_mouse_move(LunaContext* ctx, double x, double y);
 void luna_context_mouse_button(LunaContext* ctx, int button, int action,
                                int mods, double x, double y);
 void luna_context_scroll(LunaContext* ctx, double xoffset, double yoffset);
+void luna_context_touch(LunaContext* ctx, const LunaTouchEvent* event);
 int  luna_element_count(void);
 LunaElement* luna_element_at(int idx);
 int  luna_element_parent(int idx);
@@ -446,6 +646,10 @@ int  luna_element_parent(int idx);
  * this element's text or style can actually change pixels. */
 int  luna_element_visible(int idx);
 int  luna_get_element_by_id(const char* id);
+/* First element carrying the class, in document order; -1 when none does.
+ * Lets a library bind to markup by role instead of demanding that every
+ * application hand it a list of element ids. */
+int  luna_get_element_by_class(const char* class_name);
 /* Currently focused DOM element, or -1. Useful for host keyboard shortcuts. */
 int  luna_focused_element(void);
 void luna_focus_element(int idx);
@@ -481,6 +685,15 @@ void luna_get_pointer(double* x, double* y);
 void luna_consume_pointer_event(void);
 void luna_mouse_button(int button, int action, int mods, double x, double y);
 void luna_scroll(double xoff, double yoff);
+/* Multi-touch/tablet input. Native hosts should preserve contact IDs. Luna
+ * tracks up to LUNA_UI_MAX_TOUCHES contacts and maps the primary contact to
+ * existing click/drag controls while a pan over a scroll container scrolls it. */
+#ifndef LUNA_UI_MAX_TOUCHES
+#define LUNA_UI_MAX_TOUCHES 16
+#endif
+void luna_touch(const LunaTouchEvent* event);
+int  luna_touch_count(void);
+int  luna_touch_get(int index, LunaTouchEvent* out_event);
 void luna_key(int key, int scancode, int action, int mods);
 void luna_char(unsigned int codepoint);
 typedef int (*LunaTextCommitFn)(unsigned int codepoint, void* userdata);
@@ -591,6 +804,7 @@ static const char* luna_strcasestr_local(const char* haystack, const char* needl
 #define MAX_RULES    LUNA_UI_MAX_RULES
 
 static LunaPlatform g_luna_platform;
+static int g_luna_gles3;
 static double g_luna_mx = 0.0, g_luna_my = 0.0;
 static int g_luna_shift = 0;
 static int g_luna_fbw = 0, g_luna_fbh = 0;
@@ -601,12 +815,32 @@ static double luna_now(void) {
 }
 
 void luna_set_platform(const LunaPlatform* p) {
+    size_t total, fn_bytes;
+    const size_t tail = 2 * sizeof(uint32_t); /* struct_size + api_version */
     memset(&g_luna_platform, 0, sizeof(g_luna_platform));
     if (!p) return;
-    g_luna_platform = *p;
+    /*
+     * A host built against an older ABI hands us a shorter struct.  Copy only
+     * the function-pointer prefix it actually owns; everything newer stays
+     * zeroed and every luna_platform_* wrapper below null-checks before use.
+     *
+     * The copy must stop before the caller's own struct_size/api_version — in
+     * every ABI revision those are the final two members, so in a shorter
+     * struct they sit exactly where newer function pointers live here.  A
+     * blind memcpy of struct_size bytes would land them on top of
+     * set_drop_handler and hand us two garbage callables.
+     */
+    total = (size_t)p->struct_size;
+    if (total == 0 || total > sizeof(g_luna_platform)) total = sizeof(g_luna_platform);
+    fn_bytes = total > tail ? total - tail : 0;
+    memcpy(&g_luna_platform, p, fn_bytes);
+    g_luna_platform.struct_size = p->struct_size;
+    g_luna_platform.api_version = p->api_version;
 }
 
 double luna_platform_time(void) { return luna_now(); }
+LunaGetProcFn luna_platform_get_proc(void) { return g_luna_platform.get_proc; }
+void luna_set_gles3(int enabled) { g_luna_gles3 = enabled != 0; }
 void luna_platform_request_close(void) {
     if (g_luna_platform.request_close) g_luna_platform.request_close();
 }
@@ -634,6 +868,92 @@ int luna_platform_system_notify(const char* app_name, int kind,
     if (!g_luna_platform.system_notify) return 0;
     return g_luna_platform.system_notify(app_name ? app_name : "Luna", kind,
                                          title ? title : "", message ? message : "");
+}
+
+void luna_platform_set_drop_handler(LunaDropCallbackFn cb, void* userdata) {
+    if (g_luna_platform.set_drop_handler)
+        g_luna_platform.set_drop_handler(cb, userdata);
+}
+void luna_platform_set_focus_handler(LunaFocusCallbackFn cb, void* userdata) {
+    if (g_luna_platform.set_focus_handler)
+        g_luna_platform.set_focus_handler(cb, userdata);
+}
+void luna_platform_set_close_handler(LunaCloseCallbackFn cb, void* userdata) {
+    if (g_luna_platform.set_close_handler)
+        g_luna_platform.set_close_handler(cb, userdata);
+}
+void luna_platform_set_size_limits(int min_w, int min_h, int max_w, int max_h) {
+    if (g_luna_platform.set_size_limits)
+        g_luna_platform.set_size_limits(min_w, min_h, max_w, max_h);
+}
+int luna_platform_get_key(int key) {
+    if (!g_luna_platform.get_key) return LUNA_RELEASE;
+    return g_luna_platform.get_key(key);
+}
+int luna_platform_get_mouse_button(int button) {
+    if (!g_luna_platform.get_mouse_button) return LUNA_RELEASE;
+    return g_luna_platform.get_mouse_button(button);
+}
+void luna_platform_get_cursor_pos(double* x, double* y) {
+    if (g_luna_platform.get_cursor_pos) {
+        g_luna_platform.get_cursor_pos(x, y);
+        return;
+    }
+    if (x) *x = 0.0;
+    if (y) *y = 0.0;
+}
+void luna_platform_set_fullscreen(int enable) {
+    if (g_luna_platform.set_fullscreen) g_luna_platform.set_fullscreen(enable);
+}
+int luna_platform_is_fullscreen(void) {
+    if (!g_luna_platform.is_fullscreen) return 0;
+    return g_luna_platform.is_fullscreen();
+}
+void luna_platform_get_window_rect(int* x, int* y, int* w, int* h) {
+    if (g_luna_platform.get_window_rect) {
+        g_luna_platform.get_window_rect(x, y, w, h);
+        return;
+    }
+    if (x) *x = 0;
+    if (y) *y = 0;
+    if (w) *w = (int)luna_window_width;
+    if (h) *h = (int)luna_window_height;
+}
+void luna_platform_set_window_rect(int x, int y, int w, int h) {
+    if (g_luna_platform.set_window_rect)
+        g_luna_platform.set_window_rect(x, y, w, h);
+}
+int luna_platform_decoration_mode(void) {
+    if (!g_luna_platform.get_decoration_mode) return LUNA_DECORATION_UNKNOWN;
+    return g_luna_platform.get_decoration_mode();
+}
+void luna_platform_set_decoration_pref(int mode) {
+    if (g_luna_platform.set_decoration_pref)
+        g_luna_platform.set_decoration_pref(mode);
+}
+void luna_platform_show_window_menu(int x, int y) {
+    if (g_luna_platform.show_window_menu)
+        g_luna_platform.show_window_menu(x, y);
+}
+
+static LunaDecorationChangedFn g_luna_decoration_handler = NULL;
+static void* g_luna_decoration_userdata = NULL;
+static int g_luna_decoration_mode = LUNA_DECORATION_UNKNOWN;
+
+void luna_set_decoration_handler(LunaDecorationChangedFn fn, void* userdata) {
+    g_luna_decoration_handler = fn;
+    g_luna_decoration_userdata = userdata;
+    /* Replay the current mode: a handler registered from on_init would
+     * otherwise miss the configure that already arrived during startup. */
+    if (fn && g_luna_decoration_mode != LUNA_DECORATION_UNKNOWN)
+        fn(g_luna_decoration_mode, userdata);
+}
+
+void luna_notify_decoration_changed(int mode) {
+    if (mode == g_luna_decoration_mode) return;
+    g_luna_decoration_mode = mode;
+    if (g_luna_decoration_handler)
+        g_luna_decoration_handler(mode, g_luna_decoration_userdata);
 }
 
 float luna_window_width = 1024.0f;
@@ -839,13 +1159,9 @@ LUNA_PFNGLREADPIXELSPROC       luna_p_glReadPixels;
 
 // --- Shaders ---
 
-#if defined(LUNA_UI_GLES3)
-#  define LUNA_GLSL_VERTEX_HEADER   "#version 300 es\nprecision highp float;\nprecision highp int;\n"
-#  define LUNA_GLSL_FRAGMENT_HEADER "#version 300 es\nprecision highp float;\nprecision highp int;\n"
-#else
-#  define LUNA_GLSL_VERTEX_HEADER   "#version 330 core\n"
-#  define LUNA_GLSL_FRAGMENT_HEADER "#version 330 core\n"
-#endif
+/* Version directives are supplied by compile_shader at run time. */
+#define LUNA_GLSL_VERTEX_HEADER   ""
+#define LUNA_GLSL_FRAGMENT_HEADER ""
 
 const char* bg_vs =
     LUNA_GLSL_VERTEX_HEADER
@@ -1926,6 +2242,62 @@ StyleRule* css_rules = NULL;
 int rule_count = 0;
 static int g_rules_cap = 0;
 
+typedef struct LunaCssVarBinding {
+    int rule_idx;
+    char property[CSS_MAX_STR];
+    char source[CSS_MAX_VALUE];
+} LunaCssVarBinding;
+static LunaCssVarBinding* g_css_var_bindings;
+static int g_css_var_binding_count, g_css_var_binding_cap;
+/* Only custom_props/custom_prop_count are used; keeping the parser's native
+ * table makes resolution semantics identical at parse and update time. */
+static CSSStyleSheet g_css_variables;
+static uint32_t g_css_generation = 1;
+
+static void luna_css_variables_clear(void) {
+    free(g_css_var_bindings);
+    g_css_var_bindings = NULL;
+    g_css_var_binding_count = g_css_var_binding_cap = 0;
+    g_css_variables.custom_prop_count = 0;
+}
+
+static void luna_css_variable_store(const char* name, const char* value) {
+    char full[64];
+    if (!name || !*name) return;
+    if (name[0] == '-' && name[1] == '-') snprintf(full, sizeof full, "%s", name);
+    else snprintf(full, sizeof full, "--%s", name);
+    for (int i = 0; i < g_css_variables.custom_prop_count; i++) {
+        if (strcmp(g_css_variables.custom_props[i].name, full) == 0) {
+            snprintf(g_css_variables.custom_props[i].value,
+                     sizeof g_css_variables.custom_props[i].value, "%s", value ? value : "");
+            return;
+        }
+    }
+    if (g_css_variables.custom_prop_count < 128) {
+        int i = g_css_variables.custom_prop_count++;
+        snprintf(g_css_variables.custom_props[i].name,
+                 sizeof g_css_variables.custom_props[i].name, "%s", full);
+        snprintf(g_css_variables.custom_props[i].value,
+                 sizeof g_css_variables.custom_props[i].value, "%s", value ? value : "");
+    }
+}
+
+static void luna_css_bind_variable(int rule_idx, const CSSDeclaration* d) {
+    if (!d || !d->variable_source) return;
+    if (g_css_var_binding_count >= g_css_var_binding_cap) {
+        int cap = g_css_var_binding_cap ? g_css_var_binding_cap * 2 : 32;
+        LunaCssVarBinding* p = (LunaCssVarBinding*)realloc(
+            g_css_var_bindings, (size_t)cap * sizeof(*p));
+        if (!p) return;
+        g_css_var_bindings = p;
+        g_css_var_binding_cap = cap;
+    }
+    LunaCssVarBinding* b = &g_css_var_bindings[g_css_var_binding_count++];
+    b->rule_idx = rule_idx;
+    snprintf(b->property, sizeof b->property, "%s", d->property);
+    snprintf(b->source, sizeof b->source, "%s", d->variable_source);
+}
+
 static int luna_ensure_rule_capacity(int needed) {
     if (needed <= g_rules_cap) return 1;
     if (needed > MAX_RULES) return 0;
@@ -2248,6 +2620,14 @@ static float  g_scroll_drag_off = 0.0f;
 static int    g_scroll_hover_idx = -1;
 static unsigned g_pointer_visual_revision = 1;
 static int    g_scroll_hover_axis = -1; /* -1=none 0=vertical 1=horizontal */
+typedef struct LunaTouchSlot {
+    LunaTouchEvent event;
+    double start_x, start_y, last_x, last_y;
+    int active, primary, mouse_active, panning;
+    int scroll_x, scroll_y;
+} LunaTouchSlot;
+static LunaTouchSlot g_touch_slots[LUNA_UI_MAX_TOUCHES];
+static int g_touch_active_count = 0;
 static int    g_drag_moved = 0;
 static int    g_drag_mode  = 0;
 static double g_press_x = 0, g_press_y = 0;
@@ -6382,7 +6762,11 @@ static void ingest_parsed_rule(const CSSRule *pr) {
 
         rule.source_order = rule_count;
         if (!luna_ensure_rule_capacity(rule_count + 1)) return;
-        css_rules[rule_count++] = rule;
+        css_rules[rule_count] = rule;
+        for (int di = 0; di < pr->decl_count; di++)
+            if ((pr->decls[di].important ? 1 : 0) == importance)
+                luna_css_bind_variable(rule_count, &pr->decls[di]);
+        rule_count++;
       }
     }
 }
@@ -6522,6 +6906,30 @@ static int css_media_matches(const char* prelude) {
     return 1;
 }
 
+static void luna_css_resolve_sheet_variables(CSSStyleSheet* sheet) {
+    if (!sheet) return;
+    css_collect_custom_props(sheet);
+    for (int i = 0; i < sheet->custom_prop_count; i++)
+        luna_css_variable_store(sheet->custom_props[i].name,
+                                sheet->custom_props[i].value);
+    for (int ri = 0; ri < sheet->rule_count; ri++)
+        for (int di = 0; di < sheet->rules[ri].decl_count; di++)
+            if (sheet->rules[ri].decls[di].variable_source) {
+                snprintf(sheet->rules[ri].decls[di].value, CSS_MAX_VALUE, "%s",
+                         sheet->rules[ri].decls[di].variable_source);
+                resolve_var_in_value(&g_css_variables,
+                    sheet->rules[ri].decls[di].value, CSS_MAX_VALUE);
+            }
+    for (int ai = 0; ai < sheet->at_rule_count; ai++)
+        for (int ri = 0; ri < sheet->at_rules[ai].nested_rule_count; ri++)
+            for (int di = 0; di < sheet->at_rules[ai].nested_rules[ri].decl_count; di++)
+                if (sheet->at_rules[ai].nested_rules[ri].decls[di].variable_source) {
+                    CSSDeclaration* d = &sheet->at_rules[ai].nested_rules[ri].decls[di];
+                    snprintf(d->value, CSS_MAX_VALUE, "%s", d->variable_source);
+                    resolve_var_in_value(&g_css_variables, d->value, CSS_MAX_VALUE);
+                }
+}
+
 void parse_css(const char* css_text) {
     /* Stylesheets participate in one document-wide cascade.  Keep rules and
        keyframes loaded by earlier <link>, <style>, or luna_parse_css() calls;
@@ -6531,7 +6939,7 @@ void parse_css(const char* css_text) {
     CSSStyleSheet *sheet = css_parse(css_text, 0);
     if (!sheet) return;
 
-    css_resolve_vars(sheet);
+    luna_css_resolve_sheet_variables(sheet);
 
     /* Normal rules */
     for (int i = 0; i < sheet->rule_count && rule_count < MAX_RULES; i++)
@@ -7182,7 +7590,11 @@ void update_element_style(LunaElement* e) {
         if (r->has_transition) e->anim_speed = 1.0f / r->transition_duration;
         if (r->has_animation && r->anim_name[0]) {
             e->has_css_animation = 1;
-            strncpy(e->anim_name, r->anim_name, sizeof(e->anim_name) - 1);
+            /* Both fields have the same fixed width. Copying the complete
+             * field avoids strncpy's ambiguous truncation semantics; the
+             * explicit final byte keeps malformed/custom rules safe too. */
+            memcpy(e->anim_name, r->anim_name, sizeof(e->anim_name));
+            e->anim_name[sizeof(e->anim_name) - 1] = '\0';
             if (r->anim_duration > 0.0f) e->anim_duration = r->anim_duration;
             e->anim_delay = r->anim_delay;
             e->anim_infinite = r->anim_infinite;
@@ -10815,7 +11227,7 @@ static float g_dmg_x0, g_dmg_y0, g_dmg_x1, g_dmg_y1;
 static int   g_dmg_any;
 static int   g_dmg_enabled = 0;
 
-void luna_set_damage_tracking(int enabled) {
+void luna_redraw_track_damage(int enabled) {
     if (!enabled == !g_dmg_enabled) return;
     g_dmg_enabled = enabled ? 1 : 0;
     /* Turning it on mid-session must not report "unchanged" against records
@@ -10928,7 +11340,7 @@ static void damage_drop(int idx) {
     r->drawn = 0;
 }
 
-int luna_render_damage(float* x, float* y, float* w, float* h) {
+int luna_redraw_damage_region(float* x, float* y, float* w, float* h) {
     if (!g_dmg_enabled || !g_dmg_any) return 0;
     if (x) *x = g_dmg_x0;
     if (y) *y = g_dmg_y0;
@@ -11137,64 +11549,6 @@ void update_animations(double dt) {
     (void)update_animations_internal(dt, NULL, 0, NULL);
 }
 
-int luna_visuals_settling_under(int root_idx) {
-    for (int i = 0; i < elem_count; i++) {
-        LunaElement* e = &elements[i];
-        if (e->display_none) continue;
-        if (root_idx >= 0 && !elem_is_self_or_descendant(i, root_idx)) continue;
-        if (e->has_css_animation && e->anim_name[0] && !e->anim_finished) {
-            if (!e->anim_infinite) return 1;
-            continue;
-        }
-        float press_scale =
-            (e->cursor_pointer && e->is_active && e->drag_mode != 1) ? 0.96f : 1.0f;
-        float target_scale = e->transform_scale * press_scale;
-        float target_a = e->a <= 0.001f ? 0.0f :
-                         (e->a >= 0.999f ? 1.0f : e->a);
-        if (element_visual_unsettled(e, target_scale, target_a)) return 1;
-    }
-    return 0;
-}
-
-int luna_visuals_settling(void) { return luna_visuals_settling_under(-1); }
-
-int luna_visuals_settling_mask(const int* roots, int nroots, unsigned* out_mask) {
-    static unsigned own[LUNA_UI_MAX_ELEMENTS];
-    unsigned mask = 0, any_bits = 0;
-    int any = 0;
-    if (nroots > 32) nroots = 32;
-    for (int k = 0; k < nroots; k++)
-        if (roots[k] < 0) any_bits |= 1u << k;
-    for (int i = 0; i < elem_count; i++) {
-        LunaElement* e = &elements[i];
-        int parent = e->parent_idx;
-        unsigned o = any_bits;
-        if (parent >= 0 && parent < i) o |= own[parent];
-        else if (parent >= 0) {
-            for (int k = 0; k < nroots; k++)
-                if (roots[k] >= 0 && elem_is_self_or_descendant(i, roots[k]))
-                    o |= 1u << k;
-        }
-        for (int k = 0; k < nroots; k++) if (roots[k] == i) o |= 1u << k;
-        own[i] = o;
-        if (e->display_none) continue;
-        if (e->has_css_animation && e->anim_name[0] && !e->anim_finished) {
-            if (!e->anim_infinite) { any = 1; mask |= o; }
-            continue;
-        }
-        float press_scale =
-            (e->cursor_pointer && e->is_active && e->drag_mode != 1) ? 0.96f : 1.0f;
-        float target_scale = e->transform_scale * press_scale;
-        float target_a = e->a <= 0.001f ? 0.0f :
-                         (e->a >= 0.999f ? 1.0f : e->a);
-        if (element_visual_unsettled(e, target_scale, target_a)) {
-            any = 1; mask |= o;
-        }
-    }
-    if (out_mask) *out_mask = mask;
-    return any;
-}
-
 static const CssKeyframe* find_keyframe_anim(const char* name);
 
 /* Is any CSS @keyframes animation actually running under `root_idx`?
@@ -11204,7 +11558,7 @@ static const CssKeyframe* find_keyframe_anim(const char* name);
  * nothing to advance, and that timer was pure waste: a full-screen GL frame
  * plus a full-screen compositor recomposite, several times a second, forever.
  * `root_idx < 0` asks about the whole document. */
-int luna_css_anim_running_under(int root_idx) {
+static int css_animation_active_under(int root_idx) {
     /* The registry already contains only live CSS-animation candidates.
      * Scanning the full DOM once a second caused a small but regular main-loop
      * spike on large shell layouts. */
@@ -13734,8 +14088,13 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
 static GLuint compile_shader(const char* src, GLenum type, const char* label) {
     GLuint shader = glCreateShader(type);
     GLint ok = 0;
+    const char* parts[2];
     if (!shader) return 0;
-    glShaderSource(shader, 1, &src, NULL);
+    parts[0] = g_luna_gles3
+        ? "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+        : "#version 330 core\n";
+    parts[1] = src;
+    glShaderSource(shader, 2, parts, NULL);
     glCompileShader(shader);
     glGetShaderiv_(shader, GL_COMPILE_STATUS, &ok);
     if (!ok) {
@@ -13868,6 +14227,13 @@ int luna_element_count(void) { return elem_count; }
 LunaElement* luna_element_at(int i) { return (i >= 0 && i < elem_count) ? &elements[i] : NULL; }
 int luna_element_parent(int i) { return (i >= 0 && i < elem_count) ? elements[i].parent_idx : -1; }
 int luna_get_element_by_id(const char* id) { return get_element_by_id(id); }
+int luna_get_element_by_class(const char* class_name) {
+    int i;
+    if (!class_name || !*class_name) return -1;
+    for (i = 0; i < elem_count; i++)
+        if (element_has_class(&elements[i], class_name)) return i;
+    return -1;
+}
 int luna_focused_element(void) { return g_focused_element_idx; }
 void luna_focus_element(int idx) { if (idx == -1 || (idx >= 0 && idx < elem_count)) focus_element(idx); }
 void luna_clipboard_set(const char* utf8) {
@@ -13920,6 +14286,7 @@ int luna_load_css_file(const char* p) {
 }
 void luna_reset_css(void) {
     rule_bg_layers_release_all();
+    luna_css_variables_clear();
     free(css_rules);
     css_rules = NULL;
     g_rules_cap = 0;
@@ -13928,6 +14295,8 @@ void luna_reset_css(void) {
     g_css_from_document = 0;
     g_rule_index_ready = 0;
     g_has_structural_selectors = 0;
+    g_css_generation++;
+    if (!g_css_generation) g_css_generation = 1;
 }
 void luna_parse_html(const char* h) { g_probe_prepared = 0; parse_html(h); }
 void luna_parse_css(const char* c) {
@@ -13941,6 +14310,37 @@ void luna_parse_css(const char* c) {
         g_layout_dirty = 1; g_render_order_dirty = 1;
     }
 }
+void luna_css_set_variables(const LunaCssVariable* variables, int count) {
+    if (!variables || count <= 0) return;
+    for (int i = 0; i < count; i++)
+        luna_css_variable_store(variables[i].name, variables[i].value);
+    for (int i = 0; i < g_css_var_binding_count; i++) {
+        LunaCssVarBinding* b = &g_css_var_bindings[i];
+        if (b->rule_idx < 0 || b->rule_idx >= rule_count) continue;
+        char value[CSS_MAX_VALUE];
+        snprintf(value, sizeof value, "%s", b->source);
+        resolve_var_in_value(&g_css_variables, value, sizeof value);
+        StyleRule* r = &css_rules[b->rule_idx];
+        if (strcmp(b->property, "background") == 0 ||
+            strcmp(b->property, "background-image") == 0) {
+            rule_bg_layers_release(r->bg_layers);
+            r->bg_layers = NULL;
+            r->bg_layer_count = 0;
+            if (strcmp(b->property, "background") == 0) {
+                r->has_bg = r->has_gradient = r->has_bg_image = 0;
+                r->grad_stop_count = 0;
+                r->bg_image_path[0] = '\0';
+            }
+        }
+        apply_one_declaration(b->property, value, r);
+    }
+    g_probe_prepared = 0;
+    for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
+    memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
+    g_layout_dirty = 1;
+    g_render_order_dirty = 1;
+}
+uint32_t luna_css_generation(void) { return g_css_generation; }
 void luna_wire_onclick_handlers(void) { wire_element_onclick_handlers(); }
 
 void luna_push_focus_trap(int idx, LunaTrapDismissFn on_dismiss, int backdrop_dismiss) {
@@ -14073,15 +14473,40 @@ void luna_update(double now, double dt) {
     (void)update_animations_internal(dt, NULL, 0, NULL);
 }
 
-int luna_update_settling(double now, double dt) {
+int luna_needs_redraw(double now, double dt) {
+    int layout = g_layout_dirty;
     luna_update_prepare(now, dt);
-    return update_animations_internal(dt, NULL, 0, NULL);
+    int settling = update_animations_internal(dt, NULL, 0, NULL);
+    int css_anim = css_animation_active_under(-1);
+    int mask = 0;
+    if (layout) mask |= LUNA_REDRAW_LAYOUT | LUNA_REDRAW_PAINT;
+    if (settling || css_anim) mask |= LUNA_REDRAW_ANIM | LUNA_REDRAW_PAINT;
+    return mask;
 }
 
-int luna_update_settling_mask(double now, double dt,
-                              const int* roots, int nroots, unsigned* out_mask) {
+int luna_needs_redraw_mask(double now, double dt, const int* roots,
+                           int nroots, unsigned* out_flags) {
+    int layout = g_layout_dirty;
+    unsigned settling_mask = 0;
+    int any = 0;
+    if (nroots < 0) nroots = 0;
+    if (nroots > 32) nroots = 32;
+    if (out_flags)
+        for (int i = 0; i < nroots; i++) out_flags[i] = 0;
     luna_update_prepare(now, dt);
-    return update_animations_internal(dt, roots, nroots, out_mask);
+    (void)update_animations_internal(dt, roots, nroots, &settling_mask);
+    for (int i = 0; i < nroots; i++) {
+        unsigned flags = 0;
+        int valid = roots && (roots[i] == -1 ||
+                    (roots[i] >= 0 && roots[i] < elem_count));
+        if (!valid) continue;
+        if (layout) flags |= LUNA_REDRAW_LAYOUT | LUNA_REDRAW_PAINT;
+        if (settling_mask & (1u << i)) flags |= LUNA_REDRAW_ANIM | LUNA_REDRAW_PAINT;
+        if (css_animation_active_under(roots[i])) flags |= LUNA_REDRAW_ANIM;
+        if (out_flags) out_flags[i] = flags;
+        any |= (int)flags;
+    }
+    return any;
 }
 
 /* Ensure backdrop-blur FBOs/textures can hold the current framebuffer.
@@ -14265,9 +14690,9 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
 static int sticky_is_stuck_in_scroll(int idx);
 static void repaint_stuck_sticky_layers(int fbw, int fbh);
 
-int luna_probe_damage(int root_idx, int fbw, int fbh,
-                      float origin_x, float origin_y,
-                      float region_w, float region_h) {
+int luna_redraw_probe_region(int root_idx, int fbw, int fbh,
+                             float origin_x, float origin_y,
+                             float region_w, float region_h) {
     g_probe_prepared = 0;
     if (!g_dmg_enabled) return 1;
     if (fbw <= 0 || fbh <= 0) return 0;
@@ -14768,6 +15193,132 @@ void luna_mouse_button(int b, int a, int m, double x, double y) {
     mouse_button_callback(NULL, b, a, m);
 }
 void luna_scroll(double xo, double yo) { scroll_callback(NULL, xo, yo); }
+
+static int luna_touch_find(int64_t id) {
+    for (int i = 0; i < LUNA_UI_MAX_TOUCHES; i++)
+        if (g_touch_slots[i].active && g_touch_slots[i].event.id == id) return i;
+    return -1;
+}
+
+static int luna_touch_free_slot(void) {
+    for (int i = 0; i < LUNA_UI_MAX_TOUCHES; i++)
+        if (!g_touch_slots[i].active) return i;
+    return -1;
+}
+
+static void luna_touch_cancel_mouse(LunaTouchSlot* slot) {
+    if (!slot || !slot->mouse_active) return;
+    /* A pan or second contact must not activate the control that received the
+     * initial press. The normal release path already clears active/drag state. */
+    g_drag_moved = 1;
+    luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_RELEASE, 0,
+                      slot->last_x, slot->last_y);
+    slot->mouse_active = 0;
+}
+
+void luna_touch(const LunaTouchEvent* input) {
+    LunaTouchEvent event;
+    LunaTouchSlot* slot;
+    int index;
+    if (!input) return;
+    event = *input;
+    if (event.phase < LUNA_TOUCH_DOWN || event.phase > LUNA_TOUCH_CANCEL) return;
+    if (event.tool < LUNA_TOUCH_TOOL_FINGER || event.tool > LUNA_TOUCH_TOOL_ERASER)
+        event.tool = LUNA_TOUCH_TOOL_FINGER;
+    if (event.pressure < 0.0f) event.pressure = 0.0f;
+    if (event.pressure > 1.0f) event.pressure = 1.0f;
+
+    index = luna_touch_find(event.id);
+    if (event.phase == LUNA_TOUCH_DOWN) {
+        if (index < 0) index = luna_touch_free_slot();
+        if (index < 0) return;
+        slot = &g_touch_slots[index];
+        memset(slot, 0, sizeof(*slot));
+        slot->active = 1;
+        slot->event = event;
+        slot->start_x = slot->last_x = event.x;
+        slot->start_y = slot->last_y = event.y;
+        slot->scroll_x = slot->scroll_y = -1;
+        slot->primary = g_touch_active_count == 0;
+        g_touch_active_count++;
+
+        if (!slot->primary) {
+            /* Multi-touch is exposed losslessly to on_touch. The built-in UI
+             * cancels its single-pointer emulation so a pinch cannot click. */
+            for (int i = 0; i < LUNA_UI_MAX_TOUCHES; i++)
+                if (g_touch_slots[i].active && g_touch_slots[i].primary)
+                    luna_touch_cancel_mouse(&g_touch_slots[i]);
+            return;
+        }
+        luna_mouse_move(event.x, event.y);
+        {
+            int hit = hit_test_at(event.x, event.y);
+            slot->scroll_x = find_scroll_target_x(hit);
+            slot->scroll_y = find_scroll_target_y(hit);
+        }
+        luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_PRESS, 0, event.x, event.y);
+        slot->mouse_active = 1;
+        return;
+    }
+
+    if (index < 0) return;
+    slot = &g_touch_slots[index];
+    {
+        double dx = event.x - slot->last_x;
+        double dy = event.y - slot->last_y;
+        double total_x = event.x - slot->start_x;
+        double total_y = event.y - slot->start_y;
+        slot->event = event;
+        if (event.phase == LUNA_TOUCH_MOVE && slot->primary) {
+            if (!slot->panning && slot->mouse_active &&
+                total_x * total_x + total_y * total_y > 64.0 &&
+                (slot->scroll_x >= 0 || slot->scroll_y >= 0)) {
+                luna_touch_cancel_mouse(slot);
+                slot->panning = 1;
+            }
+            if (slot->panning) {
+                if (slot->scroll_x >= 0 && dx != 0.0)
+                    add_scroll_left(slot->scroll_x, -(float)dx, 0);
+                if (slot->scroll_y >= 0 && dy != 0.0)
+                    add_scroll_top(slot->scroll_y, -(float)dy, 0);
+                luna_mouse_move(event.x, event.y);
+            } else if (slot->mouse_active) {
+                luna_mouse_move(event.x, event.y);
+            }
+        } else if (event.phase == LUNA_TOUCH_UP) {
+            if (slot->primary && slot->mouse_active) {
+                luna_mouse_move(event.x, event.y);
+                luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_RELEASE, 0,
+                                  event.x, event.y);
+                slot->mouse_active = 0;
+            }
+        } else if (event.phase == LUNA_TOUCH_CANCEL) {
+            luna_touch_cancel_mouse(slot);
+        }
+        slot->last_x = event.x;
+        slot->last_y = event.y;
+    }
+    if (event.phase == LUNA_TOUCH_UP || event.phase == LUNA_TOUCH_CANCEL) {
+        memset(slot, 0, sizeof(*slot));
+        if (g_touch_active_count > 0) g_touch_active_count--;
+    }
+}
+
+int luna_touch_count(void) { return g_touch_active_count; }
+
+int luna_touch_get(int index, LunaTouchEvent* out_event) {
+    int active_index = 0;
+    if (index < 0 || !out_event) return 0;
+    for (int i = 0; i < LUNA_UI_MAX_TOUCHES; i++) {
+        if (!g_touch_slots[i].active) continue;
+        if (active_index++ == index) {
+            *out_event = g_touch_slots[i].event;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void luna_key(int k, int sc, int a, int m) {
     g_luna_shift = (m & LUNA_MOD_SHIFT) ? 1 : 0;
     key_callback(NULL, k, sc, a, m);
@@ -14875,6 +15426,8 @@ static void cache_uniform_locations(void) {
 
 int luna_init(const LunaInitConfig* cfg) {
     if (!cfg || !cfg->get_proc) return 0;
+    memset(g_touch_slots, 0, sizeof(g_touch_slots));
+    g_touch_active_count = 0;
     if (!g_luna_platform.get_proc) g_luna_platform.get_proc = cfg->get_proc;
     luna_window_width = cfg->width;
     luna_window_height = cfg->height;
@@ -14911,6 +15464,9 @@ int luna_init(const LunaInitConfig* cfg) {
 }
 void luna_shutdown(void) {
     rule_bg_layers_release_all();
+    luna_css_variables_clear();
+    g_css_generation++;
+    if (!g_css_generation) g_css_generation = 1;
     for (int i = 0; i < elem_count; i++) {
         free(elements[i].bg_layers);
         elements[i].bg_layers = NULL;
@@ -15064,6 +15620,15 @@ void luna_context_scroll(LunaContext* ctx, double xoffset, double yoffset) {
     luna_scroll(xoffset, yoffset);
 }
 
+void luna_context_touch(LunaContext* ctx, const LunaTouchEvent* event) {
+    LunaTouchEvent translated;
+    if (!ctx || !event) return;
+    translated = *event;
+    translated.x += ctx->origin_x;
+    translated.y += ctx->origin_y;
+    luna_touch(&translated);
+}
+
 #endif /* LUNA_UI_IMPLEMENTATION */
 #ifdef __cplusplus
 }
@@ -15126,7 +15691,11 @@ void luna_context_scroll(LunaContext* ctx, double xoffset, double yoffset) {
 #  elif defined(_WIN32)
 #    include "luna_windows.h"
 #  elif defined(__linux__)
-#    include "luna_linux.h"
+#    if defined(LUNA_UI_BACKEND_KMS)
+#      include "luna_kms.h"
+#    else
+#      include "luna_glfw.h"
+#    endif
 #  endif
 #  undef LUNA_UI_PLATFORM_BODY
 #endif

@@ -12,6 +12,10 @@
  *   #define LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION
  *   #include "luna-window.h"
  *
+ * Embedded hosts call luna_file_dialog_overlay_html(), luna_file_dialog_css(),
+ * luna_file_dialog_prepare(), then luna_file_dialog_show() with a callback.
+ * Standalone luna-fm uses luna_file_dialog_run() instead.
+ *
  * luna-window.h will raise LUNA_UI_MAX_ELEMENTS to 2048 for this case.
  *
  * Copyright © 2026 Yuichiro Nakada / Project Luna (Vespera) — MPL 2.0
@@ -65,6 +69,24 @@ extern "C" {
 #define LUNA_WINDOW_PATH_MAX 4096
 #endif
 
+/*
+ * Titlebar height, in logical pixels.
+ *
+ * There is exactly one authority for this number: the active luna-shell skin
+ * (`titlebar_height` in skin.conf).  luna-shell pushes it to the compositor as
+ * `wm_config titlebar_height` — which sizes the server-side decoration bar —
+ * and writes the same value into window-theme.conf, which is what
+ * luna_window_theme_load_system() reads for the client-drawn titlebar.  An SSD
+ * window and a CSD window on the same desktop therefore get the same bar.
+ *
+ * The bounds mirror SSD_BAR_H_MIN / SSD_BAR_H_MAX in the compositor
+ * (apps/luna-shell/wayland-server-rs/src/server.rs); the retro 3-D bevel and
+ * the SSD glyph metrics stop looking right outside them.
+ */
+#define LUNA_TITLEBAR_H_MIN     20
+#define LUNA_TITLEBAR_H_MAX     64
+#define LUNA_TITLEBAR_H_DEFAULT 28
+
 typedef enum LunaWindowThemeMode {
     LUNA_WINDOW_THEME_SYSTEM = 0,
     LUNA_WINDOW_THEME_LIGHT,
@@ -117,25 +139,56 @@ typedef struct LunaWindowTheme {
     int controls_on_left;
 } LunaWindowTheme;
 
+/*
+ * User-visible strings.  The window menu and the dialog buttons used to be
+ * hardcoded Japanese inside the library, which no application could override.
+ * Leave any field NULL to keep the built-in English text.
+ */
+typedef struct LunaWindowStrings {
+    const char* minimize;   /* "Minimize" */
+    const char* maximize;   /* "Maximize" */
+    const char* restore;    /* "Restore" — shown while maximized */
+    const char* close;      /* "Close" */
+    const char* ok;         /* "OK" */
+    const char* cancel;     /* "Cancel" */
+    const char* yes;        /* "Yes" */
+    const char* no;         /* "No" */
+} LunaWindowStrings;
+
+/*
+ * Where the chrome lives in the application's document.
+ *
+ * Every field is optional.  A NULL entry is resolved by looking up the
+ * standard id, then the standard class — so an application that injects
+ * luna_window_standard_titlebar_html() needs no LunaWindowParts at all, and one
+ * with its own markup only names the parts that differ.
+ */
+typedef struct LunaWindowParts {
+    const char* root;
+    const char* titlebar;
+    const char* title;
+    const char* close;
+    const char* minimize;
+    const char* maximize;
+    /* Resize handles, in LUNA_WINDOW_EDGE_* order. */
+    const char* resize[8];
+} LunaWindowParts;
+
+enum {
+    LUNA_WINDOW_EDGE_LEFT = 0, LUNA_WINDOW_EDGE_RIGHT,
+    LUNA_WINDOW_EDGE_TOP, LUNA_WINDOW_EDGE_BOTTOM,
+    LUNA_WINDOW_EDGE_TOP_LEFT, LUNA_WINDOW_EDGE_TOP_RIGHT,
+    LUNA_WINDOW_EDGE_BOTTOM_LEFT, LUNA_WINDOW_EDGE_BOTTOM_RIGHT
+};
+
 typedef struct LunaWindowConfig {
-    const char* root_id;
-    const char* titlebar_id;
-    const char* title_id;
-    const char* close_id;
-    const char* minimize_id;
-    const char* maximize_id;
-    const char* resize_left_id;
-    const char* resize_right_id;
-    const char* resize_top_id;
-    const char* resize_bottom_id;
-    const char* resize_top_left_id;
-    const char* resize_top_right_id;
-    const char* resize_bottom_left_id;
-    const char* resize_bottom_right_id;
     const char* title;
     const char* app_name;
     LunaWindowChromeMode chrome;
     LunaWindowThemeMode theme;
+    /* Both optional; NULL selects the built-in defaults. */
+    const LunaWindowStrings* strings;
+    const LunaWindowParts*   parts;
 } LunaWindowConfig;
 
 typedef void (*LunaWindowDialogCallback)(LunaWindowDialogResult result,
@@ -180,53 +233,64 @@ typedef enum LunaFileDialogMode {
     LUNA_FILE_DIALOG_SAVE_FILE
 } LunaFileDialogMode;
 
-typedef enum LunaFileDialogBackend {
-    /* AUTO means the Luna standard dialog. Desktop helpers are explicit opt-ins. */
-    LUNA_FILE_DIALOG_BACKEND_AUTO = 0,
-    LUNA_FILE_DIALOG_BACKEND_LUNA,
-    LUNA_FILE_DIALOG_BACKEND_ZENITY,
-    LUNA_FILE_DIALOG_BACKEND_KDIALOG,
-    LUNA_FILE_DIALOG_BACKEND_YAD
-} LunaFileDialogBackend;
-
 typedef struct LunaFileDialogConfig {
     LunaFileDialogMode mode;
-    LunaFileDialogBackend backend;
     const char* title;
     const char* initial_path;
     const char* suggested_name;
     const char* accept_label;
-    /* Optional desktop-helper filter, e.g. "Images" and "*.png *.jpg". */
+    /* Optional filename filter, e.g. "Images" and "*.png *.jpg". */
     const char* filter_name;
     const char* filter_patterns;
-    /* Deprecated compatibility field. The built-in Luna backend no longer
-       launches luna-fm, so this value is ignored. */
+    /* Deprecated compatibility field; ignored. */
     const char* luna_fm_path;
     int width;
     int height;
     int client_chrome;
 } LunaFileDialogConfig;
 
+/*
+ * Selected paths.  This used to be a fixed char[32][4096] — 128 KB passed by
+ * value on every callback and copied on every dialog close, to carry a handful
+ * of short strings.  `paths` is now heap-allocated and owned by the result.
+ *
+ * A LunaFileDialogCallback receives a borrowed result that is freed as soon as
+ * the callback returns; copy anything you keep.  A result filled in by
+ * luna_file_dialog_run() belongs to the caller — release it with
+ * luna_file_dialog_result_free().
+ */
 typedef struct LunaFileDialogResult {
-    int accepted;
-    int count;
-    char paths[LUNA_FILE_DIALOG_MAX_RESULTS][LUNA_WINDOW_PATH_MAX];
+    int    accepted;
+    int    count;
+    char** paths;
 } LunaFileDialogResult;
+
+void luna_file_dialog_result_free(LunaFileDialogResult* result);
 
 /* Returns 0 when the dialog ran normally, including user cancellation.
  * Inspect result->accepted to distinguish Accept from Cancel. */
 int luna_file_dialog_run(const LunaFileDialogConfig* config,
                          LunaFileDialogResult* result);
 
-/* Opens a separate dialog process, so it is safe to call from an already
- * running Luna UI application. AUTO/LUNA use the file-dialog implementation
- * compiled into the current executable; no luna-fm executable is required.
- * zenity/kdialog/yad are explicit opt-ins. Returns 0 for Accept or Cancel and
- * a negative value only when the requested backend could not be launched. */
+typedef void (*LunaFileDialogCallback)(const LunaFileDialogResult* result,
+                                       void* userdata);
+
+/* In-process overlay for hosts that already run Luna UI.
+ * Host must inject luna_file_dialog_overlay_html() into the document and
+ * luna_file_dialog_css() into CSS, then call luna_file_dialog_prepare() after
+ * parse/wire. Returns 0 if shown, negative if unavailable. */
 int luna_file_dialog_show(const LunaFileDialogConfig* config,
-                          LunaFileDialogResult* result);
-LunaFileDialogBackend luna_file_dialog_backend_from_string(const char* name);
-const char* luna_file_dialog_backend_name(LunaFileDialogBackend backend);
+                          LunaFileDialogCallback callback,
+                          void* userdata);
+
+const char* luna_file_dialog_overlay_html(void);
+const char* luna_file_dialog_css(void);
+void luna_file_dialog_prepare(void);
+void luna_file_dialog_render(int fbw, int fbh);
+void luna_file_dialog_tick(double dt);
+int luna_file_dialog_is_open(void);
+/* Returns 1 if the key was consumed by an open file dialog. */
+int luna_file_dialog_handle_key(int key, int scancode, int action, int mods);
 
 #ifdef __cplusplus
 }
@@ -261,6 +325,12 @@ static const char* luna_window_css_text =
 ".luna-resize-left{left:0;top:8px;bottom:8px;width:6px;cursor:ew-resize}.luna-resize-right{right:0;top:8px;bottom:8px;width:6px;cursor:ew-resize}\n"
 ".luna-resize-top{left:8px;right:8px;top:0;height:6px;cursor:ns-resize}.luna-resize-bottom{left:8px;right:8px;bottom:0;height:6px;cursor:ns-resize}\n"
 ".luna-resize-tl,.luna-resize-tr,.luna-resize-bl,.luna-resize-br{width:10px;height:10px}.luna-resize-tl{left:0;top:0;cursor:nwse-resize}.luna-resize-tr{right:0;top:0;cursor:nesw-resize}.luna-resize-bl{left:0;bottom:0;cursor:nesw-resize}.luna-resize-br{right:0;bottom:0;cursor:nwse-resize}\n"
+/* Chrome is hidden by class, not by omitting the markup, so the same document
+ * serves both decoration modes and a live renegotiation is only a restyle.
+ * Without these rules luna_window_show_chrome() adds a class that no selector
+ * matches, and a server-decorated window keeps drawing its own titlebar under
+ * the compositor's. */
+".luna-titlebar.hidden,.luna-resize-handle.hidden{display:none;}\n"
 ".luna-common-overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(10,15,25,.36);z-index:5000;}\n"
 ".luna-common-overlay.hidden,.luna-common-toast.hidden{display:none;}\n"
 ".luna-common-dialog{width:92%;max-width:480px;display:flex;flex-direction:column;gap:12px;padding:18px;border-radius:15px;border:1px solid rgba(255,255,255,.54);background:rgba(249,250,252,.98);box-shadow:0 26px 80px rgba(15,23,42,.34);}\n"
@@ -301,18 +371,18 @@ static const char* luna_window_overlay_html_text =
 "<div id=\"luna-common-dialog-message\" class=\"luna-common-dialog-message\"></div>"
 "<input id=\"luna-common-dialog-input\" class=\"luna-common-dialog-input hidden\" type=\"text\">"
 "<div class=\"luna-common-dialog-actions\">"
-"<div id=\"luna-common-dialog-cancel\" class=\"luna-common-button hidden\" onclick=\"lunaWindowDialogCancel()\">Cancel</div>"
-"<div id=\"luna-common-dialog-ok\" class=\"luna-common-button primary\" onclick=\"lunaWindowDialogOk()\">OK</div>"
+"<div id=\"luna-common-dialog-cancel\" class=\"luna-common-button hidden\" onclick=\"lunaWindowDialogCancel()\"></div>"
+"<div id=\"luna-common-dialog-ok\" class=\"luna-common-button primary\" onclick=\"lunaWindowDialogOk()\"></div>"
 "</div></div></div>"
 "<div id=\"luna-common-toast\" class=\"luna-common-toast hidden\" onclick=\"lunaWindowToastClose()\">"
 "<div id=\"luna-common-toast-title\" class=\"luna-common-toast-title\"></div>"
 "<div id=\"luna-common-toast-message\" class=\"luna-common-toast-message\"></div>"
 "</div>"
 "<div id=\"luna-window-menu\" class=\"luna-window-menu hidden\">"
-"<div class=\"luna-window-menu-item\" onclick=\"lunaWindowMenuMinimize()\">最小化</div>"
-"<div id=\"luna-window-menu-maximize\" class=\"luna-window-menu-item\" onclick=\"lunaWindowMenuMaximize()\">最大化</div>"
+"<div id=\"luna-window-menu-minimize\" class=\"luna-window-menu-item\" onclick=\"lunaWindowMenuMinimize()\"></div>"
+"<div id=\"luna-window-menu-maximize\" class=\"luna-window-menu-item\" onclick=\"lunaWindowMenuMaximize()\"></div>"
 "<div class=\"luna-window-menu-sep\"></div>"
-"<div class=\"luna-window-menu-item\" onclick=\"lunaWindowMenuClose()\">閉じる</div>"
+"<div id=\"luna-window-menu-close\" class=\"luna-window-menu-item\" onclick=\"lunaWindowMenuClose()\"></div>"
 "</div>";
 
 typedef struct LunaWindowState {
@@ -323,7 +393,7 @@ typedef struct LunaWindowState {
     int dialog_overlay, dialog_title, dialog_message, dialog_input;
     int dialog_cancel, dialog_ok;
     int toast, toast_title, toast_message;
-    int window_menu, window_menu_maximize;
+    int window_menu, window_menu_minimize, window_menu_maximize, window_menu_close;
     double toast_remaining;
     LunaWindowDialogCallback dialog_callback;
     void* dialog_userdata;
@@ -333,7 +403,20 @@ typedef struct LunaWindowState {
     double system_theme_poll_remaining;
     LunaWindowTheme applied_theme;
     int applied_theme_valid;
+    /* Chrome visibility, driven by the compositor's decoration decision rather
+     * than settled once at bind time.  -1 = not yet decided. */
+    int chrome_visible;
+    LunaWindowStrings strings;
 } LunaWindowState;
+
+/* Built-in English text; luna_window_text() falls back to these. */
+static const LunaWindowStrings luna_window_default_strings = {
+    "Minimize", "Maximize", "Restore", "Close", "OK", "Cancel", "Yes", "No"
+};
+
+static const char* luna_window_text(const char* configured, const char* fallback) {
+    return (configured && *configured) ? configured : fallback;
+}
 
 static LunaWindowState luna_window_state;
 
@@ -356,7 +439,10 @@ static void luna_window_state_reset(void) {
     luna_window_state.toast_title=-1;
     luna_window_state.toast_message=-1;
     luna_window_state.window_menu=-1;
+    luna_window_state.window_menu_minimize=-1;
     luna_window_state.window_menu_maximize=-1;
+    luna_window_state.window_menu_close=-1;
+    luna_window_state.chrome_visible=-1;
 }
 
 static int luna_window_id(const char* id) { return id && id[0] ? luna_get_element_by_id(id) : -1; }
@@ -379,34 +465,6 @@ static void luna_window_control_maximize(LunaElement* e) { (void)e; luna_platfor
 static void luna_window_menu_hide(void) {
     if (luna_window_state.window_menu < 0) return;
     luna_add_class(luna_window_state.window_menu, "hidden");
-    luna_mark_layout_dirty();
-    luna_platform_request_redraw();
-}
-
-static void luna_window_menu_show_at(double mx, double my) {
-    LunaElement* e;
-    float menu_w = 188.0f, menu_h = 104.0f;
-    float x, y, ww, hh;
-    if (luna_window_state.window_menu < 0) return;
-    e = luna_element_at(luna_window_state.window_menu);
-    if (!e) return;
-    if (e->w > 1.0f) menu_w = e->w;
-    if (e->h > 1.0f) menu_h = e->h;
-    ww = luna_window_width > 1.0f ? luna_window_width : 800.0f;
-    hh = luna_window_height > 1.0f ? luna_window_height : 600.0f;
-    x = (float)mx;
-    y = (float)my;
-    if (x + menu_w > ww - 4.0f) x = ww - menu_w - 4.0f;
-    if (y + menu_h > hh - 4.0f) y = hh - menu_h - 4.0f;
-    if (x < 4.0f) x = 4.0f;
-    if (y < 4.0f) y = 4.0f;
-    snprintf(e->inline_style, sizeof(e->inline_style), "left:%.0fpx;top:%.0fpx;", x, y);
-    e->has_inline_style = 1;
-    luna_update_element_style(luna_window_state.window_menu);
-    if (luna_window_state.window_menu_maximize >= 0)
-        luna_set_text(luna_window_state.window_menu_maximize, "最大化");
-    luna_remove_class(luna_window_state.window_menu, "hidden");
-    luna_consume_pointer_event();
     luna_mark_layout_dirty();
     luna_platform_request_redraw();
 }
@@ -490,16 +548,11 @@ static void luna_window_press_hook(int hit, int button, int mods) {
         {
             double mx = 0.0, my = 0.0;
             luna_get_pointer(&mx, &my);
-            /* luna_linux_show_window_menu lives in luna_linux.h; custom hosts
-             * that set LUNA_UI_NO_PLATFORM (e.g. luna-shell) skip it and use
-             * the in-app fallback menu below. */
-#if (defined(__linux__) || defined(__FreeBSD__)) && !defined(LUNA_UI_NO_PLATFORM)
-            if (luna_linux_show_window_menu((int)mx, (int)my)) {
-                luna_consume_pointer_event();
-                return;
-            }
-#endif
-            luna_window_menu_show_at(mx, my);
+            /* Native hosts may ask the compositor/WM for its menu.  The ABI is
+             * deliberately host-neutral; luna-window no longer reaches into
+             * a Linux/GLFW implementation header. */
+            luna_platform_show_window_menu((int)mx, (int)my);
+            luna_consume_pointer_event();
         }
         return;
     }
@@ -551,7 +604,7 @@ static void luna_window_theme_fill_default(LunaWindowTheme* theme, LunaWindowThe
     theme->titlebar_active = theme->surface;
     theme->titlebar_inactive = theme->surface_secondary;
     theme->titlebar_frame = theme->border;
-    theme->titlebar_height = 42.0f;
+    theme->titlebar_height = (float)LUNA_TITLEBAR_H_DEFAULT;
     theme->corner_radius = 12.0f;
     theme->dialog_radius = 15.0f;
     theme->control_size = 13.0f;
@@ -643,7 +696,14 @@ int luna_window_theme_load_file(LunaWindowTheme* theme, const char* path) {
         else if (!strcmp(line,"titlebar_active")) theme->titlebar_active=luna_window_parse_color(eq,theme->titlebar_active);
         else if (!strcmp(line,"titlebar_inactive")) theme->titlebar_inactive=luna_window_parse_color(eq,theme->titlebar_inactive);
         else if (!strcmp(line,"titlebar_frame")) theme->titlebar_frame=luna_window_parse_color(eq,theme->titlebar_frame);
-        else if (!strcmp(line,"titlebar_height")) theme->titlebar_height=strtof(eq,NULL);
+        else if (!strcmp(line,"titlebar_height")) {
+            /* Clamped to the same range the compositor clamps its SSD bar to,
+             * so a bad theme file cannot desync CSD chrome from SSD chrome. */
+            float h = strtof(eq,NULL);
+            if (h < (float)LUNA_TITLEBAR_H_MIN) h = (float)LUNA_TITLEBAR_H_MIN;
+            if (h > (float)LUNA_TITLEBAR_H_MAX) h = (float)LUNA_TITLEBAR_H_MAX;
+            theme->titlebar_height = h;
+        }
         else if (!strcmp(line,"corner_radius")) theme->corner_radius=strtof(eq,NULL);
         else if (!strcmp(line,"dialog_radius")) theme->dialog_radius=strtof(eq,NULL);
         else if (!strcmp(line,"control_size")) theme->control_size=strtof(eq,NULL);
@@ -699,7 +759,20 @@ void luna_window_theme_apply(const LunaWindowTheme* theme) {
             classes);
     }
     char bg[48],surface[48],border[48],text[48],secondary[48],accent[48],accent_hover[48],danger[48],titlebar[48],titlebar_inactive[48],frame[48];
-    char css[3072];
+    char titlebar_h[32], control_size[32], dialog_radius[32], corner_radius[32];
+    static uint32_t installed_generation;
+    static const char theme_css[] =
+        ".luna-window-root:not(.app){background:var(--luna-window-bg);color:var(--luna-window-text);}"
+        ".luna-window-root .luna-titlebar{height:var(--luna-titlebar-height);min-height:var(--luna-titlebar-height);background:var(--luna-titlebar-active);border-bottom-color:var(--luna-titlebar-frame);}"
+        ".luna-window-root.luna-window-inactive .luna-titlebar{background:var(--luna-titlebar-inactive);}"
+        ".luna-window-root .luna-window-control{width:var(--luna-control-size);height:var(--luna-control-size);}"
+        ".luna-window-root .luna-common-dialog{background:var(--luna-window-surface);border-color:var(--luna-window-border);border-radius:var(--luna-dialog-radius);color:var(--luna-window-text);}"
+        ".luna-window-root .luna-common-dialog-message{color:var(--luna-window-secondary);}"
+        ".luna-window-root .luna-common-dialog-input{border-color:var(--luna-window-border);}"
+        ".luna-window-root .luna-common-button.primary{background:var(--luna-window-accent);}"
+        ".luna-window-root .luna-common-button.primary:hover{background:var(--luna-window-accent-hover);}"
+        ".luna-window-root .luna-common-button.danger{background:var(--luna-window-danger);}"
+        ".luna-window-root{border-radius:var(--luna-window-radius);}";
     luna_window_color(bg,sizeof(bg),theme->window_background);
     luna_window_color(surface,sizeof(surface),theme->surface);
     luna_window_color(border,sizeof(border),theme->border);
@@ -711,61 +784,154 @@ void luna_window_theme_apply(const LunaWindowTheme* theme) {
     luna_window_color(titlebar,sizeof(titlebar),theme->titlebar_active);
     luna_window_color(titlebar_inactive,sizeof(titlebar_inactive),theme->titlebar_inactive);
     luna_window_color(frame,sizeof(frame),theme->titlebar_frame);
-    /* Root fill/text must not clobber application stylesheets.  Apps that share
-     * the chrome root (class="app luna-window-root") author their own
-     * background/color; theme_apply runs after those sheets and would otherwise
-     * flatten gradients or wipe transparency.  Restrict the surface fill to
-     * chrome-only roots via :not(.app).  Titlebar/dialog/control tokens still
-     * apply under either root shape. */
-    snprintf(css,sizeof(css),
-        ".luna-window-root:not(.app){background:%s;color:%s;}"
-        ".luna-window-root .luna-titlebar{height:%.1fpx;min-height:%.1fpx;background:%s;border-bottom-color:%s;}"
-        ".luna-window-root.luna-window-inactive .luna-titlebar{background:%s;}"
-        ".luna-window-root .luna-window-control{width:%.1fpx;height:%.1fpx;}"
-        ".luna-window-root .luna-common-dialog{background:%s;border-color:%s;border-radius:%.1fpx;color:%s;}"
-        ".luna-window-root .luna-common-dialog-message{color:%s;}"
-        ".luna-window-root .luna-common-dialog-input{border-color:%s;}"
-        ".luna-window-root .luna-common-button.primary{background:%s;}"
-        ".luna-window-root .luna-common-button.primary:hover{background:%s;}"
-        ".luna-window-root .luna-common-button.danger{background:%s;}"
-        ".luna-window-root{border-radius:%.1fpx;}",
-        bg,text,theme->titlebar_height,theme->titlebar_height,titlebar,frame,titlebar_inactive,
-        theme->control_size,theme->control_size,surface,border,theme->dialog_radius,text,
-        secondary,border,accent,accent_hover,danger,theme->corner_radius);
-    luna_parse_css(css);
-    luna_mark_layout_dirty();
+    snprintf(titlebar_h,sizeof titlebar_h,"%.1fpx",theme->titlebar_height);
+    snprintf(control_size,sizeof control_size,"%.1fpx",theme->control_size);
+    snprintf(dialog_radius,sizeof dialog_radius,"%.1fpx",theme->dialog_radius);
+    snprintf(corner_radius,sizeof corner_radius,"%.1fpx",theme->corner_radius);
+    LunaCssVariable vars[] = {
+        {"--luna-window-bg",bg}, {"--luna-window-surface",surface},
+        {"--luna-window-border",border}, {"--luna-window-text",text},
+        {"--luna-window-secondary",secondary}, {"--luna-window-accent",accent},
+        {"--luna-window-accent-hover",accent_hover}, {"--luna-window-danger",danger},
+        {"--luna-titlebar-active",titlebar}, {"--luna-titlebar-inactive",titlebar_inactive},
+        {"--luna-titlebar-frame",frame}, {"--luna-titlebar-height",titlebar_h},
+        {"--luna-control-size",control_size}, {"--luna-dialog-radius",dialog_radius},
+        {"--luna-window-radius",corner_radius}
+    };
+    luna_css_set_variables(vars, (int)(sizeof vars / sizeof vars[0]));
+    if (installed_generation != luna_css_generation()) {
+        /* The selector/declaration graph is immutable between CSS resets. */
+        luna_parse_css(theme_css);
+        installed_generation = luna_css_generation();
+    }
     luna_platform_request_redraw();
 }
 
+/*
+ * Show or hide the client-drawn titlebar and the eight resize handles.
+ *
+ * Hiding is done with the "hidden" class rather than by not emitting the
+ * markup, so the same document works under either decoration mode and a live
+ * renegotiation only costs a restyle: the content below reflows up into the
+ * space the titlebar was occupying.
+ */
+static void luna_window_show_chrome(int visible) {
+    int i;
+    if (luna_window_state.chrome_visible == visible) return;
+    luna_window_state.chrome_visible = visible;
+    if (luna_window_state.titlebar >= 0) {
+        if (visible) luna_remove_class(luna_window_state.titlebar, "hidden");
+        else         luna_add_class(luna_window_state.titlebar, "hidden");
+    }
+    for (i = 0; i < 8; i++) {
+        int idx = luna_window_state.resize_ids[i];
+        if (idx < 0) continue;
+        if (visible) luna_remove_class(idx, "hidden");
+        else         luna_add_class(idx, "hidden");
+    }
+    /* The press hook is what turns a titlebar drag into xdg_toplevel.move and a
+     * handle drag into xdg_toplevel.resize.  Under server-side decoration the
+     * compositor owns both, and leaving the hook installed would let a click on
+     * application content start a spurious move. */
+    luna_set_mouse_press_hook(visible ? luna_window_press_hook : NULL);
+    luna_platform_request_redraw();
+}
+
+/* Resolve the compositor's decision against the application's preference. */
+static void luna_window_apply_decoration(int mode) {
+    int visible;
+    if (!luna_window_state.bound) return;
+    switch (luna_window_state.config.chrome) {
+    case LUNA_WINDOW_CHROME_NONE:
+        visible = 0;
+        break;
+    case LUNA_WINDOW_CHROME_NATIVE:
+        /* The application asked for whatever the platform draws. */
+        visible = 0;
+        break;
+    case LUNA_WINDOW_CHROME_CLIENT:
+        /* The application insists on its own chrome — an editor with tabs in
+         * the titlebar cannot hand that to the compositor. */
+        visible = 1;
+        break;
+    case LUNA_WINDOW_CHROME_AUTO:
+    default:
+        /* Draw our own unless the compositor said it is drawing.  An unknown
+         * mode means nobody negotiated, so nobody else will draw a frame. */
+        visible = (mode != LUNA_DECORATION_SERVER) &&
+                  (luna_window_state.titlebar >= 0);
+        break;
+    }
+    luna_window_show_chrome(visible);
+}
+
+static void luna_window_decoration_changed(int mode, void* userdata) {
+    (void)userdata;
+    luna_window_apply_decoration(mode);
+}
+
+/*
+ * Resolve one chrome part.  Explicit id from LunaWindowParts wins; otherwise
+ * the standard id; otherwise the standard class.  The class fallback is what
+ * lets an application style its own markup into the roles without listing an
+ * id for each one.
+ */
+static int luna_window_resolve(const char* explicit_id, const char* std_id,
+                               const char* std_class) {
+    int idx;
+    if (explicit_id && *explicit_id) {
+        idx = luna_get_element_by_id(explicit_id);
+        if (idx >= 0) return idx;
+    }
+    if (std_id && *std_id) {
+        idx = luna_get_element_by_id(std_id);
+        if (idx >= 0) return idx;
+    }
+    if (std_class && *std_class) return luna_get_element_by_class(std_class);
+    return -1;
+}
+
+/* Standard ids and classes for the eight resize handles, in
+ * LUNA_WINDOW_EDGE_* order. */
+static const char* const luna_window_resize_std_ids[8] = {
+    "luna-resize-left", "luna-resize-right", "luna-resize-top",
+    "luna-resize-bottom", "luna-resize-tl", "luna-resize-tr",
+    "luna-resize-bl", "luna-resize-br"
+};
+static const char* const luna_window_resize_std_classes[8] = {
+    "luna-resize-left", "luna-resize-right", "luna-resize-top",
+    "luna-resize-bottom", "luna-resize-tl", "luna-resize-tr",
+    "luna-resize-bl", "luna-resize-br"
+};
+
 void luna_window_bind(const LunaWindowConfig* config) {
     luna_set_mouse_press_hook(NULL);
+    luna_set_decoration_handler(NULL, NULL);
     luna_window_state_reset();
     LunaWindowConfig c;
+    LunaWindowParts p;
     memset(&c, 0, sizeof(c));
+    memset(&p, 0, sizeof(p));
     if (config) c = *config;
-    if (!c.root_id) c.root_id = "luna-window-root";
-    if (!c.titlebar_id) c.titlebar_id = "luna-titlebar";
-    if (!c.title_id) c.title_id = "luna-window-title";
-    if (!c.close_id) c.close_id = "luna-window-close";
-    if (!c.minimize_id) c.minimize_id = "luna-window-minimize";
-    if (!c.maximize_id) c.maximize_id = "luna-window-maximize";
-    if (!c.resize_left_id) c.resize_left_id = "luna-resize-left";
-    if (!c.resize_right_id) c.resize_right_id = "luna-resize-right";
-    if (!c.resize_top_id) c.resize_top_id = "luna-resize-top";
-    if (!c.resize_bottom_id) c.resize_bottom_id = "luna-resize-bottom";
-    if (!c.resize_top_left_id) c.resize_top_left_id = "luna-resize-tl";
-    if (!c.resize_top_right_id) c.resize_top_right_id = "luna-resize-tr";
-    if (!c.resize_bottom_left_id) c.resize_bottom_left_id = "luna-resize-bl";
-    if (!c.resize_bottom_right_id) c.resize_bottom_right_id = "luna-resize-br";
+    if (c.parts) p = *c.parts;
     luna_window_state.config = c;
-    luna_window_state.root = luna_window_id(c.root_id);
-    luna_window_state.titlebar = luna_window_id(c.titlebar_id);
-    luna_window_state.title = luna_window_id(c.title_id);
-    luna_window_state.close_btn = luna_window_id(c.close_id);
-    luna_window_state.min_btn = luna_window_id(c.minimize_id);
-    luna_window_state.max_btn = luna_window_id(c.maximize_id);
-    const char* resize_ids[8] = {c.resize_left_id,c.resize_right_id,c.resize_top_id,c.resize_bottom_id,c.resize_top_left_id,c.resize_top_right_id,c.resize_bottom_left_id,c.resize_bottom_right_id};
-    for (int i=0;i<8;i++) luna_window_state.resize_ids[i]=luna_window_id(resize_ids[i]);
+    if (c.strings) luna_window_state.strings = *c.strings;
+    luna_window_state.root =
+        luna_window_resolve(p.root, "luna-window-root", "luna-window-root");
+    luna_window_state.titlebar =
+        luna_window_resolve(p.titlebar, "luna-titlebar", "luna-titlebar");
+    luna_window_state.title =
+        luna_window_resolve(p.title, "luna-window-title", "luna-titlebar-title");
+    luna_window_state.close_btn =
+        luna_window_resolve(p.close, "luna-window-close", "luna-window-close");
+    luna_window_state.min_btn =
+        luna_window_resolve(p.minimize, "luna-window-minimize", "luna-window-minimize");
+    luna_window_state.max_btn =
+        luna_window_resolve(p.maximize, "luna-window-maximize", "luna-window-maximize");
+    for (int i=0;i<8;i++)
+        luna_window_state.resize_ids[i] =
+            luna_window_resolve(p.resize[i], luna_window_resize_std_ids[i],
+                                luna_window_resize_std_classes[i]);
     luna_window_state.dialog_overlay=luna_window_id("luna-common-dialog-overlay");
     luna_window_state.dialog_title=luna_window_id("luna-common-dialog-title");
     luna_window_state.dialog_message=luna_window_id("luna-common-dialog-message");
@@ -776,7 +942,9 @@ void luna_window_bind(const LunaWindowConfig* config) {
     luna_window_state.toast_title=luna_window_id("luna-common-toast-title");
     luna_window_state.toast_message=luna_window_id("luna-common-toast-message");
     luna_window_state.window_menu=luna_window_id("luna-window-menu");
+    luna_window_state.window_menu_minimize=luna_window_id("luna-window-menu-minimize");
     luna_window_state.window_menu_maximize=luna_window_id("luna-window-menu-maximize");
+    luna_window_state.window_menu_close=luna_window_id("luna-window-menu-close");
     luna_register_js_handler("lunaWindowClose",luna_window_control_close);
     luna_register_js_handler("lunaWindowMinimize",luna_window_control_minimize);
     luna_register_js_handler("lunaWindowMaximize",luna_window_control_maximize);
@@ -787,14 +955,17 @@ void luna_window_bind(const LunaWindowConfig* config) {
     luna_register_js_handler("lunaWindowDialogCancel",luna_window_dialog_cancel_handler);
     luna_register_js_handler("lunaWindowToastClose",luna_window_toast_close_handler);
     if (luna_window_state.close_btn >= 0) luna_set_on_click(luna_window_state.close_btn,luna_window_control_close);
-    int client_chrome=c.chrome==LUNA_WINDOW_CHROME_CLIENT||
-        (c.chrome==LUNA_WINDOW_CHROME_AUTO&&luna_window_state.titlebar>=0);
-    if(client_chrome)luna_set_mouse_press_hook(luna_window_press_hook);
-    else{
-        if(luna_window_state.titlebar>=0)luna_add_class(luna_window_state.titlebar,"hidden");
-        for(int i=0;i<8;i++)if(luna_window_state.resize_ids[i]>=0)luna_add_class(luna_window_state.resize_ids[i],"hidden");
-    }
     luna_window_state.bound=1;
+    /* Chrome is no longer decided once here.  The compositor may answer the
+     * xdg-decoration negotiation after the window is already up, and under
+     * luna-session switching to a skin with prefer_ssd=1 renegotiates a live
+     * window — a titlebar chosen at bind time would leave the window wearing
+     * both the compositor's bar and its own.  The handler fires immediately
+     * with the current mode if one has already arrived. */
+    luna_window_state.chrome_visible = -1;
+    luna_set_decoration_handler(luna_window_decoration_changed, NULL);
+    if (luna_window_state.chrome_visible < 0)
+        luna_window_apply_decoration(luna_platform_decoration_mode());
     if (c.title) luna_window_set_title(c.title);
     LunaWindowTheme theme; luna_window_theme_default(&theme,c.theme); luna_window_theme_apply(&theme);
     luna_window_state.system_theme_path[0]=0;
@@ -802,7 +973,11 @@ void luna_window_bind(const LunaWindowConfig* config) {
     if(c.theme==LUNA_WINDOW_THEME_SYSTEM)
         (void)luna_window_system_theme_path(luna_window_state.system_theme_path,sizeof(luna_window_state.system_theme_path));
 }
-void luna_window_unbind(void) { luna_set_mouse_press_hook(NULL); luna_window_state_reset(); }
+void luna_window_unbind(void) {
+    luna_set_mouse_press_hook(NULL);
+    luna_set_decoration_handler(NULL, NULL);
+    luna_window_state_reset();
+}
 void luna_window_render_floating(int fbw, int fbh) {
     float ww, hh;
     if (!luna_window_state.bound || fbw <= 0 || fbh <= 0) return;
@@ -852,8 +1027,19 @@ static void luna_window_show_dialog(LunaWindowDialogKind kind,const char* title,
     if(luna_window_state.dialog_title>=0)luna_set_text(luna_window_state.dialog_title,title?title:"");
     if(luna_window_state.dialog_message>=0)luna_set_text(luna_window_state.dialog_message,message?message:"");
     if(luna_window_state.dialog_input>=0){if(prompt){luna_remove_class(luna_window_state.dialog_input,"hidden");luna_set_value(luna_window_state.dialog_input,initial?initial:"");}else luna_add_class(luna_window_state.dialog_input,"hidden");}
-    if(luna_window_state.dialog_cancel>=0){if(cancel)luna_remove_class(luna_window_state.dialog_cancel,"hidden");else luna_add_class(luna_window_state.dialog_cancel,"hidden");}
-    if(luna_window_state.dialog_ok>=0){luna_set_text(luna_window_state.dialog_ok,"OK");luna_update_classes(luna_window_state.dialog_ok,"danger",kind==LUNA_WINDOW_DIALOG_ERROR?"danger":"");}
+    if(luna_window_state.dialog_cancel>=0){
+        /* A confirm reads better as Yes/No, a prompt or alert as OK/Cancel. */
+        luna_set_text(luna_window_state.dialog_cancel,
+            luna_window_text(kind==LUNA_WINDOW_DIALOG_QUESTION&&!prompt?luna_window_state.strings.no:luna_window_state.strings.cancel,
+                             kind==LUNA_WINDOW_DIALOG_QUESTION&&!prompt?luna_window_default_strings.no:luna_window_default_strings.cancel));
+        if(cancel)luna_remove_class(luna_window_state.dialog_cancel,"hidden");else luna_add_class(luna_window_state.dialog_cancel,"hidden");
+    }
+    if(luna_window_state.dialog_ok>=0){
+        luna_set_text(luna_window_state.dialog_ok,
+            luna_window_text(kind==LUNA_WINDOW_DIALOG_QUESTION&&!prompt?luna_window_state.strings.yes:luna_window_state.strings.ok,
+                             kind==LUNA_WINDOW_DIALOG_QUESTION&&!prompt?luna_window_default_strings.yes:luna_window_default_strings.ok));
+        luna_update_classes(luna_window_state.dialog_ok,"danger",kind==LUNA_WINDOW_DIALOG_ERROR?"danger":"");
+    }
     luna_remove_class(luna_window_state.dialog_overlay,"hidden");luna_push_focus_trap(luna_window_state.dialog_overlay,NULL,0);if(prompt&&luna_window_state.dialog_input>=0)luna_focus_element(luna_window_state.dialog_input);luna_mark_layout_dirty();luna_platform_request_redraw();
 }
 void luna_window_alert(LunaWindowDialogKind kind,const char*title,const char*message){luna_window_show_dialog(kind,title,message,NULL,NULL,NULL,0,0);}
@@ -863,297 +1049,24 @@ void luna_window_dialog_close(void){luna_window_dialog_finish(LUNA_WINDOW_RESULT
 void luna_window_toast(LunaWindowDialogKind kind,const char*title,const char*message,double seconds){(void)kind;if(!luna_window_state.bound||luna_window_state.toast<0)return;if(luna_window_state.toast_title>=0)luna_set_text(luna_window_state.toast_title,title?title:"");if(luna_window_state.toast_message>=0)luna_set_text(luna_window_state.toast_message,message?message:"");luna_remove_class(luna_window_state.toast,"hidden");luna_window_state.toast_remaining=seconds>0?seconds:3.0;luna_platform_request_redraw();}
 int luna_window_notify(const char*app_name,LunaWindowDialogKind kind,const char*title,const char*message,double fallback_seconds){if(luna_platform_system_notify(app_name,luna_window_notify_kind(kind),title,message))return 1;luna_window_toast(kind,title,message,fallback_seconds);return 0;}
 
-/* ------------------------------------------------------------------------- */
-/* Standard file-dialog launcher                                             */
-/* ------------------------------------------------------------------------- */
-
-#if defined(_WIN32)
-#define LUNA_WINDOW_POPEN  _popen
-#define LUNA_WINDOW_PCLOSE _pclose
-#else
-#include <unistd.h>
-#define LUNA_WINDOW_POPEN  popen
-#define LUNA_WINDOW_PCLOSE pclose
-#endif
-
-LunaFileDialogBackend luna_file_dialog_backend_from_string(const char* name) {
-    if (!name || !*name || !strcmp(name,"auto") || !strcmp(name,"system"))
-        return LUNA_FILE_DIALOG_BACKEND_AUTO;
-    if (!strcmp(name,"luna") || !strcmp(name,"luna-fm"))
-        return LUNA_FILE_DIALOG_BACKEND_LUNA;
-    if (!strcmp(name,"zenity")) return LUNA_FILE_DIALOG_BACKEND_ZENITY;
-    if (!strcmp(name,"kdialog")) return LUNA_FILE_DIALOG_BACKEND_KDIALOG;
-    if (!strcmp(name,"yad")) return LUNA_FILE_DIALOG_BACKEND_YAD;
-    return LUNA_FILE_DIALOG_BACKEND_AUTO;
-}
-
-const char* luna_file_dialog_backend_name(LunaFileDialogBackend backend) {
-    switch (backend) {
-        case LUNA_FILE_DIALOG_BACKEND_LUNA: return "luna";
-        case LUNA_FILE_DIALOG_BACKEND_ZENITY: return "zenity";
-        case LUNA_FILE_DIALOG_BACKEND_KDIALOG: return "kdialog";
-        case LUNA_FILE_DIALOG_BACKEND_YAD: return "yad";
-        default: return "auto";
-    }
-}
-
-static int luna_window_command_exists(const char* name) {
-    if (!name || !*name) return 0;
-#if defined(_WIN32)
-    char found[MAX_PATH];
-    if (strchr(name,'\\') || strchr(name,'/'))
-        return GetFileAttributesA(name) != INVALID_FILE_ATTRIBUTES;
-    return SearchPathA(NULL,name,".exe",MAX_PATH,found,NULL) > 0;
-#else
-    if (strchr(name,'/')) return access(name,X_OK)==0;
-    const char* path=getenv("PATH");
-    if (!path) return 0;
-    size_t nl=strlen(name);
-    const char* p=path;
-    while (*p) {
-        const char* end=strchr(p,':');
-        size_t dl=end?(size_t)(end-p):strlen(p);
-        char full[LUNA_WINDOW_PATH_MAX];
-        if (dl==0) {
-            if (nl+3<sizeof(full)) snprintf(full,sizeof(full),"./%s",name);
-            else full[0]=0;
-        } else if (dl+1+nl+1<sizeof(full)) {
-            memcpy(full,p,dl); full[dl]='/'; memcpy(full+dl+1,name,nl+1);
-        } else full[0]=0;
-        if (full[0] && access(full,X_OK)==0) return 1;
-        if (!end) break;
-        p=end+1;
-    }
-    return 0;
-#endif
-}
-
-static int luna_window_cmd_raw(char* out,size_t cap,size_t* len,const char* text) {
-    size_t n=text?strlen(text):0;
-    if (!out || !len || *len+n+1>cap) return 0;
-    if (n) memcpy(out+*len,text,n);
-    *len+=n; out[*len]=0; return 1;
-}
-
-static int luna_window_cmd_quote(char* out,size_t cap,size_t* len,const char* text) {
-    if (!luna_window_cmd_raw(out,cap,len,"'")) return 0;
-    for (const char* p=text?text:""; *p; ++p) {
-        if (*p=='\'') {
-            if (!luna_window_cmd_raw(out,cap,len,"'\\''")) return 0;
-        } else {
-            char ch[2]={*p,0};
-            if (!luna_window_cmd_raw(out,cap,len,ch)) return 0;
-        }
-    }
-    return luna_window_cmd_raw(out,cap,len,"'");
-}
-
-static int luna_window_cmd_arg(char* out,size_t cap,size_t* len,const char* text) {
-    return luna_window_cmd_raw(out,cap,len," ") &&
-           luna_window_cmd_quote(out,cap,len,text?text:"");
-}
-
-static void luna_window_join_initial(char* out,size_t cap,
-                                     const LunaFileDialogConfig* c) {
-    const char* initial=(c&&c->initial_path&&*c->initial_path)?c->initial_path:".";
-    if (c && c->mode==LUNA_FILE_DIALOG_SAVE_FILE &&
-        c->suggested_name && *c->suggested_name) {
-        size_t n=strlen(initial);
-        snprintf(out,cap,"%s%s%s",initial,
-                 (n && (initial[n-1]=='/' || initial[n-1]=='\\'))?"":"/",
-                 c->suggested_name);
-    } else snprintf(out,cap,"%s",initial);
-}
-
-static LunaFileDialogBackend luna_window_choose_file_backend(
-    const LunaFileDialogConfig* c) {
-    LunaFileDialogBackend backend=c?c->backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
-    if (backend==LUNA_FILE_DIALOG_BACKEND_AUTO) {
-        const char* env=getenv("LUNA_FILE_DIALOG_BACKEND");
-        if (env && *env) backend=luna_file_dialog_backend_from_string(env);
-    }
-    if (backend==LUNA_FILE_DIALOG_BACKEND_AUTO ||
-        backend==LUNA_FILE_DIALOG_BACKEND_LUNA) {
-#if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION) && defined(__linux__)
-        return LUNA_FILE_DIALOG_BACKEND_LUNA;
-#else
-        return LUNA_FILE_DIALOG_BACKEND_AUTO;
-#endif
-    }
-    if (backend==LUNA_FILE_DIALOG_BACKEND_ZENITY)
-        return luna_window_command_exists("zenity")?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
-    if (backend==LUNA_FILE_DIALOG_BACKEND_KDIALOG)
-        return luna_window_command_exists("kdialog")?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
-    if (backend==LUNA_FILE_DIALOG_BACKEND_YAD)
-        return luna_window_command_exists("yad")?backend:LUNA_FILE_DIALOG_BACKEND_AUTO;
-    return LUNA_FILE_DIALOG_BACKEND_AUTO;
-}
-
-#if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION) && defined(__linux__)
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <errno.h>
-
-static void luna_window_internal_env(const char* name,const char* value) {
-    if (value && *value) setenv(name,value,1);
-    else unsetenv(name);
-}
-
-static void luna_window_internal_env_int(const char* name,int value) {
-    char buf[32];
-    snprintf(buf,sizeof(buf),"%d",value);
-    setenv(name,buf,1);
-}
-
-static int luna_window_show_internal_luna(const LunaFileDialogConfig* c,
-                                          LunaFileDialogResult* result) {
-    int fd[2];
-    if (pipe(fd)!=0) return -2;
-    pid_t pid=fork();
-    if (pid<0) { close(fd[0]); close(fd[1]); return -2; }
-    if (pid==0) {
-        close(fd[0]);
-        if (dup2(fd[1],STDOUT_FILENO)<0) _exit(126);
-        close(fd[1]);
-        luna_window_internal_env("LUNA_WINDOW_INTERNAL_FILE_DIALOG_CHILD","1");
-        luna_window_internal_env_int("LUNA_WINDOW_FD_MODE",c?c->mode:LUNA_FILE_DIALOG_OPEN_FILE);
-        luna_window_internal_env("LUNA_WINDOW_FD_TITLE",c?c->title:NULL);
-        luna_window_internal_env("LUNA_WINDOW_FD_INITIAL",c?c->initial_path:NULL);
-        luna_window_internal_env("LUNA_WINDOW_FD_NAME",c?c->suggested_name:NULL);
-        luna_window_internal_env("LUNA_WINDOW_FD_ACCEPT",c?c->accept_label:NULL);
-        luna_window_internal_env("LUNA_WINDOW_FD_FILTER_NAME",c?c->filter_name:NULL);
-        luna_window_internal_env("LUNA_WINDOW_FD_FILTER",c?c->filter_patterns:NULL);
-        luna_window_internal_env_int("LUNA_WINDOW_FD_WIDTH",c?c->width:0);
-        luna_window_internal_env_int("LUNA_WINDOW_FD_HEIGHT",c?c->height:0);
-        luna_window_internal_env_int("LUNA_WINDOW_FD_CLIENT_CHROME",c?c->client_chrome:0);
-        char exe[LUNA_WINDOW_PATH_MAX];
-        ssize_t n=readlink("/proc/self/exe",exe,sizeof(exe)-1);
-        if (n<=0 || (size_t)n>=sizeof(exe)-1) _exit(127);
-        exe[n]=0;
-        execl(exe,exe,(char*)NULL);
-        _exit(127);
-    }
-    close(fd[1]);
-    FILE* pipe=fdopen(fd[0],"r");
-    if (!pipe) { close(fd[0]); while(waitpid(pid,NULL,0)<0&&errno==EINTR){} return -2; }
-    char line[LUNA_WINDOW_PATH_MAX];
-    int count=0;
-    while (fgets(line,sizeof(line),pipe)) {
-        size_t n=strlen(line);
-        while(n && (line[n-1]=='\n'||line[n-1]=='\r')) line[--n]=0;
-        if (!line[0]) continue;
-        if (result && count<LUNA_FILE_DIALOG_MAX_RESULTS)
-            snprintf(result->paths[count],sizeof(result->paths[count]),"%s",line);
-        count++;
-        if (!c || c->mode!=LUNA_FILE_DIALOG_OPEN_FILES) break;
-    }
-    fclose(pipe);
-    int status=0;
-    while(waitpid(pid,&status,0)<0&&errno==EINTR){}
-    if (!WIFEXITED(status) || WEXITSTATUS(status)!=0) return -2;
-    if (result && count>0) {
-        result->accepted=1;
-        result->count=count>LUNA_FILE_DIALOG_MAX_RESULTS?LUNA_FILE_DIALOG_MAX_RESULTS:count;
-    }
-    return 0;
-}
-#endif
-
-static int luna_window_build_file_command(char* cmd,size_t cap,
-    const LunaFileDialogConfig* c,LunaFileDialogBackend backend) {
-    size_t len=0; cmd[0]=0;
-    const char* title=(c&&c->title&&*c->title)?c->title:"ファイルを選択";
-    const char* patterns=(c&&c->filter_patterns&&*c->filter_patterns)?c->filter_patterns:"*";
-    const char* filter_name=(c&&c->filter_name&&*c->filter_name)?c->filter_name:"Files";
-    char initial[LUNA_WINDOW_PATH_MAX];
-    luna_window_join_initial(initial,sizeof(initial),c);
-
-    if (backend==LUNA_FILE_DIALOG_BACKEND_ZENITY ||
-               backend==LUNA_FILE_DIALOG_BACKEND_YAD) {
-        if (!luna_window_cmd_raw(cmd,cap,&len,
-                backend==LUNA_FILE_DIALOG_BACKEND_ZENITY?"zenity --file-selection":"yad --file-selection")) return 0;
-        if(!luna_window_cmd_raw(cmd,cap,&len," --title=") || !luna_window_cmd_quote(cmd,cap,&len,title))return 0;
-        if(!luna_window_cmd_raw(cmd,cap,&len," --filename=") || !luna_window_cmd_quote(cmd,cap,&len,initial))return 0;
-        if(c && c->mode==LUNA_FILE_DIALOG_OPEN_FILES &&
-           !luna_window_cmd_raw(cmd,cap,&len," --multiple --separator='|'"))return 0;
-        if(c && c->mode==LUNA_FILE_DIALOG_SELECT_FOLDER &&
-           !luna_window_cmd_raw(cmd,cap,&len," --directory"))return 0;
-        if(c && c->mode==LUNA_FILE_DIALOG_SAVE_FILE &&
-           !luna_window_cmd_raw(cmd,cap,&len," --save --confirm-overwrite"))return 0;
-        if(c && c->filter_patterns && *c->filter_patterns) {
-            char filter[LUNA_WINDOW_PATH_MAX];
-            snprintf(filter,sizeof(filter),"%s | %s",filter_name,patterns);
-            if(!luna_window_cmd_raw(cmd,cap,&len," --file-filter=") ||
-               !luna_window_cmd_quote(cmd,cap,&len,filter))return 0;
-        }
-    } else if (backend==LUNA_FILE_DIALOG_BACKEND_KDIALOG) {
-        if (c && c->mode==LUNA_FILE_DIALOG_SELECT_FOLDER)
-            { if(!luna_window_cmd_raw(cmd,cap,&len,"kdialog --getexistingdirectory"))return 0; }
-        else if (c && c->mode==LUNA_FILE_DIALOG_SAVE_FILE)
-            { if(!luna_window_cmd_raw(cmd,cap,&len,"kdialog --getsavefilename"))return 0; }
-        else { if(!luna_window_cmd_raw(cmd,cap,&len,"kdialog --getopenfilename"))return 0; }
-        if(!luna_window_cmd_arg(cmd,cap,&len,initial))return 0;
-        if(c && c->mode!=LUNA_FILE_DIALOG_SELECT_FOLDER &&
-           c->filter_patterns && *c->filter_patterns) {
-            char filter[LUNA_WINDOW_PATH_MAX];
-            snprintf(filter,sizeof(filter),"%s|%s",patterns,filter_name);
-            if(!luna_window_cmd_arg(cmd,cap,&len,filter))return 0;
-        }
-        if(c && c->mode==LUNA_FILE_DIALOG_OPEN_FILES &&
-           !luna_window_cmd_raw(cmd,cap,&len," --multiple --separate-output"))return 0;
-        if(!luna_window_cmd_raw(cmd,cap,&len," --title") ||
-           !luna_window_cmd_arg(cmd,cap,&len,title))return 0;
-    } else return 0;
-    return luna_window_cmd_raw(cmd,cap,&len," 2>/dev/null");
-}
-
+#if !defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION)
 int luna_file_dialog_show(const LunaFileDialogConfig* config,
-                          LunaFileDialogResult* result) {
-    LunaFileDialogConfig c;
-    memset(&c,0,sizeof(c));
-    if (config) c=*config;
-    if (c.mode==LUNA_FILE_DIALOG_MANAGER) c.mode=LUNA_FILE_DIALOG_OPEN_FILE;
-    if (result) memset(result,0,sizeof(*result));
-    LunaFileDialogBackend backend=luna_window_choose_file_backend(&c);
-    if (backend==LUNA_FILE_DIALOG_BACKEND_AUTO) return -1;
-#if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION) && defined(__linux__)
-    if (backend==LUNA_FILE_DIALOG_BACKEND_LUNA)
-        return luna_window_show_internal_luna(&c,result);
-#endif
-    char command[LUNA_WINDOW_PATH_MAX*3];
-    if (!luna_window_build_file_command(command,sizeof(command),&c,backend)) return -2;
-    FILE* pipe=LUNA_WINDOW_POPEN(command,"r");
-    if (!pipe) return -2;
-    char line[LUNA_WINDOW_PATH_MAX];
-    int count=0;
-    while (fgets(line,sizeof(line),pipe)) {
-        size_t n=strlen(line);
-        while(n && (line[n-1]=='\n'||line[n-1]=='\r')) line[--n]=0;
-        if (!line[0]) continue;
-        char* cursor=line;
-        while (*cursor) {
-            char* separator=(c.mode==LUNA_FILE_DIALOG_OPEN_FILES)?strchr(cursor,'|'):NULL;
-            if (separator) *separator=0;
-            if (*cursor) {
-                if (result && count<LUNA_FILE_DIALOG_MAX_RESULTS)
-                    snprintf(result->paths[count],sizeof(result->paths[count]),"%s",cursor);
-                count++;
-            }
-            if (!separator || c.mode!=LUNA_FILE_DIALOG_OPEN_FILES) break;
-            cursor=separator+1;
-        }
-        if (c.mode!=LUNA_FILE_DIALOG_OPEN_FILES) break;
-    }
-    int status=LUNA_WINDOW_PCLOSE(pipe);
-    if (status==0 && count>0 && result) {
-        result->accepted=1;
-        result->count=count>LUNA_FILE_DIALOG_MAX_RESULTS?LUNA_FILE_DIALOG_MAX_RESULTS:count;
-    }
+                          LunaFileDialogCallback callback,
+                          void* userdata) {
+    (void)config;(void)callback;(void)userdata;
+    return -1;
+}
+const char* luna_file_dialog_overlay_html(void) { return ""; }
+const char* luna_file_dialog_css(void) { return ""; }
+void luna_file_dialog_prepare(void) {}
+void luna_file_dialog_render(int fbw, int fbh) { (void)fbw;(void)fbh; }
+void luna_file_dialog_tick(double dt) { (void)dt; }
+int luna_file_dialog_is_open(void) { return 0; }
+int luna_file_dialog_handle_key(int key, int scancode, int action, int mods) {
+    (void)key;(void)scancode;(void)action;(void)mods;
     return 0;
 }
-
-#undef LUNA_WINDOW_POPEN
-#undef LUNA_WINDOW_PCLOSE
+#endif
 
 #endif /* LUNA_WINDOW_IMPLEMENTATION_INCLUDED */
 #endif /* LUNA_WINDOW_IMPLEMENTATION */
@@ -1164,7 +1077,6 @@ int luna_file_dialog_show(const LunaFileDialogConfig* config,
 #if !defined(__linux__) && !defined(__FreeBSD__)
 #error "The full Luna file-dialog implementation currently requires a POSIX desktop host."
 #endif
-#include <GLFW/glfw3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1236,7 +1148,7 @@ typedef struct {
 } VolumeEntry;
 
 typedef struct {
-    GLFWwindow *window;
+    void *window; /* deprecated standalone-host token; kept until file split */
     FileEntry entries[MAX_ITEMS];
     int entry_count;
     int truncated;
@@ -1384,6 +1296,7 @@ typedef struct {
     int id_set_animations;
     int id_set_startup;
     int id_set_terminal;
+    int id_overlay;
 
     /* Location-bar Tab completion state. When several entries share no
        longer common prefix, repeated Tab presses cycle through the sorted
@@ -1399,18 +1312,53 @@ typedef struct {
 static App g;
 static LunaFileDialogConfig g_file_dialog_config;
 static LunaFileDialogResult* g_file_dialog_result;
-static int g_file_dialog_cancelled;
-static char g_file_dialog_pending_save[PATH_MAX];
-static GLFWcursor *g_hand_cursor, *g_cursor_ibeam, *g_cursor_crosshair;
-static GLFWcursor *g_cursor_hresize, *g_cursor_vresize;
-static int g_window_drag_mode;
-static int g_window_resize_edges;
-static double g_window_drag_anchor_x, g_window_drag_anchor_y;
-static double g_window_drag_last_x, g_window_drag_last_y;
-static void file_dialog_accept(void);
+static LunaFileDialogResult g_file_dialog_result_storage;
 
-static void request_redraw(void) { g.redraw = 1; }
-static void platform_redraw(void) { request_redraw(); }
+void luna_file_dialog_result_free(LunaFileDialogResult* result) {
+    int i;
+    if (!result || !result->paths) { if (result) result->count = 0; return; }
+    for (i = 0; i < result->count; i++) free(result->paths[i]);
+    free(result->paths);
+    result->paths = NULL;
+    result->count = 0;
+}
+
+static void file_dialog_result_clear(LunaFileDialogResult* result) {
+    luna_file_dialog_result_free(result);
+}
+
+/* Grows one slot at a time: a file dialog selection is a handful of entries,
+ * and LUNA_FILE_DIALOG_MAX_RESULTS caps it anyway. */
+static int file_dialog_result_add(LunaFileDialogResult* result, const char* path) {
+    char** grown;
+    size_t n;
+    if (!result || !path) return 0;
+    grown = (char**)realloc(result->paths, (size_t)(result->count + 1) * sizeof(char*));
+    if (!grown) return 0;
+    result->paths = grown;
+    n = strlen(path) + 1;
+    result->paths[result->count] = (char*)malloc(n);
+    if (!result->paths[result->count]) return 0;
+    memcpy(result->paths[result->count], path, n);
+    result->count++;
+    return 1;
+}
+static LunaFileDialogCallback g_file_dialog_callback;
+static void* g_file_dialog_userdata;
+static int g_file_dialog_cancelled;
+static int g_file_dialog_overlay_mode;
+static int g_file_dialog_open;
+static int g_file_dialog_prepared;
+static char g_file_dialog_pending_save[PATH_MAX];
+static char g_file_dialog_search_prev[MAX_SEARCH];
+static void file_dialog_accept(void);
+static int file_dialog_handle_key(int key, int scancode, int action, int mods);
+static int append_file_dialog_body(char *h, size_t cap, size_t *n, int standalone);
+
+static void request_redraw(void) {
+    g.redraw = 1;
+    luna_platform_request_redraw();
+}
 static void refresh_sidebar_visibility(void);
 static void save_settings(void);
 static void show_toast(const char *fmt, ...);
@@ -1430,275 +1378,394 @@ static void trim_text(char *s);
 static int run_program_wait(const char *prog, char *const argv[]);
 
 static const char *UI_CSS =
-"* { box-sizing: border-box; }\n"
-"body { width:100%; height:100%; margin:0; background:#edf1f6; color:#1f2937; font-size:12px; overflow:hidden; }\n"
-".hidden { display:none; }\n"
-"input { font-size:12px; }\n"
-".app { position:fixed; left:0; top:0; width:100%; height:100%; min-width:0; min-height:0; display:flex; flex-direction:column; background:linear-gradient(180deg,#f8fafc 0%,#edf2f7 100%); overflow:hidden; }\n"
-".toolbar { width:100%; height:48px; min-height:48px; max-height:48px; flex:0 0 48px; display:flex; align-items:center; gap:5px; padding:6px 8px; background:rgba(249,250,252,.93); border-bottom:1px solid rgba(15,23,42,.12); box-shadow:0 2px 10px rgba(30,41,59,.06); overflow:hidden; }\n"
-".navgroup,.viewgroup { flex-shrink:0; display:flex; align-items:center; gap:3px; padding:2px; border-radius:9px; background:rgba(100,116,139,.10); }\n"
-".tool { width:29px; min-width:29px; height:29px; flex-shrink:0; display:flex; align-items:center; justify-content:center; border-radius:7px; color:#334155; cursor:pointer; font-size:14px; transition:.12s; }\n"
-".tool:hover { background:rgba(255,255,255,.9); box-shadow:0 1px 5px rgba(15,23,42,.10); }\n"
-".tool:active { transform:scale(.95); }\n"
-".tool.disabled { opacity:.34; pointer-events:none; }\n"
-".tool.on { background:#dbeafe; color:#1261c9; }\n"
-".location { flex:1 1 auto; min-width:90px; height:32px; padding:6px 10px; border:1px solid rgba(100,116,139,.18); border-radius:9px; background:rgba(255,255,255,.86); color:#243244; box-shadow:inset 0 1px 2px rgba(15,23,42,.04); caret-color:#1684ff; }\n"
-".location:focus { border-color:#5aa7ff; outline:2px solid rgba(58,141,255,.18); }\n"
-".search { width:160px; min-width:110px; height:32px; flex:0 1 160px; padding:6px 9px; border:1px solid rgba(100,116,139,.18); border-radius:9px; background:rgba(255,255,255,.86); color:#243244; caret-color:#1684ff; }\n"
-".search:focus { border-color:#5aa7ff; outline:2px solid rgba(58,141,255,.18); }\n"
-".workbench { width:100%; flex:1 1 0; min-width:0; min-height:0; display:flex; overflow:hidden; }\n"
-".sidebar { width:174px; min-width:174px; max-width:174px; flex:0 0 174px; display:flex; flex-direction:column; gap:2px; padding:9px 7px; background:rgba(239,244,249,.86); border-right:1px solid rgba(71,85,105,.11); overflow-y:auto; scrollbar-width:thin; }\n"
-".side-label { height:20px; padding:3px 8px; color:#7b8798; font-size:10px; font-weight:700; letter-spacing:.3px; text-transform:uppercase; }\n"
-".side-item { height:29px; display:flex; align-items:center; padding:5px 8px; border-radius:7px; cursor:pointer; color:#344256; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n"
-".side-item:hover { background:rgba(255,255,255,.74); }\n"
-".side-item.missing { display:none; }\n"
-".side-item.hidden { display:none; }\n"
-".sidebar.hidden,.search.hidden { display:none; }\n"
-".side-item.active { background:#d9eaff; color:#135eaf; font-weight:700; }\n"
-".side-item.volume-unmounted { opacity:.78; font-style:italic; }\n"
-".side-label.hidden { display:none; }\n"
-".volume-context { position:fixed; right:12px; top:120px; width:240px; display:flex; flex-direction:column; gap:1px; padding:6px; border:1px solid rgba(71,85,105,.16); border-radius:11px; background:rgba(250,252,255,.96); box-shadow:0 16px 44px rgba(15,23,42,.23); z-index:85; }\n"
-".volume-context.hidden { display:none; }\n"
-".main { flex:1 1 0; min-width:0; min-height:0; display:flex; flex-direction:column; background:rgba(255,255,255,.58); overflow:hidden; }\n"
-".subbar { height:32px; min-height:32px; flex:0 0 32px; display:flex; align-items:center; gap:6px; padding:3px 10px; color:#64748b; border-bottom:1px solid rgba(71,85,105,.08); }\n"
-".folder-title { flex:1; font-size:12px; font-weight:700; color:#334155; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n"
-".hint { font-size:10px; color:#8a97a8; }\n"
-".file-grid { width:100%; flex:1 1 0; min-width:0; min-height:0; overflow:auto; scrollbar-width:thin; padding:10px; align-content:flex-start; }\n"
-".file-grid.grid { display:flex; flex-direction:row; flex-wrap:wrap; align-items:flex-start; align-content:flex-start; justify-content:flex-start; gap:6px; }\n"
-".file-grid.list { display:flex; flex-direction:column; align-items:stretch; justify-content:flex-start; gap:1px; padding:6px 8px; }\n"
-".file-item { cursor:pointer; transition:.10s; user-select:none; }\n"
-".file-item.hidden { display:none; }\n"
-".file-item.grid-item { width:108px; min-width:108px; max-width:108px; height:94px; min-height:94px; max-height:94px; flex-grow:0; flex-shrink:0; flex-basis:108px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; padding:6px 5px; border-radius:10px; text-align:center; }\n"
-".file-item.list-item { width:auto; min-width:0; height:32px; min-height:32px; max-height:32px; flex-grow:0; flex-shrink:0; flex-basis:32px; align-self:stretch; display:grid; grid-template-columns:31px minmax(0,1fr) 130px; align-items:center; gap:6px; padding:2px 7px; border-radius:7px; }\n"
-".file-item:hover { background:rgba(219,234,254,.58); }\n"
-".file-item.selected { background:#cfe5ff; color:#0b4f97; box-shadow:inset 0 0 0 1px rgba(40,126,220,.25); }\n"
-".file-item.cut { opacity:.48; }\n"
-".file-icon,.file-name,.file-meta { pointer-events:none; }\n"
-".grid-item .file-icon { width:40px; height:38px; display:flex; align-items:center; justify-content:center; border-radius:10px; font-size:25px; color:#4b88d8; background:linear-gradient(145deg,#eaf4ff,#d6e9ff); box-shadow:0 3px 8px rgba(31,91,154,.11); }\n"
-".grid-item.type-folder .file-icon { color:#d89b26; background:linear-gradient(145deg,#fff3bf,#ffe18a); }\n"
-".grid-item.type-image .file-icon { color:#b54dcc; background:linear-gradient(145deg,#f8e9ff,#edd3f6); }\n"
-".grid-item.type-audio .file-icon { color:#df4d76; background:linear-gradient(145deg,#ffe9f0,#ffd4e0); }\n"
-".grid-item.type-video .file-icon { color:#8b5fd7; background:linear-gradient(145deg,#efe7ff,#ded0ff); }\n"
-".grid-item.type-code .file-icon { color:#3b8f77; background:linear-gradient(145deg,#e2f8f0,#ccefe3); }\n"
-".grid-item.type-archive .file-icon { color:#9a7040; background:linear-gradient(145deg,#f5ecdf,#ead9c2); }\n"
-".grid-item.type-desktop .file-icon { color:#2f7d56; background:linear-gradient(145deg,#e5f7ee,#cfeedd); }\n"
-".list-item .file-icon { width:26px; height:26px; display:flex; align-items:center; justify-content:center; border-radius:7px; background:#e8f2ff; color:#4a82c5; font-size:15px; }\n"
-".list-item.type-folder .file-icon { background:#fff0b3; color:#bf8420; }\n"
-".file-name { width:100%; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n"
-".grid-item .file-name { font-size:11px; }\n"
-".file-meta { color:#8a97a8; font-size:10px; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n"
-".grid-item .file-meta { display:none; }\n"
-".empty { width:100%; min-height:90px; display:flex; align-items:center; justify-content:center; color:#8a97a8; font-size:12px; pointer-events:none; }\n"
-".empty.hidden { display:none; }\n"
-".status { height:24px; min-height:24px; flex:0 0 24px; display:flex; align-items:center; padding:3px 10px; border-top:1px solid rgba(71,85,105,.09); background:rgba(248,250,252,.88); color:#6b788a; font-size:10px; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n"
-".context { position:fixed; right:12px; top:82px; width:286px; display:flex; flex-direction:column; gap:1px; padding:6px; border:1px solid rgba(71,85,105,.16); border-radius:11px; background:rgba(250,252,255,.96); box-shadow:0 16px 44px rgba(15,23,42,.23); z-index:80; }\n"
-".context.hidden { display:none; }\n"
-".menu-item { height:28px; min-height:28px; max-height:28px; flex:0 0 28px; display:flex; align-items:center; padding:6px 8px; border-radius:6px; cursor:pointer; }\n"
-".menu-item:hover { background:#dbeafe; color:#145da7; }\n"
-".menu-item.danger:hover { background:#ffe2e5; color:#b4232f; }\n"
-".menu-sep { height:1px; min-height:1px; max-height:1px; flex:0 0 1px; margin:3px 4px; background:rgba(71,85,105,.13); }\n"
-".modal-wrap { position:fixed; left:0; top:0; width:100%; height:100%; display:flex; align-items:center; justify-content:center; padding:14px; background:rgba(15,23,42,.24); z-index:100; }\n"
-".modal-wrap.hidden { display:none; }\n"
-".modal-wrap.overlay-idle { visibility:hidden; }\n"
-".modal { width:90%; max-width:520px; max-height:88%; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:16px; border:1px solid rgba(255,255,255,.65); border-radius:14px; background:rgba(248,250,253,.97); box-shadow:0 22px 60px rgba(15,23,42,.30); }\n"
-".modal-title { font-size:15px; font-weight:700; color:#263548; }\n"
-".modal-info { color:#617085; line-height:1.45; white-space:pre-line; overflow-wrap:anywhere; }\n"
-".modal-info.hidden { display:none; }\n"
-".modal-info-stack { width:100%; min-height:1px; display:flex; flex-direction:column; gap:0; }\n"
-".modal-wrap.properties-dialog .modal { width:94%; max-width:720px; max-height:82%; padding:0; gap:0; overflow-y:auto; scrollbar-width:thin; }\n"
-".modal-wrap.properties-dialog .modal-title { padding:16px 18px 13px; border-bottom:1px solid rgba(71,85,105,.12); background:rgba(248,250,253,.98); font-size:16px; }\n"
-".modal-wrap.properties-dialog .modal-info-stack { min-height:0; display:block; overflow:visible; padding:16px 20px 20px; background:rgba(255,255,255,.72); }\n"
-".modal-wrap.properties-dialog .modal-info { width:100%; min-height:0; display:block; color:#455468; font-size:12px; line-height:1.72; white-space:pre-wrap; overflow-wrap:anywhere; }\n"
-".modal-wrap.properties-dialog .modal-actions { padding:11px 14px; border-top:1px solid rgba(71,85,105,.12); background:rgba(248,250,253,.98); }\n"
-".open-with-modal { width:92%; max-width:470px; max-height:88%; }\n"
-".open-app-list { min-height:0; max-height:380px; display:flex; flex-direction:column; gap:4px; overflow-y:auto; padding:2px; scrollbar-width:thin; }\n"
-".app-choice { min-height:43px; flex:0 0 auto; display:flex; align-items:center; padding:7px 10px; border:1px solid rgba(100,116,139,.13); border-radius:9px; background:rgba(255,255,255,.72); color:#334155; cursor:pointer; line-height:1.35; white-space:pre-line; overflow-wrap:anywhere; }\n"
-".app-choice:hover { background:#dbeafe; color:#145da7; border-color:rgba(54,152,255,.25); }\n"
-".app-choice.hidden { display:none; }\n"
-".modal-input { height:34px; padding:6px 9px; border:1px solid #9eb9d7; border-radius:8px; background:white; caret-color:#1684ff; }\n"
-".desktop-edit-modal { width:94%; max-width:540px; max-height:92%; gap:8px; }\n"
-".desktop-edit-hint { color:#617085; font-size:11px; line-height:1.4; white-space:pre-line; }\n"
-".desktop-edit-form { display:flex; flex-direction:column; gap:7px; min-height:0; overflow-y:auto; padding:2px 1px 4px; scrollbar-width:thin; }\n"
-".desktop-edit-row { display:flex; flex-direction:column; gap:3px; }\n"
-".desktop-edit-row.hidden { display:none; }\n"
-".desktop-edit-label { color:#4b5b70; font-size:11px; font-weight:700; }\n"
-".desktop-edit-input { height:32px; padding:5px 8px; border:1px solid #9eb9d7; border-radius:8px; background:white; caret-color:#1684ff; }\n"
-".desktop-edit-toggle { height:32px; min-height:32px; display:flex; align-items:center; justify-content:space-between; padding:5px 10px; border:1px solid rgba(100,116,139,.18); border-radius:8px; background:rgba(255,255,255,.78); cursor:pointer; color:#334155; font-size:12px; }\n"
-".desktop-edit-toggle:hover { background:#dbeafe; color:#145da7; }\n"
-".desktop-edit-toggle.on { border-color:rgba(54,152,255,.35); background:#eef6ff; }\n"
-".modal-actions { display:flex; justify-content:flex-end; gap:6px; }\n"
-".button { min-width:72px; height:30px; display:flex; align-items:center; justify-content:center; padding:5px 10px; border-radius:8px; background:#e6ebf1; cursor:pointer; }\n"
-".button:hover { filter:brightness(1.04); }\n"
-".button.primary { color:white; background:linear-gradient(180deg,#3698ff,#1477e6); box-shadow:0 4px 10px rgba(20,119,230,.24); }\n"
-".toast { position:fixed; left:10%; bottom:36px; width:80%; max-width:360px; min-height:34px; display:flex; align-items:center; justify-content:center; padding:7px 11px; border-radius:10px; background:rgba(26,35,49,.91); color:white; box-shadow:0 10px 30px rgba(15,23,42,.28); z-index:130; }\n"
-".toast.hidden { display:none; }\n"
-".settings-panel { width:90%; max-width:430px; max-height:90%; overflow-y:auto; display:flex; flex-direction:column; gap:4px; padding:12px; border:1px solid rgba(71,85,105,.16); border-radius:14px; background:#f8fafc; box-shadow:0 22px 60px rgba(15,23,42,.30); }\n"
-".settings-row { height:34px; min-height:34px; display:flex; align-items:center; gap:9px; padding:5px 8px; border-radius:8px; cursor:pointer; }\n"
-".settings-row:hover { background:#e7f0fb; }\n"
-".settings-name { flex:1; color:#334155; font-size:12px; pointer-events:none; }\n"
-".settings-state { min-width:66px; height:24px; display:flex; align-items:center; justify-content:center; border-radius:12px; background:#e3e8ee; color:#5b6878; font-size:11px; font-weight:700; pointer-events:none; }\n"
-".settings-state.on { background:#d8eaff; color:#145da7; }\n"
-".settings-note { min-height:34px; color:#738094; font-size:10px; line-height:1.4; }\n"
-".app.font-small,.app.font-small input { font-size:11px; }\n"
-".app.font-small .folder-title,.app.font-small .settings-name { font-size:11px; }\n"
-".app.font-small .grid-item .file-name,.app.font-small .file-meta,.app.font-small .hint,.app.font-small .status,.app.font-small .side-label,.app.font-small .settings-note { font-size:9px; }\n"
-".app.font-standard,.app.font-standard input { font-size:13px; }\n"
-".app.font-standard .folder-title,.app.font-standard .settings-name { font-size:13px; }\n"
-".app.font-standard .grid-item .file-name { font-size:12px; }\n"
-".app.font-standard .file-meta,.app.font-standard .hint,.app.font-standard .status,.app.font-standard .side-label,.app.font-standard .settings-note { font-size:11px; }\n"
-".app.font-large,.app.font-large input { font-size:15px; }\n"
-".app.font-large .folder-title,.app.font-large .settings-name { font-size:15px; }\n"
-".app.font-large .grid-item .file-name { font-size:14px; }\n"
-".app.font-large .file-meta,.app.font-large .hint,.app.font-large .status,.app.font-large .side-label,.app.font-large .settings-note { font-size:12px; }\n"
-".app.density-minimal .toolbar { height:42px; min-height:42px; max-height:42px; flex-basis:42px; padding:4px 6px; gap:4px; }\n"
-".app.density-minimal .tool { width:25px; min-width:25px; height:25px; font-size:12px; border-radius:6px; }\n"
-".app.density-minimal .navgroup,.app.density-minimal .viewgroup { gap:1px; padding:1px; border-radius:7px; }\n"
-".app.density-minimal .location,.app.density-minimal .search { height:28px; padding:4px 7px; }\n"
-".app.density-minimal .search { width:130px; min-width:86px; flex-basis:130px; }\n"
-".app.density-minimal .sidebar { width:148px; min-width:148px; max-width:148px; flex-basis:148px; padding:6px 5px; }\n"
-".app.density-minimal .side-label { height:17px; padding:2px 7px; }\n"
-".app.density-minimal .side-item { height:25px; min-height:25px; padding:3px 7px; border-radius:6px; }\n"
-".app.density-minimal .subbar { height:27px; min-height:27px; flex-basis:27px; padding:2px 8px; }\n"
-".app.density-minimal .file-grid { padding:6px; }\n"
-".app.density-minimal .file-grid.grid { gap:4px; }\n"
-".app.density-minimal .file-item.grid-item { width:88px; min-width:88px; max-width:88px; flex-basis:88px; height:76px; min-height:76px; max-height:76px; gap:3px; padding:4px; border-radius:8px; }\n"
-".app.density-minimal .grid-item .file-icon { width:30px; height:29px; font-size:19px; border-radius:8px; }\n"
-".app.density-minimal .file-item.list-item { grid-template-columns:25px minmax(0,1fr) 112px; height:27px; min-height:27px; max-height:27px; flex-basis:27px; gap:5px; padding:1px 6px; border-radius:6px; }\n"
-".app.density-minimal .list-item .file-icon { width:23px; height:23px; font-size:13px; border-radius:6px; }\n"
-".app.density-minimal .status { height:21px; min-height:21px; flex-basis:21px; padding:2px 8px; }\n"
-".app.density-standard .toolbar { height:52px; min-height:52px; max-height:52px; flex-basis:52px; padding:7px 10px; gap:6px; }\n"
-".app.density-standard .tool { width:32px; min-width:32px; height:31px; }\n"
-".app.density-standard .location,.app.density-standard .search { height:34px; }\n"
-".app.density-standard .sidebar { width:190px; min-width:190px; max-width:190px; flex-basis:190px; padding:11px 8px; }\n"
-".app.density-standard .side-item { height:32px; padding:6px 9px; }\n"
-".app.density-standard .subbar { height:35px; min-height:35px; flex-basis:35px; }\n"
-".app.density-standard .file-grid { padding:12px; }\n"
-".app.density-standard .file-item.grid-item { width:116px; min-width:116px; max-width:116px; flex-basis:116px; height:102px; min-height:102px; max-height:102px; }\n"
-".app.density-standard .file-item.list-item { height:35px; min-height:35px; max-height:35px; flex-basis:35px; }\n"
-".app.density-roomy .toolbar { height:57px; min-height:57px; max-height:57px; flex-basis:57px; padding:8px 11px; gap:7px; }\n"
-".app.density-roomy .tool { width:35px; min-width:35px; height:33px; }\n"
-".app.density-roomy .location,.app.density-roomy .search { height:36px; }\n"
-".app.density-roomy .sidebar { width:206px; min-width:206px; max-width:206px; flex-basis:206px; padding:13px 10px; }\n"
-".app.density-roomy .side-item { height:34px; padding:7px 10px; }\n"
-".app.density-roomy .subbar { height:38px; min-height:38px; flex-basis:38px; }\n"
-".app.density-roomy .file-grid { padding:14px; }\n"
-".app.density-roomy .file-item.grid-item { width:124px; min-width:124px; max-width:124px; flex-basis:124px; height:110px; min-height:110px; max-height:110px; }\n"
-".app.density-roomy .file-item.list-item { height:38px; min-height:38px; max-height:38px; flex-basis:38px; }\n"
-".app.window-narrow .toolbar { height:44px; min-height:44px; max-height:44px; flex-basis:44px; gap:3px; padding:5px 6px; }\n"
-".app.window-narrow .tool { width:27px; min-width:27px; height:27px; font-size:13px; }\n"
-".app.window-narrow .navgroup,.app.window-narrow .viewgroup { gap:1px; padding:1px; }\n"
-".app.window-narrow .location { min-width:72px; height:29px; padding:5px 7px; }\n"
-".app.window-narrow .search { width:120px; min-width:82px; height:29px; flex-basis:120px; padding:5px 7px; }\n"
-".app.window-narrow .sidebar { width:150px; min-width:150px; max-width:150px; flex-basis:150px; padding:7px 5px; }\n"
-".app.window-narrow .subbar { height:29px; min-height:29px; flex-basis:29px; padding:2px 8px; }\n"
-".app.window-narrow .file-grid { padding:7px; }\n"
-".app.window-narrow .file-item.grid-item { width:96px; min-width:96px; max-width:96px; flex-basis:96px; height:84px; min-height:84px; max-height:84px; padding:4px; }\n"
-".app.window-narrow .grid-item .file-icon { width:36px; height:34px; font-size:22px; }\n"
-".app.window-narrow .file-item.list-item { grid-template-columns:28px minmax(0,1fr) 105px; height:29px; min-height:29px; max-height:29px; flex-basis:29px; }\n"
-".app.window-narrow .responsive-hide-narrow { display:none; }\n"
-".app.window-tiny .search,.app.window-tiny .sidebar,.app.window-tiny .responsive-hide-tiny { display:none; }\n"
-".app.window-tiny .toolbar { gap:2px; padding-left:4px; padding-right:4px; }\n"
-".app.window-tiny .tool { width:26px; min-width:26px; height:26px; }\n"
-".app.window-tiny .location { min-width:56px; }\n"
-".app.window-tiny .hint { display:none; }\n"
-".app.window-tiny .file-item.list-item { grid-template-columns:27px minmax(0,1fr); }\n"
-".app.window-tiny .file-meta { display:none; }\n"
-".app.window-short .sidebar { padding-top:5px; padding-bottom:5px; }\n"
-".app.window-short .side-item { height:27px; min-height:27px; }\n"
-".app.window-short .settings-panel { max-height:94%; }\n"
-".app.density-minimal.window-narrow .toolbar { height:40px; min-height:40px; max-height:40px; flex-basis:40px; padding:3px 5px; gap:2px; }\n"
-".app.density-minimal.window-narrow .tool { width:24px; min-width:24px; height:24px; font-size:12px; }\n"
-".app.density-minimal.window-narrow .location { min-width:64px; height:27px; padding:4px 6px; }\n"
-".app.density-minimal.window-narrow .search { width:108px; min-width:72px; height:27px; flex-basis:108px; padding:4px 6px; }\n"
-".app.density-minimal.window-narrow .sidebar { width:138px; min-width:138px; max-width:138px; flex-basis:138px; padding:5px 4px; }\n"
-".app.density-minimal.window-narrow .side-item { height:24px; min-height:24px; padding:3px 6px; }\n"
-".app.density-minimal.window-narrow .subbar { height:26px; min-height:26px; flex-basis:26px; padding:2px 7px; }\n"
-".app.density-minimal.window-narrow .file-grid { padding:5px; }\n"
-".app.density-minimal.window-narrow .file-item.grid-item { width:82px; min-width:82px; max-width:82px; flex-basis:82px; height:72px; min-height:72px; max-height:72px; padding:3px; }\n"
-".app.density-minimal.window-narrow .grid-item .file-icon { width:28px; height:27px; font-size:18px; }\n"
-".app.density-minimal.window-narrow .file-item.list-item { grid-template-columns:24px minmax(0,1fr) 96px; height:26px; min-height:26px; max-height:26px; flex-basis:26px; }\n"
-".app.density-minimal.window-tiny .file-item.list-item { grid-template-columns:24px minmax(0,1fr); }\n"
-".app.density-minimal.window-narrow .status { height:20px; min-height:20px; flex-basis:20px; }\n"
-".settings-panel { overflow:hidden; gap:0; padding:0; }\n"
-".settings-header { height:48px; min-height:48px; flex:0 0 48px; display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid rgba(71,85,105,.12); background:rgba(248,250,252,.98); }\n"
-".settings-header .modal-title { flex:1; }\n"
-".settings-shortcut { color:#8793a4; font-size:10px; }\n"
-".settings-scroll { flex:1 1 auto; min-height:0; overflow-y:auto; padding:10px 12px 12px; scrollbar-width:thin; }\n"
-".settings-section { height:25px; display:flex; align-items:flex-end; padding:5px 8px 3px; color:#7b8798; font-size:10px; font-weight:700; letter-spacing:.35px; text-transform:uppercase; }\n"
-".settings-footer { height:52px; min-height:52px; flex:0 0 52px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 12px; border-top:1px solid rgba(71,85,105,.12); background:rgba(248,250,252,.98); }\n"
-".settings-footer-right { display:flex; gap:6px; }\n"
-".button.subtle { min-width:84px; background:transparent; color:#64748b; }\n"
-".app.hide-status .status { display:none; }\n"
-".app.grid-details .grid-item .file-meta { display:block; width:100%; font-size:9px; line-height:1.15; text-align:center; }\n"
-".app.grid-details .file-item.grid-item { height:112px; min-height:112px; max-height:112px; }\n"
-".app.grid-details.density-minimal .file-item.grid-item { height:91px; min-height:91px; max-height:91px; }\n"
-".app.grid-details.density-standard .file-item.grid-item { height:122px; min-height:122px; max-height:122px; }\n"
-".app.grid-details.density-roomy .file-item.grid-item { height:130px; min-height:130px; max-height:130px; }\n"
-".app.grid-details.window-narrow .file-item.grid-item { height:102px; min-height:102px; max-height:102px; }\n"
-".app.grid-details.density-minimal.window-narrow .file-item.grid-item { height:86px; min-height:86px; max-height:86px; }\n"
-".app.no-motion .tool,.app.no-motion .file-item,.app.no-motion .button,.app.no-motion .settings-row { transition:0s; }\n"
-".app.theme-dark { background:linear-gradient(180deg,#121923 0%,#0d131c 100%); color:#e5eaf0; }\n"
-".app.theme-dark .toolbar { background:rgba(22,30,42,.96); border-bottom-color:rgba(148,163,184,.15); box-shadow:0 2px 12px rgba(0,0,0,.22); }\n"
-".app.theme-dark .navgroup,.app.theme-dark .viewgroup { background:rgba(148,163,184,.10); }\n"
-".app.theme-dark .tool { color:#c8d2df; }\n"
-".app.theme-dark .tool:hover { background:rgba(51,65,85,.92); box-shadow:0 1px 5px rgba(0,0,0,.22); }\n"
-".app.theme-dark .location,.app.theme-dark .search,.app.theme-dark .modal-input,.app.theme-dark .desktop-edit-input { background:#182231; color:#eef3f8; border-color:rgba(148,163,184,.22); }\n"
-".app.theme-dark .desktop-edit-hint,.app.theme-dark .desktop-edit-label { color:#8997aa; }\n"
-".app.theme-dark .desktop-edit-toggle { background:#1d2a3a; border-color:rgba(148,163,184,.14); color:#d7e0ea; }\n"
-".app.theme-dark .desktop-edit-toggle:hover { background:#29415d; color:#c9e3ff; }\n"
-".app.theme-dark .desktop-edit-toggle.on { background:#24364c; border-color:rgba(125,178,255,.35); }\n"
-".app.theme-dark .sidebar { background:rgba(18,27,39,.94); border-right-color:rgba(148,163,184,.13); }\n"
-".app.theme-dark .side-label,.app.theme-dark .hint,.app.theme-dark .file-meta,.app.theme-dark .settings-note,.app.theme-dark .settings-shortcut { color:#8997aa; }\n"
-".app.theme-dark .side-item { color:#cbd5e1; }\n"
-".app.theme-dark .side-item:hover { background:rgba(51,65,85,.72); }\n"
-".app.theme-dark .main { background:rgba(13,19,28,.72); }\n"
-".app.theme-dark .subbar { color:#8fa0b5; border-bottom-color:rgba(148,163,184,.11); }\n"
-".app.theme-dark .folder-title,.app.theme-dark .settings-name,.app.theme-dark .modal-title { color:#e7edf4; }\n"
-".app.theme-dark .file-item:hover { background:rgba(51,65,85,.62); }\n"
-".app.theme-dark .grid-item .file-icon { background:linear-gradient(145deg,#24354a,#1d2d40); box-shadow:0 3px 8px rgba(0,0,0,.18); }\n"
-".app.theme-dark .grid-item.type-folder .file-icon { background:linear-gradient(145deg,#493d23,#372f20); }\n"
-".app.theme-dark .list-item .file-icon { background:#22344a; }\n"
-".app.theme-dark .list-item.type-folder .file-icon { background:#463a20; }\n"
-".app.theme-dark .status { background:rgba(20,28,39,.96); color:#8fa0b5; border-top-color:rgba(148,163,184,.11); }\n"
-".app.theme-dark .context,.app.theme-dark .volume-context,.app.theme-dark .modal,.app.theme-dark .settings-panel { background:#172130; border-color:rgba(148,163,184,.18); box-shadow:0 22px 60px rgba(0,0,0,.45); }\n"
-".app.theme-dark .menu-item { color:#d7e0ea; }\n"
-".app.theme-dark .menu-item:hover,.app.theme-dark .settings-row:hover { background:#24364c; }\n"
-".app.theme-dark .app-choice { background:#1d2a3a; color:#d7e0ea; border-color:rgba(148,163,184,.14); }\n"
-".app.theme-dark .app-choice:hover { background:#29415d; color:#c9e3ff; }\n"
-".app.theme-dark .menu-sep { background:rgba(148,163,184,.15); }\n"
-".app.theme-dark .button { background:#2a3748; color:#e5ebf2; }\n"
-".app.theme-dark .button.subtle { background:transparent; color:#9ba9ba; }\n"
-".app.theme-dark .settings-state { background:#2a3746; color:#a9b5c4; }\n"
-".app.theme-dark .settings-header,.app.theme-dark .settings-footer { background:#172130; border-color:rgba(148,163,184,.15); }\n"
-".app.theme-dark .modal-wrap.properties-dialog .modal-title,.app.theme-dark .modal-wrap.properties-dialog .modal-actions { background:#172130; border-color:rgba(148,163,184,.15); }\n"
-".app.theme-dark .modal-wrap.properties-dialog .modal-info-stack { background:#131c29; }\n"
-".app.theme-dark .modal-wrap.properties-dialog .modal-info { color:#c8d3df; }\n"
-".app.theme-dark .settings-section { color:#8d9bad; }\n"
-".app.accent-blue .tool.on,.app.accent-blue .settings-state.on { background:#d8eaff; color:#145da7; }\n"
-".app.accent-blue .side-item.active,.app.accent-blue .file-item.selected { background:#cfe5ff; color:#0b4f97; }\n"
-".app.accent-blue .button.primary { background:linear-gradient(180deg,#3698ff,#1477e6); }\n"
-".app.accent-purple .tool.on,.app.accent-purple .settings-state.on { background:#eadcff; color:#7040b5; }\n"
-".app.accent-purple .side-item.active,.app.accent-purple .file-item.selected { background:#e7d6ff; color:#6430a5; }\n"
-".app.accent-purple .button.primary { background:linear-gradient(180deg,#9a69e8,#7445c5); }\n"
-".app.accent-green .tool.on,.app.accent-green .settings-state.on { background:#d8f3e7; color:#19704f; }\n"
-".app.accent-green .side-item.active,.app.accent-green .file-item.selected { background:#d2f0e1; color:#146443; }\n"
-".app.accent-green .button.primary { background:linear-gradient(180deg,#39b985,#188a5f); }\n"
-".app.accent-orange .tool.on,.app.accent-orange .settings-state.on { background:#ffead2; color:#a65b13; }\n"
-".app.accent-orange .side-item.active,.app.accent-orange .file-item.selected { background:#ffe2c2; color:#934c0c; }\n"
-".app.accent-orange .button.primary { background:linear-gradient(180deg,#f3a64d,#d97716); }\n"
-".app.theme-dark.accent-blue .tool.on,.app.theme-dark.accent-blue .settings-state.on { background:#203f63; color:#8dc5ff; }\n"
-".app.theme-dark.accent-blue .side-item.active,.app.theme-dark.accent-blue .file-item.selected { background:#22466f; color:#b9dcff; }\n"
-".app.theme-dark.accent-purple .tool.on,.app.theme-dark.accent-purple .settings-state.on { background:#402d5d; color:#d4b9ff; }\n"
-".app.theme-dark.accent-purple .side-item.active,.app.theme-dark.accent-purple .file-item.selected { background:#49336b; color:#e0ccff; }\n"
-".app.theme-dark.accent-green .tool.on,.app.theme-dark.accent-green .settings-state.on { background:#1d493a; color:#9ce2c5; }\n"
-".app.theme-dark.accent-green .side-item.active,.app.theme-dark.accent-green .file-item.selected { background:#22533f; color:#b4ead2; }\n"
-".app.theme-dark.accent-orange .tool.on,.app.theme-dark.accent-orange .settings-state.on { background:#53371f; color:#ffc487; }\n"
-".app.theme-dark.accent-orange .side-item.active,.app.theme-dark.accent-orange .file-item.selected { background:#614024; color:#ffd2a1; }\n"
-".file-dialog-actions { flex:0 0 54px; min-height:54px; display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:9px 12px; border-top:1px solid rgba(71,85,105,.13); background:rgba(249,250,252,.97); }\n"
-".file-dialog-name { flex:1 1 auto; min-width:120px; max-width:420px; height:34px; padding:6px 9px; border:1px solid #9eb9d7; border-radius:8px; background:white; }\n"
-".app.theme-dark .file-dialog-actions { background:#172130; border-top-color:rgba(148,163,184,.15); }\n"
-".app.theme-dark .file-dialog-name { background:#111a26; color:#eef3f8; border-color:#40536b; }\n"
+".luna-file-dialog-overlay, .luna-file-dialog-overlay *{ box-sizing: border-box; }\n.lfd-she"
+"ll .hidden{ display:none; }\n.lfd-shell input{ font-size:12px; }\n.lfd-shell{ position:fixed"
+"; left:0; top:0; width:100%; height:100%; min-width:0; min-height:0; display:flex; flex-di"
+"rection:column; background:linear-gradient(180deg,#f8fafc 0%,#edf2f7 100%); color:#1f2937;"
+" font-size:12px; overflow:hidden; }\n.lfd-shell .toolbar{ width:100%; height:48px; min-heig"
+"ht:48px; max-height:48px; flex:0 0 48px; display:flex; align-items:center; gap:5px; paddin"
+"g:6px 8px; background:rgba(249,250,252,.93); border-bottom:1px solid rgba(15,23,42,.12); b"
+"ox-shadow:0 2px 10px rgba(30,41,59,.06); overflow:hidden; }\n.lfd-shell .navgroup,.lfd-shel"
+"l .viewgroup{ flex-shrink:0; display:flex; align-items:center; gap:3px; padding:2px; borde"
+"r-radius:9px; background:rgba(100,116,139,.10); }\n.lfd-shell .tool{ width:29px; min-width:"
+"29px; height:29px; flex-shrink:0; display:flex; align-items:center; justify-content:center"
+"; border-radius:7px; color:#334155; cursor:pointer; font-size:14px; transition:.12s; }\n.lf"
+"d-shell .tool:hover{ background:rgba(255,255,255,.9); box-shadow:0 1px 5px rgba(15,23,42,."
+"10); }\n.lfd-shell .tool:active{ transform:scale(.95); }\n.lfd-shell .tool.disabled{ opacity"
+":.34; pointer-events:none; }\n.lfd-shell .tool.on{ background:#dbeafe; color:#1261c9; }\n.lf"
+"d-shell .location{ flex:1 1 auto; min-width:90px; height:32px; padding:6px 10px; border:1p"
+"x solid rgba(100,116,139,.18); border-radius:9px; background:rgba(255,255,255,.86); color:"
+"#243244; box-shadow:inset 0 1px 2px rgba(15,23,42,.04); caret-color:#1684ff; }\n.lfd-shell "
+".location:focus{ border-color:#5aa7ff; outline:2px solid rgba(58,141,255,.18); }\n.lfd-shel"
+"l .search{ width:160px; min-width:110px; height:32px; flex:0 1 160px; padding:6px 9px; bor"
+"der:1px solid rgba(100,116,139,.18); border-radius:9px; background:rgba(255,255,255,.86); "
+"color:#243244; caret-color:#1684ff; }\n.lfd-shell .search:focus{ border-color:#5aa7ff; outl"
+"ine:2px solid rgba(58,141,255,.18); }\n.lfd-shell .workbench{ width:100%; flex:1 1 0; min-w"
+"idth:0; min-height:0; display:flex; overflow:hidden; }\n.lfd-shell .sidebar{ width:174px; m"
+"in-width:174px; max-width:174px; flex:0 0 174px; display:flex; flex-direction:column; gap:"
+"2px; padding:9px 7px; background:rgba(239,244,249,.86); border-right:1px solid rgba(71,85,"
+"105,.11); overflow-y:auto; scrollbar-width:thin; }\n.lfd-shell .side-label{ height:20px; pa"
+"dding:3px 8px; color:#7b8798; font-size:10px; font-weight:700; letter-spacing:.3px; text-t"
+"ransform:uppercase; }\n.lfd-shell .side-item{ height:29px; display:flex; align-items:center"
+"; padding:5px 8px; border-radius:7px; cursor:pointer; color:#344256; white-space:nowrap; t"
+"ext-overflow:ellipsis; overflow:hidden; }\n.lfd-shell .side-item:hover{ background:rgba(255"
+",255,255,.74); }\n.lfd-shell .side-item.missing{ display:none; }\n.lfd-shell .side-item.hidd"
+"en{ display:none; }\n.lfd-shell .sidebar.hidden,.lfd-shell .search.hidden{ display:none; }\n"
+".lfd-shell .side-item.active{ background:#d9eaff; color:#135eaf; font-weight:700; }\n.lfd-s"
+"hell .side-item.volume-unmounted{ opacity:.78; font-style:italic; }\n.lfd-shell .side-label"
+".hidden{ display:none; }\n.lfd-shell .volume-context{ position:fixed; right:12px; top:120px"
+"; width:240px; display:flex; flex-direction:column; gap:1px; padding:6px; border:1px solid"
+" rgba(71,85,105,.16); border-radius:11px; background:rgba(250,252,255,.96); box-shadow:0 1"
+"6px 44px rgba(15,23,42,.23); z-index:85; }\n.lfd-shell .volume-context.hidden{ display:none"
+"; }\n.lfd-shell .main{ flex:1 1 0; min-width:0; min-height:0; display:flex; flex-direction:"
+"column; background:rgba(255,255,255,.58); overflow:hidden; }\n.lfd-shell .subbar{ height:32"
+"px; min-height:32px; flex:0 0 32px; display:flex; align-items:center; gap:6px; padding:3px"
+" 10px; color:#64748b; border-bottom:1px solid rgba(71,85,105,.08); }\n.lfd-shell .folder-ti"
+"tle{ flex:1; font-size:12px; font-weight:700; color:#334155; white-space:nowrap; text-over"
+"flow:ellipsis; overflow:hidden; }\n.lfd-shell .hint{ font-size:10px; color:#8a97a8; }\n.lfd-"
+"shell .file-grid{ width:100%; flex:1 1 0; min-width:0; min-height:0; overflow:auto; scroll"
+"bar-width:thin; padding:10px; align-content:flex-start; }\n.lfd-shell .file-grid.grid{ disp"
+"lay:flex; flex-direction:row; flex-wrap:wrap; align-items:flex-start; align-content:flex-s"
+"tart; justify-content:flex-start; gap:6px; }\n.lfd-shell .file-grid.list{ display:flex; fle"
+"x-direction:column; align-items:stretch; justify-content:flex-start; gap:1px; padding:6px "
+"8px; }\n.lfd-shell .file-item{ cursor:pointer; transition:.10s; user-select:none; }\n.lfd-sh"
+"ell .file-item.hidden{ display:none; }\n.lfd-shell .file-item.grid-item{ width:108px; min-w"
+"idth:108px; max-width:108px; height:94px; min-height:94px; max-height:94px; flex-grow:0; f"
+"lex-shrink:0; flex-basis:108px; display:flex; flex-direction:column; align-items:center; j"
+"ustify-content:center; gap:4px; padding:6px 5px; border-radius:10px; text-align:center; }\n"
+".lfd-shell .file-item.list-item{ width:auto; min-width:0; height:32px; min-height:32px; ma"
+"x-height:32px; flex-grow:0; flex-shrink:0; flex-basis:32px; align-self:stretch; display:gr"
+"id; grid-template-columns:31px minmax(0,1fr) 130px; align-items:center; gap:6px; padding:2"
+"px 7px; border-radius:7px; }\n.lfd-shell .file-item:hover{ background:rgba(219,234,254,.58)"
+"; }\n.lfd-shell .file-item.selected{ background:#cfe5ff; color:#0b4f97; box-shadow:inset 0 "
+"0 0 1px rgba(40,126,220,.25); }\n.lfd-shell .file-item.cut{ opacity:.48; }\n.lfd-shell .file"
+"-icon,.lfd-shell .file-name,.lfd-shell .file-meta{ pointer-events:none; }\n.lfd-shell .grid"
+"-item .file-icon{ width:40px; height:38px; display:flex; align-items:center; justify-conte"
+"nt:center; border-radius:10px; font-size:25px; color:#4b88d8; background:linear-gradient(1"
+"45deg,#eaf4ff,#d6e9ff); box-shadow:0 3px 8px rgba(31,91,154,.11); }\n.lfd-shell .grid-item."
+"type-folder .file-icon{ color:#d89b26; background:linear-gradient(145deg,#fff3bf,#ffe18a);"
+" }\n.lfd-shell .grid-item.type-image .file-icon{ color:#b54dcc; background:linear-gradient("
+"145deg,#f8e9ff,#edd3f6); }\n.lfd-shell .grid-item.type-audio .file-icon{ color:#df4d76; bac"
+"kground:linear-gradient(145deg,#ffe9f0,#ffd4e0); }\n.lfd-shell .grid-item.type-video .file-"
+"icon{ color:#8b5fd7; background:linear-gradient(145deg,#efe7ff,#ded0ff); }\n.lfd-shell .gri"
+"d-item.type-code .file-icon{ color:#3b8f77; background:linear-gradient(145deg,#e2f8f0,#cce"
+"fe3); }\n.lfd-shell .grid-item.type-archive .file-icon{ color:#9a7040; background:linear-gr"
+"adient(145deg,#f5ecdf,#ead9c2); }\n.lfd-shell .grid-item.type-desktop .file-icon{ color:#2f"
+"7d56; background:linear-gradient(145deg,#e5f7ee,#cfeedd); }\n.lfd-shell .list-item .file-ic"
+"on{ width:26px; height:26px; display:flex; align-items:center; justify-content:center; bor"
+"der-radius:7px; background:#e8f2ff; color:#4a82c5; font-size:15px; }\n.lfd-shell .list-item"
+".type-folder .file-icon{ background:#fff0b3; color:#bf8420; }\n.lfd-shell .file-name{ width"
+":100%; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n.lfd-shell .grid-ite"
+"m .file-name{ font-size:11px; }\n.lfd-shell .file-meta{ color:#8a97a8; font-size:10px; whit"
+"e-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n.lfd-shell .grid-item .file-met"
+"a{ display:none; }\n.lfd-shell .empty{ width:100%; min-height:90px; display:flex; align-ite"
+"ms:center; justify-content:center; color:#8a97a8; font-size:12px; pointer-events:none; }\n."
+"lfd-shell .empty.hidden{ display:none; }\n.lfd-shell .status{ height:24px; min-height:24px;"
+" flex:0 0 24px; display:flex; align-items:center; padding:3px 10px; border-top:1px solid r"
+"gba(71,85,105,.09); background:rgba(248,250,252,.88); color:#6b788a; font-size:10px; white"
+"-space:nowrap; text-overflow:ellipsis; overflow:hidden; }\n.lfd-shell .context{ position:fi"
+"xed; right:12px; top:82px; width:286px; display:flex; flex-direction:column; gap:1px; padd"
+"ing:6px; border:1px solid rgba(71,85,105,.16); border-radius:11px; background:rgba(250,252"
+",255,.96); box-shadow:0 16px 44px rgba(15,23,42,.23); z-index:80; }\n.lfd-shell .context.hi"
+"dden{ display:none; }\n.lfd-shell .menu-item{ height:28px; min-height:28px; max-height:28px"
+"; flex:0 0 28px; display:flex; align-items:center; padding:6px 8px; border-radius:6px; cur"
+"sor:pointer; }\n.lfd-shell .menu-item:hover{ background:#dbeafe; color:#145da7; }\n.lfd-shel"
+"l .menu-item.danger:hover{ background:#ffe2e5; color:#b4232f; }\n.lfd-shell .menu-sep{ heig"
+"ht:1px; min-height:1px; max-height:1px; flex:0 0 1px; margin:3px 4px; background:rgba(71,8"
+"5,105,.13); }\n.lfd-shell .modal-wrap{ position:fixed; left:0; top:0; width:100%; height:10"
+"0%; display:flex; align-items:center; justify-content:center; padding:14px; background:rgb"
+"a(15,23,42,.24); z-index:100; }\n.lfd-shell .modal-wrap.hidden{ display:none; }\n.lfd-shell "
+".modal-wrap.overlay-idle{ visibility:hidden; }\n.lfd-shell .modal{ width:90%; max-width:520"
+"px; max-height:88%; overflow-y:auto; display:flex; flex-direction:column; gap:10px; paddin"
+"g:16px; border:1px solid rgba(255,255,255,.65); border-radius:14px; background:rgba(248,25"
+"0,253,.97); box-shadow:0 22px 60px rgba(15,23,42,.30); }\n.lfd-shell .modal-title{ font-siz"
+"e:15px; font-weight:700; color:#263548; }\n.lfd-shell .modal-info{ color:#617085; line-heig"
+"ht:1.45; white-space:pre-line; overflow-wrap:anywhere; }\n.lfd-shell .modal-info.hidden{ di"
+"splay:none; }\n.lfd-shell .modal-info-stack{ width:100%; min-height:1px; display:flex; flex"
+"-direction:column; gap:0; }\n.lfd-shell .modal-wrap.properties-dialog .modal{ width:94%; ma"
+"x-width:720px; max-height:82%; padding:0; gap:0; overflow-y:auto; scrollbar-width:thin; }\n"
+".lfd-shell .modal-wrap.properties-dialog .modal-title{ padding:16px 18px 13px; border-bott"
+"om:1px solid rgba(71,85,105,.12); background:rgba(248,250,253,.98); font-size:16px; }\n.lfd"
+"-shell .modal-wrap.properties-dialog .modal-info-stack{ min-height:0; display:block; overf"
+"low:visible; padding:16px 20px 20px; background:rgba(255,255,255,.72); }\n.lfd-shell .modal"
+"-wrap.properties-dialog .modal-info{ width:100%; min-height:0; display:block; color:#45546"
+"8; font-size:12px; line-height:1.72; white-space:pre-wrap; overflow-wrap:anywhere; }\n.lfd-"
+"shell .modal-wrap.properties-dialog .modal-actions{ padding:11px 14px; border-top:1px soli"
+"d rgba(71,85,105,.12); background:rgba(248,250,253,.98); }\n.lfd-shell .open-with-modal{ wi"
+"dth:92%; max-width:470px; max-height:88%; }\n.lfd-shell .open-app-list{ min-height:0; max-h"
+"eight:380px; display:flex; flex-direction:column; gap:4px; overflow-y:auto; padding:2px; s"
+"crollbar-width:thin; }\n.lfd-shell .app-choice{ min-height:43px; flex:0 0 auto; display:fle"
+"x; align-items:center; padding:7px 10px; border:1px solid rgba(100,116,139,.13); border-ra"
+"dius:9px; background:rgba(255,255,255,.72); color:#334155; cursor:pointer; line-height:1.3"
+"5; white-space:pre-line; overflow-wrap:anywhere; }\n.lfd-shell .app-choice:hover{ backgroun"
+"d:#dbeafe; color:#145da7; border-color:rgba(54,152,255,.25); }\n.lfd-shell .app-choice.hidd"
+"en{ display:none; }\n.lfd-shell .modal-input{ height:34px; padding:6px 9px; border:1px soli"
+"d #9eb9d7; border-radius:8px; background:white; caret-color:#1684ff; }\n.lfd-shell .desktop"
+"-edit-modal{ width:94%; max-width:540px; max-height:92%; gap:8px; }\n.lfd-shell .desktop-ed"
+"it-hint{ color:#617085; font-size:11px; line-height:1.4; white-space:pre-line; }\n.lfd-shel"
+"l .desktop-edit-form{ display:flex; flex-direction:column; gap:7px; min-height:0; overflow"
+"-y:auto; padding:2px 1px 4px; scrollbar-width:thin; }\n.lfd-shell .desktop-edit-row{ displa"
+"y:flex; flex-direction:column; gap:3px; }\n.lfd-shell .desktop-edit-row.hidden{ display:non"
+"e; }\n.lfd-shell .desktop-edit-label{ color:#4b5b70; font-size:11px; font-weight:700; }\n.lf"
+"d-shell .desktop-edit-input{ height:32px; padding:5px 8px; border:1px solid #9eb9d7; borde"
+"r-radius:8px; background:white; caret-color:#1684ff; }\n.lfd-shell .desktop-edit-toggle{ he"
+"ight:32px; min-height:32px; display:flex; align-items:center; justify-content:space-betwee"
+"n; padding:5px 10px; border:1px solid rgba(100,116,139,.18); border-radius:8px; background"
+":rgba(255,255,255,.78); cursor:pointer; color:#334155; font-size:12px; }\n.lfd-shell .deskt"
+"op-edit-toggle:hover{ background:#dbeafe; color:#145da7; }\n.lfd-shell .desktop-edit-toggle"
+".on{ border-color:rgba(54,152,255,.35); background:#eef6ff; }\n.lfd-shell .modal-actions{ d"
+"isplay:flex; justify-content:flex-end; gap:6px; }\n.lfd-shell .button{ min-width:72px; heig"
+"ht:30px; display:flex; align-items:center; justify-content:center; padding:5px 10px; borde"
+"r-radius:8px; background:#e6ebf1; cursor:pointer; }\n.lfd-shell .button:hover{ filter:brigh"
+"tness(1.04); }\n.lfd-shell .button.primary{ color:white; background:linear-gradient(180deg,"
+"#3698ff,#1477e6); box-shadow:0 4px 10px rgba(20,119,230,.24); }\n.lfd-shell .toast{ positio"
+"n:fixed; left:10%; bottom:36px; width:80%; max-width:360px; min-height:34px; display:flex;"
+" align-items:center; justify-content:center; padding:7px 11px; border-radius:10px; backgro"
+"und:rgba(26,35,49,.91); color:white; box-shadow:0 10px 30px rgba(15,23,42,.28); z-index:13"
+"0; }\n.lfd-shell .toast.hidden{ display:none; }\n.lfd-shell .settings-panel{ width:90%; max-"
+"width:430px; max-height:90%; overflow-y:auto; display:flex; flex-direction:column; gap:4px"
+"; padding:12px; border:1px solid rgba(71,85,105,.16); border-radius:14px; background:#f8fa"
+"fc; box-shadow:0 22px 60px rgba(15,23,42,.30); }\n.lfd-shell .settings-row{ height:34px; mi"
+"n-height:34px; display:flex; align-items:center; gap:9px; padding:5px 8px; border-radius:8"
+"px; cursor:pointer; }\n.lfd-shell .settings-row:hover{ background:#e7f0fb; }\n.lfd-shell .se"
+"ttings-name{ flex:1; color:#334155; font-size:12px; pointer-events:none; }\n.lfd-shell .set"
+"tings-state{ min-width:66px; height:24px; display:flex; align-items:center; justify-conten"
+"t:center; border-radius:12px; background:#e3e8ee; color:#5b6878; font-size:11px; font-weig"
+"ht:700; pointer-events:none; }\n.lfd-shell .settings-state.on{ background:#d8eaff; color:#1"
+"45da7; }\n.lfd-shell .settings-note{ min-height:34px; color:#738094; font-size:10px; line-h"
+"eight:1.4; }\n.lfd-shell.font-small,.lfd-shell.font-small input{ font-size:11px; }\n.lfd-she"
+"ll.font-small .folder-title,.lfd-shell.font-small .settings-name{ font-size:11px; }\n.lfd-s"
+"hell.font-small .grid-item .file-name,.lfd-shell.font-small .file-meta,.lfd-shell.font-sma"
+"ll .hint,.lfd-shell.font-small .status,.lfd-shell.font-small .side-label,.lfd-shell.font-s"
+"mall .settings-note{ font-size:9px; }\n.lfd-shell.font-standard,.lfd-shell.font-standard in"
+"put{ font-size:13px; }\n.lfd-shell.font-standard .folder-title,.lfd-shell.font-standard .se"
+"ttings-name{ font-size:13px; }\n.lfd-shell.font-standard .grid-item .file-name{ font-size:1"
+"2px; }\n.lfd-shell.font-standard .file-meta,.lfd-shell.font-standard .hint,.lfd-shell.font-"
+"standard .status,.lfd-shell.font-standard .side-label,.lfd-shell.font-standard .settings-n"
+"ote{ font-size:11px; }\n.lfd-shell.font-large,.lfd-shell.font-large input{ font-size:15px; "
+"}\n.lfd-shell.font-large .folder-title,.lfd-shell.font-large .settings-name{ font-size:15px"
+"; }\n.lfd-shell.font-large .grid-item .file-name{ font-size:14px; }\n.lfd-shell.font-large ."
+"file-meta,.lfd-shell.font-large .hint,.lfd-shell.font-large .status,.lfd-shell.font-large "
+".side-label,.lfd-shell.font-large .settings-note{ font-size:12px; }\n.lfd-shell.density-min"
+"imal .toolbar{ height:42px; min-height:42px; max-height:42px; flex-basis:42px; padding:4px"
+" 6px; gap:4px; }\n.lfd-shell.density-minimal .tool{ width:25px; min-width:25px; height:25px"
+"; font-size:12px; border-radius:6px; }\n.lfd-shell.density-minimal .navgroup,.lfd-shell.den"
+"sity-minimal .viewgroup{ gap:1px; padding:1px; border-radius:7px; }\n.lfd-shell.density-min"
+"imal .location,.lfd-shell.density-minimal .search{ height:28px; padding:4px 7px; }\n.lfd-sh"
+"ell.density-minimal .search{ width:130px; min-width:86px; flex-basis:130px; }\n.lfd-shell.d"
+"ensity-minimal .sidebar{ width:148px; min-width:148px; max-width:148px; flex-basis:148px; "
+"padding:6px 5px; }\n.lfd-shell.density-minimal .side-label{ height:17px; padding:2px 7px; }"
+"\n.lfd-shell.density-minimal .side-item{ height:25px; min-height:25px; padding:3px 7px; bor"
+"der-radius:6px; }\n.lfd-shell.density-minimal .subbar{ height:27px; min-height:27px; flex-b"
+"asis:27px; padding:2px 8px; }\n.lfd-shell.density-minimal .file-grid{ padding:6px; }\n.lfd-s"
+"hell.density-minimal .file-grid.grid{ gap:4px; }\n.lfd-shell.density-minimal .file-item.gri"
+"d-item{ width:88px; min-width:88px; max-width:88px; flex-basis:88px; height:76px; min-heig"
+"ht:76px; max-height:76px; gap:3px; padding:4px; border-radius:8px; }\n.lfd-shell.density-mi"
+"nimal .grid-item .file-icon{ width:30px; height:29px; font-size:19px; border-radius:8px; }"
+"\n.lfd-shell.density-minimal .file-item.list-item{ grid-template-columns:25px minmax(0,1fr)"
+" 112px; height:27px; min-height:27px; max-height:27px; flex-basis:27px; gap:5px; padding:1"
+"px 6px; border-radius:6px; }\n.lfd-shell.density-minimal .list-item .file-icon{ width:23px;"
+" height:23px; font-size:13px; border-radius:6px; }\n.lfd-shell.density-minimal .status{ hei"
+"ght:21px; min-height:21px; flex-basis:21px; padding:2px 8px; }\n.lfd-shell.density-standard"
+" .toolbar{ height:52px; min-height:52px; max-height:52px; flex-basis:52px; padding:7px 10p"
+"x; gap:6px; }\n.lfd-shell.density-standard .tool{ width:32px; min-width:32px; height:31px; "
+"}\n.lfd-shell.density-standard .location,.lfd-shell.density-standard .search{ height:34px; "
+"}\n.lfd-shell.density-standard .sidebar{ width:190px; min-width:190px; max-width:190px; fle"
+"x-basis:190px; padding:11px 8px; }\n.lfd-shell.density-standard .side-item{ height:32px; pa"
+"dding:6px 9px; }\n.lfd-shell.density-standard .subbar{ height:35px; min-height:35px; flex-b"
+"asis:35px; }\n.lfd-shell.density-standard .file-grid{ padding:12px; }\n.lfd-shell.density-st"
+"andard .file-item.grid-item{ width:116px; min-width:116px; max-width:116px; flex-basis:116"
+"px; height:102px; min-height:102px; max-height:102px; }\n.lfd-shell.density-standard .file-"
+"item.list-item{ height:35px; min-height:35px; max-height:35px; flex-basis:35px; }\n.lfd-she"
+"ll.density-roomy .toolbar{ height:57px; min-height:57px; max-height:57px; flex-basis:57px;"
+" padding:8px 11px; gap:7px; }\n.lfd-shell.density-roomy .tool{ width:35px; min-width:35px; "
+"height:33px; }\n.lfd-shell.density-roomy .location,.lfd-shell.density-roomy .search{ height"
+":36px; }\n.lfd-shell.density-roomy .sidebar{ width:206px; min-width:206px; max-width:206px;"
+" flex-basis:206px; padding:13px 10px; }\n.lfd-shell.density-roomy .side-item{ height:34px; "
+"padding:7px 10px; }\n.lfd-shell.density-roomy .subbar{ height:38px; min-height:38px; flex-b"
+"asis:38px; }\n.lfd-shell.density-roomy .file-grid{ padding:14px; }\n.lfd-shell.density-roomy"
+" .file-item.grid-item{ width:124px; min-width:124px; max-width:124px; flex-basis:124px; he"
+"ight:110px; min-height:110px; max-height:110px; }\n.lfd-shell.density-roomy .file-item.list"
+"-item{ height:38px; min-height:38px; max-height:38px; flex-basis:38px; }\n.lfd-shell.window"
+"-narrow .toolbar{ height:44px; min-height:44px; max-height:44px; flex-basis:44px; gap:3px;"
+" padding:5px 6px; }\n.lfd-shell.window-narrow .tool{ width:27px; min-width:27px; height:27p"
+"x; font-size:13px; }\n.lfd-shell.window-narrow .navgroup,.lfd-shell.window-narrow .viewgrou"
+"p{ gap:1px; padding:1px; }\n.lfd-shell.window-narrow .location{ min-width:72px; height:29px"
+"; padding:5px 7px; }\n.lfd-shell.window-narrow .search{ width:120px; min-width:82px; height"
+":29px; flex-basis:120px; padding:5px 7px; }\n.lfd-shell.window-narrow .sidebar{ width:150px"
+"; min-width:150px; max-width:150px; flex-basis:150px; padding:7px 5px; }\n.lfd-shell.window"
+"-narrow .subbar{ height:29px; min-height:29px; flex-basis:29px; padding:2px 8px; }\n.lfd-sh"
+"ell.window-narrow .file-grid{ padding:7px; }\n.lfd-shell.window-narrow .file-item.grid-item"
+"{ width:96px; min-width:96px; max-width:96px; flex-basis:96px; height:84px; min-height:84p"
+"x; max-height:84px; padding:4px; }\n.lfd-shell.window-narrow .grid-item .file-icon{ width:3"
+"6px; height:34px; font-size:22px; }\n.lfd-shell.window-narrow .file-item.list-item{ grid-te"
+"mplate-columns:28px minmax(0,1fr) 105px; height:29px; min-height:29px; max-height:29px; fl"
+"ex-basis:29px; }\n.lfd-shell.window-narrow .responsive-hide-narrow{ display:none; }\n.lfd-sh"
+"ell.window-tiny .search,.lfd-shell.window-tiny .sidebar,.lfd-shell.window-tiny .responsive"
+"-hide-tiny{ display:none; }\n.lfd-shell.window-tiny .toolbar{ gap:2px; padding-left:4px; pa"
+"dding-right:4px; }\n.lfd-shell.window-tiny .tool{ width:26px; min-width:26px; height:26px; "
+"}\n.lfd-shell.window-tiny .location{ min-width:56px; }\n.lfd-shell.window-tiny .hint{ displa"
+"y:none; }\n.lfd-shell.window-tiny .file-item.list-item{ grid-template-columns:27px minmax(0"
+",1fr); }\n.lfd-shell.window-tiny .file-meta{ display:none; }\n.lfd-shell.window-short .sideb"
+"ar{ padding-top:5px; padding-bottom:5px; }\n.lfd-shell.window-short .side-item{ height:27px"
+"; min-height:27px; }\n.lfd-shell.window-short .settings-panel{ max-height:94%; }\n.lfd-shell"
+".density-minimal.window-narrow .toolbar{ height:40px; min-height:40px; max-height:40px; fl"
+"ex-basis:40px; padding:3px 5px; gap:2px; }\n.lfd-shell.density-minimal.window-narrow .tool{"
+" width:24px; min-width:24px; height:24px; font-size:12px; }\n.lfd-shell.density-minimal.win"
+"dow-narrow .location{ min-width:64px; height:27px; padding:4px 6px; }\n.lfd-shell.density-m"
+"inimal.window-narrow .search{ width:108px; min-width:72px; height:27px; flex-basis:108px; "
+"padding:4px 6px; }\n.lfd-shell.density-minimal.window-narrow .sidebar{ width:138px; min-wid"
+"th:138px; max-width:138px; flex-basis:138px; padding:5px 4px; }\n.lfd-shell.density-minimal"
+".window-narrow .side-item{ height:24px; min-height:24px; padding:3px 6px; }\n.lfd-shell.den"
+"sity-minimal.window-narrow .subbar{ height:26px; min-height:26px; flex-basis:26px; padding"
+":2px 7px; }\n.lfd-shell.density-minimal.window-narrow .file-grid{ padding:5px; }\n.lfd-shell"
+".density-minimal.window-narrow .file-item.grid-item{ width:82px; min-width:82px; max-width"
+":82px; flex-basis:82px; height:72px; min-height:72px; max-height:72px; padding:3px; }\n.lfd"
+"-shell.density-minimal.window-narrow .grid-item .file-icon{ width:28px; height:27px; font-"
+"size:18px; }\n.lfd-shell.density-minimal.window-narrow .file-item.list-item{ grid-template-"
+"columns:24px minmax(0,1fr) 96px; height:26px; min-height:26px; max-height:26px; flex-basis"
+":26px; }\n.lfd-shell.density-minimal.window-tiny .file-item.list-item{ grid-template-column"
+"s:24px minmax(0,1fr); }\n.lfd-shell.density-minimal.window-narrow .status{ height:20px; min"
+"-height:20px; flex-basis:20px; }\n.lfd-shell .settings-panel{ overflow:hidden; gap:0; paddi"
+"ng:0; }\n.lfd-shell .settings-header{ height:48px; min-height:48px; flex:0 0 48px; display:"
+"flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid rgba(71,85,1"
+"05,.12); background:rgba(248,250,252,.98); }\n.lfd-shell .settings-header .modal-title{ fle"
+"x:1; }\n.lfd-shell .settings-shortcut{ color:#8793a4; font-size:10px; }\n.lfd-shell .setting"
+"s-scroll{ flex:1 1 auto; min-height:0; overflow-y:auto; padding:10px 12px 12px; scrollbar-"
+"width:thin; }\n.lfd-shell .settings-section{ height:25px; display:flex; align-items:flex-en"
+"d; padding:5px 8px 3px; color:#7b8798; font-size:10px; font-weight:700; letter-spacing:.35"
+"px; text-transform:uppercase; }\n.lfd-shell .settings-footer{ height:52px; min-height:52px;"
+" flex:0 0 52px; display:flex; align-items:center; justify-content:space-between; gap:8px; "
+"padding:10px 12px; border-top:1px solid rgba(71,85,105,.12); background:rgba(248,250,252,."
+"98); }\n.lfd-shell .settings-footer-right{ display:flex; gap:6px; }\n.lfd-shell .button.subt"
+"le{ min-width:84px; background:transparent; color:#64748b; }\n.lfd-shell.hide-status .statu"
+"s{ display:none; }\n.lfd-shell.grid-details .grid-item .file-meta{ display:block; width:100"
+"%; font-size:9px; line-height:1.15; text-align:center; }\n.lfd-shell.grid-details .file-ite"
+"m.grid-item{ height:112px; min-height:112px; max-height:112px; }\n.lfd-shell.grid-details.d"
+"ensity-minimal .file-item.grid-item{ height:91px; min-height:91px; max-height:91px; }\n.lfd"
+"-shell.grid-details.density-standard .file-item.grid-item{ height:122px; min-height:122px;"
+" max-height:122px; }\n.lfd-shell.grid-details.density-roomy .file-item.grid-item{ height:13"
+"0px; min-height:130px; max-height:130px; }\n.lfd-shell.grid-details.window-narrow .file-ite"
+"m.grid-item{ height:102px; min-height:102px; max-height:102px; }\n.lfd-shell.grid-details.d"
+"ensity-minimal.window-narrow .file-item.grid-item{ height:86px; min-height:86px; max-heigh"
+"t:86px; }\n.lfd-shell.no-motion .tool,.lfd-shell.no-motion .file-item,.lfd-shell.no-motion "
+".button,.lfd-shell.no-motion .settings-row{ transition:0s; }\n.lfd-shell.theme-dark{ backgr"
+"ound:linear-gradient(180deg,#121923 0%,#0d131c 100%); color:#e5eaf0; }\n.lfd-shell.theme-da"
+"rk .toolbar{ background:rgba(22,30,42,.96); border-bottom-color:rgba(148,163,184,.15); box"
+"-shadow:0 2px 12px rgba(0,0,0,.22); }\n.lfd-shell.theme-dark .navgroup,.lfd-shell.theme-dar"
+"k .viewgroup{ background:rgba(148,163,184,.10); }\n.lfd-shell.theme-dark .tool{ color:#c8d2"
+"df; }\n.lfd-shell.theme-dark .tool:hover{ background:rgba(51,65,85,.92); box-shadow:0 1px 5"
+"px rgba(0,0,0,.22); }\n.lfd-shell.theme-dark .location,.lfd-shell.theme-dark .search,.lfd-s"
+"hell.theme-dark .modal-input,.lfd-shell.theme-dark .desktop-edit-input{ background:#182231"
+"; color:#eef3f8; border-color:rgba(148,163,184,.22); }\n.lfd-shell.theme-dark .desktop-edit"
+"-hint,.lfd-shell.theme-dark .desktop-edit-label{ color:#8997aa; }\n.lfd-shell.theme-dark .d"
+"esktop-edit-toggle{ background:#1d2a3a; border-color:rgba(148,163,184,.14); color:#d7e0ea;"
+" }\n.lfd-shell.theme-dark .desktop-edit-toggle:hover{ background:#29415d; color:#c9e3ff; }\n"
+".lfd-shell.theme-dark .desktop-edit-toggle.on{ background:#24364c; border-color:rgba(125,1"
+"78,255,.35); }\n.lfd-shell.theme-dark .sidebar{ background:rgba(18,27,39,.94); border-right"
+"-color:rgba(148,163,184,.13); }\n.lfd-shell.theme-dark .side-label,.lfd-shell.theme-dark .h"
+"int,.lfd-shell.theme-dark .file-meta,.lfd-shell.theme-dark .settings-note,.lfd-shell.theme"
+"-dark .settings-shortcut{ color:#8997aa; }\n.lfd-shell.theme-dark .side-item{ color:#cbd5e1"
+"; }\n.lfd-shell.theme-dark .side-item:hover{ background:rgba(51,65,85,.72); }\n.lfd-shell.th"
+"eme-dark .main{ background:rgba(13,19,28,.72); }\n.lfd-shell.theme-dark .subbar{ color:#8fa"
+"0b5; border-bottom-color:rgba(148,163,184,.11); }\n.lfd-shell.theme-dark .folder-title,.lfd"
+"-shell.theme-dark .settings-name,.lfd-shell.theme-dark .modal-title{ color:#e7edf4; }\n.lfd"
+"-shell.theme-dark .file-item:hover{ background:rgba(51,65,85,.62); }\n.lfd-shell.theme-dark"
+" .grid-item .file-icon{ background:linear-gradient(145deg,#24354a,#1d2d40); box-shadow:0 3"
+"px 8px rgba(0,0,0,.18); }\n.lfd-shell.theme-dark .grid-item.type-folder .file-icon{ backgro"
+"und:linear-gradient(145deg,#493d23,#372f20); }\n.lfd-shell.theme-dark .list-item .file-icon"
+"{ background:#22344a; }\n.lfd-shell.theme-dark .list-item.type-folder .file-icon{ backgroun"
+"d:#463a20; }\n.lfd-shell.theme-dark .status{ background:rgba(20,28,39,.96); color:#8fa0b5; "
+"border-top-color:rgba(148,163,184,.11); }\n.lfd-shell.theme-dark .context,.lfd-shell.theme-"
+"dark .volume-context,.lfd-shell.theme-dark .modal,.lfd-shell.theme-dark .settings-panel{ b"
+"ackground:#172130; border-color:rgba(148,163,184,.18); box-shadow:0 22px 60px rgba(0,0,0,."
+"45); }\n.lfd-shell.theme-dark .menu-item{ color:#d7e0ea; }\n.lfd-shell.theme-dark .menu-item"
+":hover,.lfd-shell.theme-dark .settings-row:hover{ background:#24364c; }\n.lfd-shell.theme-d"
+"ark .app-choice{ background:#1d2a3a; color:#d7e0ea; border-color:rgba(148,163,184,.14); }\n"
+".lfd-shell.theme-dark .app-choice:hover{ background:#29415d; color:#c9e3ff; }\n.lfd-shell.t"
+"heme-dark .menu-sep{ background:rgba(148,163,184,.15); }\n.lfd-shell.theme-dark .button{ ba"
+"ckground:#2a3748; color:#e5ebf2; }\n.lfd-shell.theme-dark .button.subtle{ background:transp"
+"arent; color:#9ba9ba; }\n.lfd-shell.theme-dark .settings-state{ background:#2a3746; color:#"
+"a9b5c4; }\n.lfd-shell.theme-dark .settings-header,.lfd-shell.theme-dark .settings-footer{ b"
+"ackground:#172130; border-color:rgba(148,163,184,.15); }\n.lfd-shell.theme-dark .modal-wrap"
+".properties-dialog .modal-title,.lfd-shell.theme-dark .modal-wrap.properties-dialog .modal"
+"-actions{ background:#172130; border-color:rgba(148,163,184,.15); }\n.lfd-shell.theme-dark "
+".modal-wrap.properties-dialog .modal-info-stack{ background:#131c29; }\n.lfd-shell.theme-da"
+"rk .modal-wrap.properties-dialog .modal-info{ color:#c8d3df; }\n.lfd-shell.theme-dark .sett"
+"ings-section{ color:#8d9bad; }\n.lfd-shell.accent-blue .tool.on,.lfd-shell.accent-blue .set"
+"tings-state.on{ background:#d8eaff; color:#145da7; }\n.lfd-shell.accent-blue .side-item.act"
+"ive,.lfd-shell.accent-blue .file-item.selected{ background:#cfe5ff; color:#0b4f97; }\n.lfd-"
+"shell.accent-blue .button.primary{ background:linear-gradient(180deg,#3698ff,#1477e6); }\n."
+"lfd-shell.accent-purple .tool.on,.lfd-shell.accent-purple .settings-state.on{ background:#"
+"eadcff; color:#7040b5; }\n.lfd-shell.accent-purple .side-item.active,.lfd-shell.accent-purp"
+"le .file-item.selected{ background:#e7d6ff; color:#6430a5; }\n.lfd-shell.accent-purple .but"
+"ton.primary{ background:linear-gradient(180deg,#9a69e8,#7445c5); }\n.lfd-shell.accent-green"
+" .tool.on,.lfd-shell.accent-green .settings-state.on{ background:#d8f3e7; color:#19704f; }"
+"\n.lfd-shell.accent-green .side-item.active,.lfd-shell.accent-green .file-item.selected{ ba"
+"ckground:#d2f0e1; color:#146443; }\n.lfd-shell.accent-green .button.primary{ background:lin"
+"ear-gradient(180deg,#39b985,#188a5f); }\n.lfd-shell.accent-orange .tool.on,.lfd-shell.accen"
+"t-orange .settings-state.on{ background:#ffead2; color:#a65b13; }\n.lfd-shell.accent-orange"
+" .side-item.active,.lfd-shell.accent-orange .file-item.selected{ background:#ffe2c2; color"
+":#934c0c; }\n.lfd-shell.accent-orange .button.primary{ background:linear-gradient(180deg,#f"
+"3a64d,#d97716); }\n.lfd-shell.theme-dark.accent-blue .tool.on,.lfd-shell.theme-dark.accent-"
+"blue .settings-state.on{ background:#203f63; color:#8dc5ff; }\n.lfd-shell.theme-dark.accent"
+"-blue .side-item.active,.lfd-shell.theme-dark.accent-blue .file-item.selected{ background:"
+"#22466f; color:#b9dcff; }\n.lfd-shell.theme-dark.accent-purple .tool.on,.lfd-shell.theme-da"
+"rk.accent-purple .settings-state.on{ background:#402d5d; color:#d4b9ff; }\n.lfd-shell.theme"
+"-dark.accent-purple .side-item.active,.lfd-shell.theme-dark.accent-purple .file-item.selec"
+"ted{ background:#49336b; color:#e0ccff; }\n.lfd-shell.theme-dark.accent-green .tool.on,.lfd"
+"-shell.theme-dark.accent-green .settings-state.on{ background:#1d493a; color:#9ce2c5; }\n.l"
+"fd-shell.theme-dark.accent-green .side-item.active,.lfd-shell.theme-dark.accent-green .fil"
+"e-item.selected{ background:#22533f; color:#b4ead2; }\n.lfd-shell.theme-dark.accent-orange "
+".tool.on,.lfd-shell.theme-dark.accent-orange .settings-state.on{ background:#53371f; color"
+":#ffc487; }\n.lfd-shell.theme-dark.accent-orange .side-item.active,.lfd-shell.theme-dark.ac"
+"cent-orange .file-item.selected{ background:#614024; color:#ffd2a1; }\n.lfd-shell .file-dia"
+"log-actions{ flex:0 0 54px; min-height:54px; display:flex; align-items:center; justify-con"
+"tent:flex-end; gap:8px; padding:9px 12px; border-top:1px solid rgba(71,85,105,.13); backgr"
+"ound:rgba(249,250,252,.97); }\n.lfd-shell .file-dialog-name{ flex:1 1 auto; min-width:120px"
+"; max-width:420px; height:34px; padding:6px 9px; border:1px solid #9eb9d7; border-radius:8"
+"px; background:white; }\n.lfd-shell.theme-dark .file-dialog-actions{ background:#172130; bo"
+"rder-top-color:rgba(148,163,184,.15); }\n.lfd-shell.theme-dark .file-dialog-name{ backgroun"
+"d:#111a26; color:#eef3f8; border-color:#40536b; }\n"
 ;
+
+static const char *LFD_OVERLAY_CSS =
+".luna-file-dialog-overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; padding:18px; background:rgba(10,15,25,.36); z-index:4900; }\n"
+".luna-file-dialog-overlay.hidden { display:none; }\n"
+".luna-file-dialog-overlay > .lfd-shell {"
+" position:relative !important; left:auto !important; top:auto !important; right:auto !important; bottom:auto !important;"
+" width:92% !important; height:86% !important; max-width:920px; max-height:620px;"
+" min-width:280px; min-height:280px; border-radius:12px;"
+" box-shadow:0 22px 60px rgba(15,23,42,.30); overflow:hidden;"
+"}\n"
+;
+
+const char* luna_file_dialog_css(void) {
+    static char combined[65536];
+    static int built;
+    if (!built) {
+        snprintf(combined, sizeof(combined), "%s%s", UI_CSS, LFD_OVERLAY_CSS);
+        built = 1;
+    }
+    return combined;
+}
+
+static char *g_file_dialog_overlay_html_cache;
+
+const char* luna_file_dialog_overlay_html(void) {
+    if (g_file_dialog_overlay_html_cache) return g_file_dialog_overlay_html_cache;
+    size_t cap = 700000;
+    char *h = calloc(1, cap);
+    if (!h) return "";
+    size_t n = 0;
+#define APPEND(...) do{int z=snprintf(h+n,cap-n,__VA_ARGS__);if(z<0||(size_t)z>=cap-n){free(h);return "";}n+=(size_t)z;}while(0)
+    APPEND("<div id=\"lfd-overlay\" class=\"luna-file-dialog-overlay hidden\">");
+    if (!append_file_dialog_body(h, cap, &n, 0)) { free(h); return ""; }
+    APPEND("</div>");
+#undef APPEND
+    g_file_dialog_overlay_html_cache = h;
+    return h;
+}
 
 static void log_error(const char *fmt, ...) {
     va_list ap;
@@ -1985,7 +2052,7 @@ static void load_settings(void) {
 
 static void save_settings(void) {
     char path[PATH_MAX]; settings_path(path,sizeof(path));
-    if(g.window)glfwGetWindowSize(g.window,&g.window_width,&g.window_height);
+    luna_platform_get_window_rect(NULL,NULL,&g.window_width,&g.window_height);
     if(g.cwd[0])safe_copy(g.last_directory,sizeof(g.last_directory),g.cwd);
     FILE *fp=fopen(path,"w"); if(!fp)return;
     fprintf(fp,"show_sidebar=%d\n",g.show_sidebar);
@@ -2046,7 +2113,7 @@ static void build_sidebar_paths(void) {
 }
 
 static void refresh_sidebar_visibility(void) {
-    static const char *ids[9]={"side-home","side-desktop","side-documents","side-downloads","side-pictures","side-music","side-videos","side-trash","side-root"};
+    static const char *ids[9]={"lfd-side-home","lfd-side-desktop","lfd-side-documents","lfd-side-downloads","lfd-side-pictures","lfd-side-music","lfd-side-videos","lfd-side-trash","lfd-side-root"};
     for(int i=0;i<9;i++){
         int id=luna_get_element_by_id(ids[i]);
         if(path_is_directory(g.side_paths[i]))luna_remove_class(id,"missing");
@@ -2246,7 +2313,7 @@ static void render_volumes(void) {
     for(int i=0;i<MAX_VOLUMES;i++){
         char id[32],label[320];
         int eid;
-        snprintf(id,sizeof(id),"vol%02d",i);
+        snprintf(id,sizeof(id),"lfd-vol%02d",i);
         eid=luna_get_element_by_id(id);
         if(eid<0)continue;
         if(i>=g.volume_count){
@@ -2270,7 +2337,7 @@ static void render_volumes(void) {
 }
 
 static void refresh_volumes(int force) {
-    double now=glfwGetTime();
+    double now=luna_platform_time();
     if(!force && g.volumes_next_refresh>0 && now<g.volumes_next_refresh)return;
     g.volume_count=0;
     /* Prefer util-linux lsblk (no gvfs). Optional gio fills network mounts. */
@@ -3363,7 +3430,7 @@ static void show_toast(const char *fmt, ...) {
     char msg[512]; va_list ap; va_start(ap,fmt); vsnprintf(msg,sizeof(msg),fmt,ap); va_end(ap);
     luna_set_text(g.id_toast,msg);
     luna_remove_class(g.id_toast,"hidden");
-    g.toast_until=glfwGetTime()+TOAST_SECONDS;
+    g.toast_until=luna_platform_time()+TOAST_SECONDS;
     request_redraw();
 }
 
@@ -3386,7 +3453,7 @@ static void update_toolbar_state(void) {
 }
 
 static void update_sidebar_active(void) {
-    static const char *ids[9]={"side-home","side-desktop","side-documents","side-downloads","side-pictures","side-music","side-videos","side-trash","side-root"};
+    static const char *ids[9]={"lfd-side-home","lfd-side-desktop","lfd-side-documents","lfd-side-downloads","lfd-side-pictures","lfd-side-music","lfd-side-videos","lfd-side-trash","lfd-side-root"};
     for(int i=0;i<9;i++){
         int id=luna_get_element_by_id(ids[i]);
         if(!strcmp(g.cwd,g.side_paths[i]))luna_add_class(id,"active"); else luna_remove_class(id,"active");
@@ -3416,7 +3483,7 @@ static int path_in_clipboard(const char *path) {
 
 static void apply_item_classes(int slot, int ei) {
     char id[32], cls_remove[256], cls_add[256];
-    snprintf(id,sizeof(id),"item%03d",slot);
+    snprintf(id,sizeof(id),"lfd-item%03d",slot);
     int idx=luna_get_element_by_id(id);
     snprintf(cls_remove,sizeof(cls_remove),"hidden grid-item list-item type-folder type-file type-image type-audio type-video type-code type-archive selected cut");
     if(ei<0){luna_update_classes(idx,cls_remove,"file-item hidden"); return;}
@@ -3453,15 +3520,15 @@ static void render_files(void) {
         if(!starts_with_ci(f->name,g.search)) continue;
         g.slot_entry[slot]=i;
         char id[32], meta[96];
-        snprintf(id,sizeof(id),"icon%03d",slot);luna_set_text(luna_get_element_by_id(id),type_icon(f));
-        snprintf(id,sizeof(id),"name%03d",slot);luna_set_text(luna_get_element_by_id(id),f->name);
-        format_meta(f,meta,sizeof(meta));snprintf(id,sizeof(id),"meta%03d",slot);luna_set_text(luna_get_element_by_id(id),meta);
+        snprintf(id,sizeof(id),"lfd-icon%03d",slot);luna_set_text(luna_get_element_by_id(id),type_icon(f));
+        snprintf(id,sizeof(id),"lfd-name%03d",slot);luna_set_text(luna_get_element_by_id(id),f->name);
+        format_meta(f,meta,sizeof(meta));snprintf(id,sizeof(id),"lfd-meta%03d",slot);luna_set_text(luna_get_element_by_id(id),meta);
         apply_item_classes(slot,i);
         slot++;
     }
     for(int i=slot;i<old_visible;i++){g.slot_entry[i]=-1;apply_item_classes(i,-1);}
     g.visible_count=slot;
-    if(slot==0)luna_remove_class(luna_get_element_by_id("empty"),"hidden");else luna_add_class(luna_get_element_by_id("empty"),"hidden");
+    if(slot==0)luna_remove_class(luna_get_element_by_id("lfd-empty"),"hidden");else luna_add_class(luna_get_element_by_id("lfd-empty"),"hidden");
     if(g.grid_view)luna_update_classes(g.id_grid,"list","grid");else luna_update_classes(g.id_grid,"grid","list");
     update_file_status();
     luna_mark_layout_dirty();
@@ -3798,7 +3865,7 @@ static void show_open_with_dialog(int target) {
     luna_set_text(g.id_open_with_info,heading);
     char default_id[256]="";if(mime[0])query_xdg_default_app(mime,default_id,sizeof(default_id));
     for(int i=0;i<MAX_OPEN_APPS;i++){
-        char id[32];snprintf(id,sizeof(id),"openapp%02d",i);int eid=luna_get_element_by_id(id);
+        char id[32];snprintf(id,sizeof(id),"lfd-openapp%02d",i);int eid=luna_get_element_by_id(id);
         if(i<g.open_app_count){
             char label[768];snprintf(label,sizeof(label),"%s%s\n%s",g.open_app_names[i],default_id[0]&&!strcmp(default_id,g.open_app_ids[i])?"　（既定）":"",g.open_app_ids[i]);
             luna_set_text(eid,label);luna_remove_class(eid,"hidden");
@@ -3820,11 +3887,11 @@ static int parse_slot(const char *id) {
 static void select_entry_click(int ei, int mods, int right_click) {
     if(ei<0||ei>=g.entry_count)return;
     if(right_click){if(!g.entries[ei].selected){clear_selection();g.entries[ei].selected=1;}g.anchor_entry=ei;refresh_file_visuals();return;}
-    if(mods & GLFW_MOD_SHIFT && g.anchor_entry>=0){
+    if(mods & LUNA_MOD_SHIFT && g.anchor_entry>=0){
         int a=g.anchor_entry<ei?g.anchor_entry:ei,b=g.anchor_entry>ei?g.anchor_entry:ei;
-        if(!(mods&GLFW_MOD_CONTROL))clear_selection();
+        if(!(mods&LUNA_MOD_CONTROL))clear_selection();
         for(int i=a;i<=b;i++)g.entries[i].selected=1;
-    } else if(mods & GLFW_MOD_CONTROL){
+    } else if(mods & LUNA_MOD_CONTROL){
         g.entries[ei].selected=!g.entries[ei].selected; g.anchor_entry=ei;
     } else { clear_selection();g.entries[ei].selected=1;g.anchor_entry=ei; }
     refresh_file_visuals();
@@ -3840,7 +3907,7 @@ static void clipboard_export(void) {
         strncat(mime,"file://",cap-strlen(mime)-1);strncat(mime,escaped,cap-strlen(mime)-1);strncat(mime,"\n",cap-strlen(mime)-1);
         strncat(text,g.clip_paths[i],cap-strlen(text)-1);strncat(text,"\n",cap-strlen(text)-1);
     }
-    glfwSetClipboardString(g.window,text);
+    luna_clipboard_set(text);
     if(getenv("WAYLAND_DISPLAY")&&program_exists("wl-copy")){
         char *argv[]={"wl-copy","--type","x-special/gnome-copied-files",NULL};
         pipe_write_program("wl-copy",argv,mime);
@@ -3870,7 +3937,7 @@ static int clipboard_import(void) {
     } else if(program_exists("xclip")){
         char *argv[]={"xclip","-selection","clipboard","-t","x-special/gnome-copied-files","-o",NULL};got=pipe_read_program("xclip",argv,buf,sizeof(buf));
     }
-    if(!got){const char *s=glfwGetClipboardString(g.window);if(s)safe_copy(buf,sizeof(buf),s);}
+    if(!got){char *s=luna_clipboard_get();if(s){safe_copy(buf,sizeof(buf),s);luna_clipboard_free(s);}}
     if(!buf[0])return 0;
     g.clip_count=0;g.clip_cut=0;
     char *save=NULL,*line=strtok_r(buf,"\r\n",&save);
@@ -4036,7 +4103,7 @@ static void on_blank(LunaElement *e) {
     (void)e;
     /* Item clicks bubble to the file-grid handler in Luna UI.  Ignore that
        matching parent callback so it cannot clear selection or disturb scroll. */
-    double now = glfwGetTime();
+    double now = luna_platform_time();
     if (now <= g.suppress_blank_until) {
         g.suppress_blank_until = 0.0;
         return;
@@ -4053,7 +4120,7 @@ static void on_blank(LunaElement *e) {
 }
 
 static void on_item(LunaElement *e) {
-    g.suppress_blank_until = glfwGetTime() + 0.15;
+    g.suppress_blank_until = luna_platform_time() + 0.15;
     int slot=parse_slot(e->id);if(slot<0)return;int ei=g.slot_entry[slot];if(ei<0)return;
     int button=luna_last_click_button(),mods=luna_last_click_mods();
     if(button==LUNA_MOUSE_BUTTON_RIGHT){
@@ -4065,8 +4132,8 @@ static void on_item(LunaElement *e) {
         return;
     }
     hide_context();select_entry_click(ei,mods,0);
-    double now=glfwGetTime();
-    if(ei==g.last_click_entry&&now-g.last_click_time<0.38&&!(mods&(GLFW_MOD_CONTROL|GLFW_MOD_SHIFT)))open_entry(ei);
+    double now=luna_platform_time();
+    if(ei==g.last_click_entry&&now-g.last_click_time<0.38&&!(mods&(LUNA_MOD_CONTROL|LUNA_MOD_SHIFT)))open_entry(ei);
     g.last_click_entry=ei;g.last_click_time=now;
 }
 
@@ -4123,29 +4190,48 @@ static void on_modal_ok(LunaElement *e){(void)e;confirm_modal();}
 static void file_dialog_finish(int accepted) {
     if (g_file_dialog_result) g_file_dialog_result->accepted = accepted;
     g_file_dialog_cancelled = accepted ? 0 : 1;
-    if (g.window) glfwSetWindowShouldClose(g.window, 1);
+    if (g_file_dialog_overlay_mode) {
+        LunaFileDialogCallback cb = g_file_dialog_callback;
+        void *ud = g_file_dialog_userdata;
+        LunaFileDialogResult result = g_file_dialog_result_storage;
+        if (g.id_overlay >= 0) {
+            luna_add_class(g.id_overlay, "hidden");
+            luna_pop_focus_trap(g.id_overlay);
+        }
+        g_file_dialog_open = 0;
+        g_file_dialog_overlay_mode = 0;
+        g_file_dialog_callback = NULL;
+        g_file_dialog_userdata = NULL;
+        g_file_dialog_result = NULL;
+        if (cb) cb(&result, ud);
+        /* The callback contract is "borrowed for the duration of the call". */
+        luna_file_dialog_result_free(&result);
+        memset(&g_file_dialog_result_storage, 0, sizeof(g_file_dialog_result_storage));
+        luna_platform_request_redraw();
+        return;
+    }
+    luna_app_quit();
 }
 static void file_dialog_overwrite_result(LunaWindowDialogResult result,const char*input,void*userdata){
     (void)input;(void)userdata;
     if(result!=LUNA_WINDOW_RESULT_OK){g_file_dialog_pending_save[0]=0;return;}
     if(!g_file_dialog_result||!g_file_dialog_pending_save[0])return;
-    safe_copy(g_file_dialog_result->paths[0],sizeof(g_file_dialog_result->paths[0]),g_file_dialog_pending_save);
-    g_file_dialog_result->count=1;
+    file_dialog_result_clear(g_file_dialog_result);
+    file_dialog_result_add(g_file_dialog_result,g_file_dialog_pending_save);
     g_file_dialog_pending_save[0]=0;
     file_dialog_finish(1);
 }
 static void file_dialog_accept(void) {
     if (g_file_dialog_config.mode == LUNA_FILE_DIALOG_MANAGER) return;
     if (!g_file_dialog_result) { file_dialog_finish(0); return; }
-    g_file_dialog_result->count = 0;
+    file_dialog_result_clear(g_file_dialog_result);
     if (g_file_dialog_config.mode == LUNA_FILE_DIALOG_SELECT_FOLDER) {
         int first = first_selected();
         const char* path = g.cwd;
         if (first >= 0 && g.entries[first].is_dir) path = g.entries[first].path;
-        safe_copy(g_file_dialog_result->paths[0], sizeof(g_file_dialog_result->paths[0]), path);
-        g_file_dialog_result->count = 1;
+        file_dialog_result_add(g_file_dialog_result, path);
     } else if (g_file_dialog_config.mode == LUNA_FILE_DIALOG_SAVE_FILE) {
-        int name_id = luna_get_element_by_id("file-dialog-name");
+        int name_id = luna_get_element_by_id("lfd-file-dialog-name");
         const char* name = name_id >= 0 ? luna_get_value(name_id) : NULL;
         char path[PATH_MAX];
         if (!name || !name[0]) { show_toast("ファイル名を入力してください"); return; }
@@ -4162,15 +4248,12 @@ static void file_dialog_accept(void) {
             if(overwrite_cancel>=0)luna_set_text(overwrite_cancel,"キャンセル");
             return;
         }
-        safe_copy(g_file_dialog_result->paths[0],sizeof(g_file_dialog_result->paths[0]),path);
-        g_file_dialog_result->count=1;
+        file_dialog_result_add(g_file_dialog_result,path);
     } else {
         int max_results = g_file_dialog_config.mode == LUNA_FILE_DIALOG_OPEN_FILES ? LUNA_FILE_DIALOG_MAX_RESULTS : 1;
         for (int i=0;i<g.entry_count && g_file_dialog_result->count<max_results;i++) {
             if (!g.entries[i].selected || g.entries[i].is_dir) continue;
-            safe_copy(g_file_dialog_result->paths[g_file_dialog_result->count],
-                      sizeof(g_file_dialog_result->paths[0]),g.entries[i].path);
-            g_file_dialog_result->count++;
+            file_dialog_result_add(g_file_dialog_result,g.entries[i].path);
         }
         if (g_file_dialog_result->count==0) { show_toast("ファイルを選択してください"); return; }
     }
@@ -4178,7 +4261,11 @@ static void file_dialog_accept(void) {
 }
 static void on_file_dialog_accept(LunaElement*e){(void)e;file_dialog_accept();}
 static void on_file_dialog_cancel(LunaElement*e){(void)e;file_dialog_finish(0);}
-static void on_close(LunaElement *e){(void)e;if(g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER)file_dialog_finish(0);else glfwSetWindowShouldClose(g.window,1);}
+static void on_close(LunaElement *e){
+    (void)e;
+    if(g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER) file_dialog_finish(0);
+    else luna_app_quit();
+}
 
 static void side_navigate_index(int index) {
     if(index<0||index>=9||!path_is_directory(g.side_paths[index])){
@@ -4199,9 +4286,9 @@ static void on_side_trash(LunaElement *e){(void)e;side_navigate_index(7);}
 static void on_side_root(LunaElement *e){(void)e;side_navigate_index(8);}
 static int parse_vol_slot(const char *id) {
     int s;
-    if(!id||strncmp(id,"vol",3)!=0||strlen(id)!=5)return -1;
-    if(id[3]<'0'||id[3]>'9'||id[4]<'0'||id[4]>'9')return -1;
-    s=(id[3]-'0')*10+(id[4]-'0');
+    if(!id||strncmp(id,"lfd-vol",7)!=0||strlen(id)!=9)return -1;
+    if(id[7]<'0'||id[7]>'9'||id[8]<'0'||id[8]>'9')return -1;
+    s=(id[7]-'0')*10+(id[8]-'0');
     return (s>=0&&s<MAX_VOLUMES)?s:-1;
 }
 static void on_volume(LunaElement *e){
@@ -4393,144 +4480,153 @@ static void register_handlers(void) {
     luna_register_js_handler("onFileDialogCancel",on_file_dialog_cancel);
 }
 
-static char *build_html(void) {
-    size_t cap=700000;char *h=calloc(1,cap);if(!h)return NULL;size_t n=0;
-#define APPEND(...) do{int z=snprintf(h+n,cap-n,__VA_ARGS__);if(z<0||(size_t)z>=cap-n){free(h);return NULL;}n+=(size_t)z;}while(0)
-    APPEND("<html><head><title>Luna Files</title></head><body><div id=\"app\" class=\"app luna-window-root\">");
-    if(g_file_dialog_config.client_chrome) APPEND("%s",luna_window_standard_titlebar_html());
-    APPEND("<div id=\"toolbar\" class=\"toolbar\">"
-      "<div class=\"navgroup\"><div id=\"btn-back\" class=\"tool\" onclick=\"onBack()\">‹</div><div id=\"btn-forward\" class=\"tool\" onclick=\"onForward()\">›</div><div class=\"tool\" onclick=\"onUp()\">⌃</div></div>"
+static int append_file_dialog_body(char *h, size_t cap, size_t *n, int standalone) {
+#define APPEND(...) do{int z=snprintf(h+*n,cap-*n,__VA_ARGS__);if(z<0||(size_t)z>=cap-*n)return 0;*n+=(size_t)z;}while(0)
+    APPEND("<div id=\"lfd-app\" class=\"lfd-shell\">");
+    if(standalone && g_file_dialog_config.client_chrome) APPEND("%s",luna_window_standard_titlebar_html());
+    APPEND("<div id=\"lfd-toolbar\" class=\"toolbar\">"
+      "<div class=\"navgroup\"><div id=\"lfd-btn-back\" class=\"tool\" onclick=\"onBack()\">‹</div><div id=\"lfd-btn-forward\" class=\"tool\" onclick=\"onForward()\">›</div><div class=\"tool\" onclick=\"onUp()\">⌃</div></div>"
       "<div class=\"tool responsive-hide-tiny\" onclick=\"onHome()\">⌂</div><div class=\"tool responsive-hide-narrow\" onclick=\"onReload()\">↻</div>"
-      "<input id=\"path\" class=\"location\" type=\"text\" placeholder=\"場所を入力\">"
-      "<input id=\"search\" class=\"search\" type=\"text\" placeholder=\"このフォルダーを検索\">"
+      "<input id=\"lfd-path\" class=\"location\" type=\"text\" placeholder=\"場所を入力\">"
+      "<input id=\"lfd-search\" class=\"search\" type=\"text\" placeholder=\"このフォルダーを検索\">"
       "<div class=\"viewgroup\"><div class=\"tool\" onclick=\"onGrid()\">▦</div><div class=\"tool\" onclick=\"onList()\">☰</div></div>"
-      "<div id=\"btn-hidden\" class=\"tool responsive-hide-tiny\" onclick=\"onHidden()\">◌</div><div id=\"btn-sort\" class=\"tool responsive-hide-tiny\" onclick=\"onSort()\">A↓</div>"
-      "<div class=\"tool\" onclick=\"onNewFolder()\">＋</div><div id=\"btn-paste\" class=\"tool\" onclick=\"onPaste()\">▣</div>"
-      "<div id=\"btn-settings\" class=\"tool\" onclick=\"onSettingsOpen()\">⚙</div>"
-      "</div><div class=\"workbench\"><div id=\"sidebar\" class=\"sidebar\">"
+      "<div id=\"lfd-btn-hidden\" class=\"tool responsive-hide-tiny\" onclick=\"onHidden()\">◌</div><div id=\"lfd-btn-sort\" class=\"tool responsive-hide-tiny\" onclick=\"onSort()\">A↓</div>"
+      "<div class=\"tool\" onclick=\"onNewFolder()\">＋</div><div id=\"lfd-btn-paste\" class=\"tool\" onclick=\"onPaste()\">▣</div>"
+      "<div id=\"lfd-btn-settings\" class=\"tool\" onclick=\"onSettingsOpen()\">⚙</div>"
+      "</div><div class=\"workbench\"><div id=\"lfd-sidebar\" class=\"sidebar\">"
       "<div class=\"side-label\">お気に入り</div>"
-      "<div id=\"side-home\" class=\"side-item\" onclick=\"onSideHome()\">⌂　ホーム</div>"
-      "<div id=\"side-desktop\" class=\"side-item\" onclick=\"onSideDesktop()\">▧　デスクトップ</div>"
-      "<div id=\"side-documents\" class=\"side-item\" onclick=\"onSideDocuments()\">◇　書類</div>"
-      "<div id=\"side-downloads\" class=\"side-item\" onclick=\"onSideDownloads()\">⇩　ダウンロード</div>"
-      "<div id=\"side-pictures\" class=\"side-item\" onclick=\"onSidePictures()\">▧　ピクチャ</div>"
-      "<div id=\"side-music\" class=\"side-item\" onclick=\"onSideMusic()\">♫　ミュージック</div>"
-      "<div id=\"side-videos\" class=\"side-item\" onclick=\"onSideVideos()\">▶　ビデオ</div>"
+      "<div id=\"lfd-side-home\" class=\"side-item\" onclick=\"onSideHome()\">⌂　ホーム</div>"
+      "<div id=\"lfd-side-desktop\" class=\"side-item\" onclick=\"onSideDesktop()\">▧　デスクトップ</div>"
+      "<div id=\"lfd-side-documents\" class=\"side-item\" onclick=\"onSideDocuments()\">◇　書類</div>"
+      "<div id=\"lfd-side-downloads\" class=\"side-item\" onclick=\"onSideDownloads()\">⇩　ダウンロード</div>"
+      "<div id=\"lfd-side-pictures\" class=\"side-item\" onclick=\"onSidePictures()\">▧　ピクチャ</div>"
+      "<div id=\"lfd-side-music\" class=\"side-item\" onclick=\"onSideMusic()\">♫　ミュージック</div>"
+      "<div id=\"lfd-side-videos\" class=\"side-item\" onclick=\"onSideVideos()\">▶　ビデオ</div>"
       "<div class=\"side-label\">場所</div>"
-      "<div id=\"side-trash\" class=\"side-item\" onclick=\"onSideTrash()\">♲　ごみ箱</div>"
-      "<div id=\"side-root\" class=\"side-item\" onclick=\"onSideRoot()\">◈　ファイルシステム</div>"
-      "<div id=\"side-devices-label\" class=\"side-label hidden\">デバイス</div>");
+      "<div id=\"lfd-side-trash\" class=\"side-item\" onclick=\"onSideTrash()\">♲　ごみ箱</div>"
+      "<div id=\"lfd-side-root\" class=\"side-item\" onclick=\"onSideRoot()\">◈　ファイルシステム</div>"
+      "<div id=\"lfd-side-devices-label\" class=\"side-label hidden\">デバイス</div>");
     for(int i=0;i<MAX_VOLUMES;i++)
-        APPEND("<div id=\"vol%02d\" class=\"side-item volume-item hidden\" onclick=\"onVolume()\"></div>",i);
-    APPEND("</div><div class=\"main\"><div class=\"subbar\"><div id=\"folder-title\" class=\"folder-title\">ホーム</div><div class=\"hint\">右クリックで操作メニュー　F4: ターミナル</div></div>"
-      "<div id=\"file-grid\" class=\"file-grid grid\" onclick=\"onBlank()\">");
-    for(int i=0;i<MAX_ITEMS;i++) APPEND("<div id=\"item%03d\" class=\"file-item grid-item hidden\" onclick=\"onItem()\"><div id=\"icon%03d\" class=\"file-icon\">◇</div><div id=\"name%03d\" class=\"file-name\"></div><div id=\"meta%03d\" class=\"file-meta\"></div></div>",i,i,i,i);
-    APPEND("<div id=\"empty\" class=\"empty hidden\">このフォルダーは空です</div></div><div id=\"status\" class=\"status\"></div></div></div>");
-    if(g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER){
+        APPEND("<div id=\"lfd-vol%02d\" class=\"side-item volume-item hidden\" onclick=\"onVolume()\"></div>",i);
+    APPEND("</div><div class=\"main\"><div class=\"subbar\"><div id=\"lfd-folder-title\" class=\"folder-title\">ホーム</div><div class=\"hint\">右クリックで操作メニュー　F4: ターミナル</div></div>"
+      "<div id=\"lfd-file-grid\" class=\"file-grid grid\" onclick=\"onBlank()\">");
+    for(int i=0;i<MAX_ITEMS;i++) APPEND("<div id=\"lfd-item%03d\" class=\"file-item grid-item hidden\" onclick=\"onItem()\"><div id=\"lfd-icon%03d\" class=\"file-icon\">◇</div><div id=\"lfd-name%03d\" class=\"file-name\"></div><div id=\"lfd-meta%03d\" class=\"file-meta\"></div></div>",i,i,i,i);
+    APPEND("<div id=\"lfd-empty\" class=\"empty hidden\">このフォルダーは空です</div></div><div id=\"lfd-status\" class=\"status\"></div></div></div>");
+    if((standalone && g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER) || !standalone){
         APPEND("<div class=\"file-dialog-actions\">");
-        if(g_file_dialog_config.mode==LUNA_FILE_DIALOG_SAVE_FILE)
-            APPEND("<input id=\"file-dialog-name\" class=\"file-dialog-name\" type=\"text\" placeholder=\"ファイル名\">");
-        APPEND("<div class=\"button\" onclick=\"onFileDialogCancel()\">キャンセル</div><div id=\"file-dialog-accept\" class=\"button primary\" onclick=\"onFileDialogAccept()\">開く</div></div>");
+        APPEND("<input id=\"lfd-file-dialog-name\" class=\"file-dialog-name hidden\" type=\"text\" placeholder=\"ファイル名\">");
+        APPEND("<div class=\"button\" onclick=\"onFileDialogCancel()\">キャンセル</div><div id=\"lfd-file-dialog-accept\" class=\"button primary\" onclick=\"onFileDialogAccept()\">開く</div></div>");
     }
-    APPEND("<div id=\"context\" class=\"context hidden\"><div class=\"menu-item\" onclick=\"onOpen()\">開く</div><div class=\"menu-item\" onclick=\"onOpenWith()\">アプリケーションで開く…</div><div class=\"menu-item\" onclick=\"onSetDefaultApp()\">この種類の既定アプリを設定…</div><div class=\"menu-item\" onclick=\"onCreateLauncher()\">ランチャーを作成…</div><div class=\"menu-item\" onclick=\"onEditDesktop()\">デスクトップエントリを編集…</div><div class=\"menu-item\" onclick=\"onTerminal()\">ここでターミナルを開く　F4</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onCopy()\">コピー　Ctrl+C</div><div class=\"menu-item\" onclick=\"onCut()\">切り取り　Ctrl+X</div><div class=\"menu-item\" onclick=\"onPaste()\">貼り付け　Ctrl+V</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onRename()\">名前を変更　F2</div><div class=\"menu-item danger\" onclick=\"onDelete()\">ごみ箱へ移動　Delete</div><div class=\"menu-item danger\" onclick=\"onPermanentDelete()\">完全に削除…　Shift+Delete</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onProperties()\">プロパティ</div></div>"
-      "<div id=\"volume-context\" class=\"volume-context hidden\">"
+    APPEND("<div id=\"lfd-context\" class=\"context hidden\"><div class=\"menu-item\" onclick=\"onOpen()\">開く</div><div class=\"menu-item\" onclick=\"onOpenWith()\">アプリケーションで開く…</div><div class=\"menu-item\" onclick=\"onSetDefaultApp()\">この種類の既定アプリを設定…</div><div class=\"menu-item\" onclick=\"onCreateLauncher()\">ランチャーを作成…</div><div class=\"menu-item\" onclick=\"onEditDesktop()\">デスクトップエントリを編集…</div><div class=\"menu-item\" onclick=\"onTerminal()\">ここでターミナルを開く　F4</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onCopy()\">コピー　Ctrl+C</div><div class=\"menu-item\" onclick=\"onCut()\">切り取り　Ctrl+X</div><div class=\"menu-item\" onclick=\"onPaste()\">貼り付け　Ctrl+V</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onRename()\">名前を変更　F2</div><div class=\"menu-item danger\" onclick=\"onDelete()\">ごみ箱へ移動　Delete</div><div class=\"menu-item danger\" onclick=\"onPermanentDelete()\">完全に削除…　Shift+Delete</div><div class=\"menu-sep\"></div><div class=\"menu-item\" onclick=\"onProperties()\">プロパティ</div></div>"
+      "<div id=\"lfd-volume-context\" class=\"volume-context hidden\">"
       "<div class=\"menu-item\" onclick=\"onVolumeOpen()\">開く / マウント</div>"
       "<div class=\"menu-item\" onclick=\"onVolumeUnmount()\">アンマウント</div>"
       "<div class=\"menu-item\" onclick=\"onVolumeEject()\">取り出す</div>"
       "<div class=\"menu-sep\"></div>"
       "<div class=\"menu-item\" onclick=\"onVolumeContextCancel()\">キャンセル</div>"
       "</div>"
-      "<div id=\"modal-wrap\" class=\"modal-wrap overlay-idle\"><div class=\"modal\"><div id=\"modal-title\" class=\"modal-title\"></div><div class=\"modal-info-stack\">");
+      "<div id=\"lfd-modal-wrap\" class=\"modal-wrap overlay-idle\"><div class=\"modal\"><div id=\"lfd-modal-title\" class=\"modal-title\"></div><div class=\"modal-info-stack\">");
     for(int i=0;i<MODAL_INFO_PARTS;i++)
-        APPEND("<div id=\"modal-info%d\" class=\"modal-info\"></div>",i);
-    APPEND("</div><input id=\"modal-input\" class=\"modal-input\" type=\"text\"><div class=\"modal-actions\"><div id=\"modal-cancel\" class=\"button\" onclick=\"onModalCancel()\">キャンセル</div><div id=\"modal-ok\" class=\"button primary\" onclick=\"onModalOk()\">OK</div></div></div></div>"
-      "<div id=\"open-with-wrap\" class=\"modal-wrap hidden\"><div class=\"modal open-with-modal\"><div class=\"modal-title\">アプリケーションで開く</div><div id=\"open-with-info\" class=\"modal-info\"></div><div id=\"open-app-list\" class=\"open-app-list\">");
-    for(int i=0;i<MAX_OPEN_APPS;i++) APPEND("<div id=\"openapp%02d\" class=\"app-choice hidden\" onclick=\"onOpenApp()\"></div>",i);
+        APPEND("<div id=\"lfd-modal-info%d\" class=\"modal-info\"></div>",i);
+    APPEND("</div><input id=\"lfd-modal-input\" class=\"modal-input\" type=\"text\"><div class=\"modal-actions\"><div id=\"lfd-modal-cancel\" class=\"button\" onclick=\"onModalCancel()\">キャンセル</div><div id=\"lfd-modal-ok\" class=\"button primary\" onclick=\"onModalOk()\">OK</div></div></div></div>"
+      "<div id=\"lfd-open-with-wrap\" class=\"modal-wrap hidden\"><div class=\"modal open-with-modal\"><div class=\"modal-title\">アプリケーションで開く</div><div id=\"lfd-open-with-info\" class=\"modal-info\"></div><div id=\"lfd-open-app-list\" class=\"open-app-list\">");
+    for(int i=0;i<MAX_OPEN_APPS;i++) APPEND("<div id=\"lfd-openapp%02d\" class=\"app-choice hidden\" onclick=\"onOpenApp()\"></div>",i);
     APPEND("</div><div class=\"modal-actions\"><div class=\"button\" onclick=\"onOpenWithCancel()\">キャンセル</div><div class=\"button primary\" onclick=\"onOpenWithDefault()\">既定で開く</div></div></div></div>"
-      "<div id=\"desktop-edit-wrap\" class=\"modal-wrap hidden\"><div class=\"modal desktop-edit-modal\">"
-      "<div id=\"desktop-edit-title\" class=\"modal-title\">デスクトップエントリ</div>"
-      "<div id=\"desktop-edit-hint\" class=\"desktop-edit-hint\"></div>"
+      "<div id=\"lfd-desktop-edit-wrap\" class=\"modal-wrap hidden\"><div class=\"modal desktop-edit-modal\">"
+      "<div id=\"lfd-desktop-edit-title\" class=\"modal-title\">デスクトップエントリ</div>"
+      "<div id=\"lfd-desktop-edit-hint\" class=\"desktop-edit-hint\"></div>"
       "<div class=\"desktop-edit-form\">"
-      "<div id=\"desktop-edit-type\" class=\"desktop-edit-toggle\" onclick=\"onDesktopEditType()\">種類</div>"
-      "<div class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">名前</div><input id=\"desktop-edit-name\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"表示名\"></div>"
-      "<div class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">コメント</div><input id=\"desktop-edit-comment\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"説明（任意）\"></div>"
-      "<div class=\"desktop-edit-row\"><div id=\"desktop-edit-exec-label\" class=\"desktop-edit-label\">コマンド (Exec)</div><input id=\"desktop-edit-exec\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"command %%f\"></div>"
-      "<div class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">アイコン</div><input id=\"desktop-edit-icon\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"theme-icon または ファイルパス\"></div>"
-      "<div id=\"desktop-edit-workdir-row\" class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">作業ディレクトリ (Path)</div><input id=\"desktop-edit-workdir\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"任意\"></div>"
-      "<div id=\"desktop-edit-terminal-row\" class=\"desktop-edit-row\"><div id=\"desktop-edit-terminal\" class=\"desktop-edit-toggle\" onclick=\"onDesktopEditTerminal()\">ターミナルで実行</div></div>"
-      "<div id=\"desktop-edit-filename-row\" class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">ファイル名</div><input id=\"desktop-edit-filename\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"launcher.desktop\"></div>"
+      "<div id=\"lfd-desktop-edit-type\" class=\"desktop-edit-toggle\" onclick=\"onDesktopEditType()\">種類</div>"
+      "<div class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">名前</div><input id=\"lfd-desktop-edit-name\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"表示名\"></div>"
+      "<div class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">コメント</div><input id=\"lfd-desktop-edit-comment\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"説明（任意）\"></div>"
+      "<div class=\"desktop-edit-row\"><div id=\"lfd-desktop-edit-exec-label\" class=\"desktop-edit-label\">コマンド (Exec)</div><input id=\"lfd-desktop-edit-exec\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"command %%f\"></div>"
+      "<div class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">アイコン</div><input id=\"lfd-desktop-edit-icon\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"theme-icon または ファイルパス\"></div>"
+      "<div id=\"lfd-desktop-edit-workdir-row\" class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">作業ディレクトリ (Path)</div><input id=\"lfd-desktop-edit-workdir\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"任意\"></div>"
+      "<div id=\"lfd-desktop-edit-terminal-row\" class=\"desktop-edit-row\"><div id=\"lfd-desktop-edit-terminal\" class=\"desktop-edit-toggle\" onclick=\"onDesktopEditTerminal()\">ターミナルで実行</div></div>"
+      "<div id=\"lfd-desktop-edit-filename-row\" class=\"desktop-edit-row\"><div class=\"desktop-edit-label\">ファイル名</div><input id=\"lfd-desktop-edit-filename\" class=\"desktop-edit-input\" type=\"text\" placeholder=\"launcher.desktop\"></div>"
       "</div>"
       "<div class=\"modal-actions\"><div class=\"button\" onclick=\"onDesktopEditCancel()\">キャンセル</div><div class=\"button primary\" onclick=\"onDesktopEditSave()\">保存</div></div>"
       "</div></div>"
-      "<div id=\"settings-wrap\" class=\"modal-wrap overlay-idle\"><div class=\"settings-panel\">"
+      "<div id=\"lfd-settings-wrap\" class=\"modal-wrap overlay-idle\"><div class=\"settings-panel\">"
       "<div class=\"settings-header\"><div class=\"modal-title\">設定</div><div class=\"settings-shortcut\">Ctrl+,</div></div>"
-      "<div id=\"settings-scroll\" class=\"settings-scroll\"><div class=\"settings-note\">外観と動作をここで変更できます。フォントの種類とカスタムフォントは、次回起動時に読み込まれます。</div>"
+      "<div id=\"lfd-settings-scroll\" class=\"settings-scroll\"><div class=\"settings-note\">外観と動作をここで変更できます。フォントの種類とカスタムフォントは、次回起動時に読み込まれます。</div>"
       "<div class=\"settings-section\">外観</div>"
-      "<div class=\"settings-row\" onclick=\"onSettingTheme()\"><div class=\"settings-name\">テーマ</div><div id=\"set-theme\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingAccent()\"><div class=\"settings-name\">アクセントカラー</div><div id=\"set-accent\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingFontFamily()\"><div class=\"settings-name\">フォントの種類</div><div id=\"set-font-family\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingCustomFont()\"><div class=\"settings-name\">カスタムフォント</div><div id=\"set-custom-font\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingFontSize()\"><div class=\"settings-name\">文字サイズ</div><div id=\"set-font-size\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingDensity()\"><div class=\"settings-name\">表示密度</div><div id=\"set-density\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingAnimations()\"><div class=\"settings-name\">アニメーション</div><div id=\"set-animations\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingTheme()\"><div class=\"settings-name\">テーマ</div><div id=\"lfd-set-theme\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingAccent()\"><div class=\"settings-name\">アクセントカラー</div><div id=\"lfd-set-accent\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingFontFamily()\"><div class=\"settings-name\">フォントの種類</div><div id=\"lfd-set-font-family\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingCustomFont()\"><div class=\"settings-name\">カスタムフォント</div><div id=\"lfd-set-custom-font\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingFontSize()\"><div class=\"settings-name\">文字サイズ</div><div id=\"lfd-set-font-size\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingDensity()\"><div class=\"settings-name\">表示密度</div><div id=\"lfd-set-density\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingAnimations()\"><div class=\"settings-name\">アニメーション</div><div id=\"lfd-set-animations\" class=\"settings-state\"></div></div>"
       "<div class=\"settings-section\">表示</div>"
-      "<div class=\"settings-row\" onclick=\"onSettingSidebar()\"><div class=\"settings-name\">サイドバー</div><div id=\"set-sidebar\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingSearch()\"><div class=\"settings-name\">検索欄</div><div id=\"set-search\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingStatus()\"><div class=\"settings-name\">ステータスバー</div><div id=\"set-status\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingGridDetails()\"><div class=\"settings-name\">アイコン表示の詳細</div><div id=\"set-grid-details\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingHidden()\"><div class=\"settings-name\">隠しファイル</div><div id=\"set-hidden\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingView()\"><div class=\"settings-name\">表示形式</div><div id=\"set-view\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingSort()\"><div class=\"settings-name\">並び順</div><div id=\"set-sort\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingDesc()\"><div class=\"settings-name\">並び方向</div><div id=\"set-desc\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingSidebar()\"><div class=\"settings-name\">サイドバー</div><div id=\"lfd-set-sidebar\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingSearch()\"><div class=\"settings-name\">検索欄</div><div id=\"lfd-set-search\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingStatus()\"><div class=\"settings-name\">ステータスバー</div><div id=\"lfd-set-status\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingGridDetails()\"><div class=\"settings-name\">アイコン表示の詳細</div><div id=\"lfd-set-grid-details\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingHidden()\"><div class=\"settings-name\">隠しファイル</div><div id=\"lfd-set-hidden\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingView()\"><div class=\"settings-name\">表示形式</div><div id=\"lfd-set-view\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingSort()\"><div class=\"settings-name\">並び順</div><div id=\"lfd-set-sort\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingDesc()\"><div class=\"settings-name\">並び方向</div><div id=\"lfd-set-desc\" class=\"settings-state\"></div></div>"
       "<div class=\"settings-section\">動作</div>"
-      "<div class=\"settings-row\" onclick=\"onSettingStartup()\"><div class=\"settings-name\">起動時のフォルダー</div><div id=\"set-startup\" class=\"settings-state\"></div></div>"
-      "<div class=\"settings-row\" onclick=\"onSettingTerminal()\"><div class=\"settings-name\">F4 ターミナル</div><div id=\"set-terminal\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingStartup()\"><div class=\"settings-name\">起動時のフォルダー</div><div id=\"lfd-set-startup\" class=\"settings-state\"></div></div>"
+      "<div class=\"settings-row\" onclick=\"onSettingTerminal()\"><div class=\"settings-name\">F4 ターミナル</div><div id=\"lfd-set-terminal\" class=\"settings-state\"></div></div>"
       "<div class=\"settings-note\">ファイルはXDGの既定アプリで開きます。右クリックからMIMEごとの関連付けを変更できます。</div></div>"
       "<div class=\"settings-footer\"><div class=\"button subtle\" onclick=\"onSettingsReset()\">初期設定に戻す</div><div class=\"settings-footer-right\"><div class=\"button primary\" onclick=\"onSettingsClose()\">閉じる</div></div></div></div></div>"
-      "<div id=\"toast\" class=\"toast hidden\"></div>");
-    APPEND("%s",luna_window_standard_overlay_html());
-    APPEND("</div></body></html>");
+      "<div id=\"lfd-toast\" class=\"toast hidden\"></div>");
+    if(standalone) APPEND("%s",luna_window_standard_overlay_html());
+    APPEND("</div>");
+#undef APPEND
+    return 1;
+}
+
+static char *build_html(void) {
+    size_t cap=700000;char *h=calloc(1,cap);if(!h)return NULL;size_t n=0;
+#define APPEND(...) do{int z=snprintf(h+n,cap-n,__VA_ARGS__);if(z<0||(size_t)z>=cap-n){free(h);return NULL;}n+=(size_t)z;}while(0)
+    APPEND("<html><head><title>Luna Files</title></head><body>");
+    if(!append_file_dialog_body(h,cap,&n,1)){free(h);return NULL;}
+    APPEND("</body></html>");
 #undef APPEND
     return h;
 }
 
 static void cache_ids(void) {
-    g.id_app=luna_get_element_by_id("app");g.id_toolbar=luna_get_element_by_id("toolbar");g.id_sidebar=luna_get_element_by_id("sidebar");
-    g.id_path=luna_get_element_by_id("path");g.id_search=luna_get_element_by_id("search");g.id_grid=luna_get_element_by_id("file-grid");
-    g.id_status=luna_get_element_by_id("status");g.id_title=luna_get_element_by_id("folder-title");g.id_context=luna_get_element_by_id("context");
-    g.id_side_devices_label=luna_get_element_by_id("side-devices-label");
-    g.id_volume_context=luna_get_element_by_id("volume-context");
-    g.id_modal=luna_get_element_by_id("modal-wrap");g.id_modal_title=luna_get_element_by_id("modal-title");g.id_modal_input=luna_get_element_by_id("modal-input");
-    g.id_modal_cancel=luna_get_element_by_id("modal-cancel");g.id_modal_ok=luna_get_element_by_id("modal-ok");
+    g.id_overlay=luna_get_element_by_id("lfd-overlay");
+    g.id_app=luna_get_element_by_id("lfd-app");g.id_toolbar=luna_get_element_by_id("lfd-toolbar");g.id_sidebar=luna_get_element_by_id("lfd-sidebar");
+    g.id_path=luna_get_element_by_id("lfd-path");g.id_search=luna_get_element_by_id("lfd-search");g.id_grid=luna_get_element_by_id("lfd-file-grid");
+    g.id_status=luna_get_element_by_id("lfd-status");g.id_title=luna_get_element_by_id("lfd-folder-title");g.id_context=luna_get_element_by_id("lfd-context");
+    g.id_side_devices_label=luna_get_element_by_id("lfd-side-devices-label");
+    g.id_volume_context=luna_get_element_by_id("lfd-volume-context");
+    g.id_modal=luna_get_element_by_id("lfd-modal-wrap");g.id_modal_title=luna_get_element_by_id("lfd-modal-title");g.id_modal_input=luna_get_element_by_id("lfd-modal-input");
+    g.id_modal_cancel=luna_get_element_by_id("lfd-modal-cancel");g.id_modal_ok=luna_get_element_by_id("lfd-modal-ok");
     for(int i=0;i<MODAL_INFO_PARTS;i++){
-        char id[32];snprintf(id,sizeof(id),"modal-info%d",i);
+        char id[32];snprintf(id,sizeof(id),"lfd-modal-info%d",i);
         g.id_modal_info_parts[i]=luna_get_element_by_id(id);
     }
-    g.id_modal_info=g.id_modal_info_parts[0];g.id_open_with=luna_get_element_by_id("open-with-wrap");g.id_open_with_info=luna_get_element_by_id("open-with-info");g.id_open_app_list=luna_get_element_by_id("open-app-list");
-    g.id_desktop_edit=luna_get_element_by_id("desktop-edit-wrap");
-    g.id_desktop_edit_title=luna_get_element_by_id("desktop-edit-title");
-    g.id_desktop_edit_hint=luna_get_element_by_id("desktop-edit-hint");
-    g.id_desktop_edit_type=luna_get_element_by_id("desktop-edit-type");
-    g.id_desktop_edit_name=luna_get_element_by_id("desktop-edit-name");
-    g.id_desktop_edit_comment=luna_get_element_by_id("desktop-edit-comment");
-    g.id_desktop_edit_exec_label=luna_get_element_by_id("desktop-edit-exec-label");
-    g.id_desktop_edit_exec=luna_get_element_by_id("desktop-edit-exec");
-    g.id_desktop_edit_icon=luna_get_element_by_id("desktop-edit-icon");
-    g.id_desktop_edit_workdir_row=luna_get_element_by_id("desktop-edit-workdir-row");
-    g.id_desktop_edit_workdir=luna_get_element_by_id("desktop-edit-workdir");
-    g.id_desktop_edit_terminal_row=luna_get_element_by_id("desktop-edit-terminal-row");
-    g.id_desktop_edit_terminal=luna_get_element_by_id("desktop-edit-terminal");
-    g.id_desktop_edit_filename_row=luna_get_element_by_id("desktop-edit-filename-row");
-    g.id_desktop_edit_filename=luna_get_element_by_id("desktop-edit-filename");
-    g.id_toast=luna_get_element_by_id("toast");g.id_btn_back=luna_get_element_by_id("btn-back");
-    g.id_btn_forward=luna_get_element_by_id("btn-forward");g.id_btn_paste=luna_get_element_by_id("btn-paste");g.id_btn_hidden=luna_get_element_by_id("btn-hidden");g.id_btn_sort=luna_get_element_by_id("btn-sort");
-    g.id_btn_settings=luna_get_element_by_id("btn-settings");g.id_settings=luna_get_element_by_id("settings-wrap");g.id_settings_scroll=luna_get_element_by_id("settings-scroll");
-    g.id_set_sidebar=luna_get_element_by_id("set-sidebar");g.id_set_search=luna_get_element_by_id("set-search");g.id_set_hidden=luna_get_element_by_id("set-hidden");
-    g.id_set_view=luna_get_element_by_id("set-view");g.id_set_sort=luna_get_element_by_id("set-sort");g.id_set_desc=luna_get_element_by_id("set-desc");
-    g.id_set_font_size=luna_get_element_by_id("set-font-size");g.id_set_font_family=luna_get_element_by_id("set-font-family");g.id_set_custom_font=luna_get_element_by_id("set-custom-font");
-    g.id_set_density=luna_get_element_by_id("set-density");g.id_set_theme=luna_get_element_by_id("set-theme");g.id_set_accent=luna_get_element_by_id("set-accent");
-    g.id_set_status=luna_get_element_by_id("set-status");g.id_set_grid_details=luna_get_element_by_id("set-grid-details");g.id_set_animations=luna_get_element_by_id("set-animations");
-    g.id_set_startup=luna_get_element_by_id("set-startup");g.id_set_terminal=luna_get_element_by_id("set-terminal");
+    g.id_modal_info=g.id_modal_info_parts[0];g.id_open_with=luna_get_element_by_id("lfd-open-with-wrap");g.id_open_with_info=luna_get_element_by_id("lfd-open-with-info");g.id_open_app_list=luna_get_element_by_id("lfd-open-app-list");
+    g.id_desktop_edit=luna_get_element_by_id("lfd-desktop-edit-wrap");
+    g.id_desktop_edit_title=luna_get_element_by_id("lfd-desktop-edit-title");
+    g.id_desktop_edit_hint=luna_get_element_by_id("lfd-desktop-edit-hint");
+    g.id_desktop_edit_type=luna_get_element_by_id("lfd-desktop-edit-type");
+    g.id_desktop_edit_name=luna_get_element_by_id("lfd-desktop-edit-name");
+    g.id_desktop_edit_comment=luna_get_element_by_id("lfd-desktop-edit-comment");
+    g.id_desktop_edit_exec_label=luna_get_element_by_id("lfd-desktop-edit-exec-label");
+    g.id_desktop_edit_exec=luna_get_element_by_id("lfd-desktop-edit-exec");
+    g.id_desktop_edit_icon=luna_get_element_by_id("lfd-desktop-edit-icon");
+    g.id_desktop_edit_workdir_row=luna_get_element_by_id("lfd-desktop-edit-workdir-row");
+    g.id_desktop_edit_workdir=luna_get_element_by_id("lfd-desktop-edit-workdir");
+    g.id_desktop_edit_terminal_row=luna_get_element_by_id("lfd-desktop-edit-terminal-row");
+    g.id_desktop_edit_terminal=luna_get_element_by_id("lfd-desktop-edit-terminal");
+    g.id_desktop_edit_filename_row=luna_get_element_by_id("lfd-desktop-edit-filename-row");
+    g.id_desktop_edit_filename=luna_get_element_by_id("lfd-desktop-edit-filename");
+    g.id_toast=luna_get_element_by_id("lfd-toast");g.id_btn_back=luna_get_element_by_id("lfd-btn-back");
+    g.id_btn_forward=luna_get_element_by_id("lfd-btn-forward");g.id_btn_paste=luna_get_element_by_id("lfd-btn-paste");g.id_btn_hidden=luna_get_element_by_id("lfd-btn-hidden");g.id_btn_sort=luna_get_element_by_id("lfd-btn-sort");
+    g.id_btn_settings=luna_get_element_by_id("lfd-btn-settings");g.id_settings=luna_get_element_by_id("lfd-settings-wrap");g.id_settings_scroll=luna_get_element_by_id("lfd-settings-scroll");
+    g.id_set_sidebar=luna_get_element_by_id("lfd-set-sidebar");g.id_set_search=luna_get_element_by_id("lfd-set-search");g.id_set_hidden=luna_get_element_by_id("lfd-set-hidden");
+    g.id_set_view=luna_get_element_by_id("lfd-set-view");g.id_set_sort=luna_get_element_by_id("lfd-set-sort");g.id_set_desc=luna_get_element_by_id("lfd-set-desc");
+    g.id_set_font_size=luna_get_element_by_id("lfd-set-font-size");g.id_set_font_family=luna_get_element_by_id("lfd-set-font-family");g.id_set_custom_font=luna_get_element_by_id("lfd-set-custom-font");
+    g.id_set_density=luna_get_element_by_id("lfd-set-density");g.id_set_theme=luna_get_element_by_id("lfd-set-theme");g.id_set_accent=luna_get_element_by_id("lfd-set-accent");
+    g.id_set_status=luna_get_element_by_id("lfd-set-status");g.id_set_grid_details=luna_get_element_by_id("lfd-set-grid-details");g.id_set_animations=luna_get_element_by_id("lfd-set-animations");
+    g.id_set_startup=luna_get_element_by_id("lfd-set-startup");g.id_set_terminal=luna_get_element_by_id("lfd-set-terminal");
 }
 
 static int validate_ui_ids(void) {
@@ -4545,98 +4641,56 @@ static int validate_ui_ids(void) {
     return 1;
 }
 
-static void cursor_cb(GLFWwindow *w,double x,double y){
-    if(g_window_drag_mode&&glfwGetMouseButton(w,GLFW_MOUSE_BUTTON_LEFT)==GLFW_PRESS){
-        int wx,wy,ww,wh;
-        glfwGetWindowPos(w,&wx,&wy);
-        glfwGetWindowSize(w,&ww,&wh);
-        if(g_window_drag_mode==1){
-            int dx=(int)(x-g_window_drag_anchor_x);
-            int dy=(int)(y-g_window_drag_anchor_y);
-            if(dx||dy)glfwSetWindowPos(w,wx+dx,wy+dy);
-        }else{
-            int edge=g_window_resize_edges;
-            int dx_left=(int)(x-g_window_drag_anchor_x);
-            int dy_top=(int)(y-g_window_drag_anchor_y);
-            int dx_right=(int)(x-g_window_drag_last_x);
-            int dy_bottom=(int)(y-g_window_drag_last_y);
-            int nx=wx,ny=wy,nw=ww,nh=wh;
-            if(edge&LUNA_RESIZE_EDGE_LEFT){nx+=dx_left;nw-=dx_left;}
-            if(edge&LUNA_RESIZE_EDGE_TOP){ny+=dy_top;nh-=dy_top;}
-            if(edge&LUNA_RESIZE_EDGE_RIGHT)nw+=dx_right;
-            if(edge&LUNA_RESIZE_EDGE_BOTTOM)nh+=dy_bottom;
-            if(nw<MIN_WINDOW_W){if(edge&LUNA_RESIZE_EDGE_LEFT)nx-=MIN_WINDOW_W-nw;nw=MIN_WINDOW_W;}
-            if(nh<MIN_WINDOW_H){if(edge&LUNA_RESIZE_EDGE_TOP)ny-=MIN_WINDOW_H-nh;nh=MIN_WINDOW_H;}
-            if(nx!=wx||ny!=wy)glfwSetWindowPos(w,nx,ny);
-            if(nw!=ww||nh!=wh)glfwSetWindowSize(w,nw,nh);
-            if(edge&LUNA_RESIZE_EDGE_RIGHT)g_window_drag_last_x=x;
-            if(edge&LUNA_RESIZE_EDGE_BOTTOM)g_window_drag_last_y=y;
-        }
-    }
+/*
+ * Input hooks (LunaAppConfig.on_*).  Client-side window move/resize is gone:
+ * both are compositor grabs now via luna_platform_begin_move/begin_resize, so
+ * the dialog no longer chases the pointer with SetWindowPos — which never
+ * worked on Wayland anyway.
+ */
+static int cursor_cb(double x,double y,void *ud){
+    (void)ud;
     apply_grid_scroll();
     luna_mouse_move(x,y);
-
-    /* Mouse movement changes the file-grid position only while its scrollbar
-       thumb is being dragged.  Ordinary hover movement never writes it. */
-    if(glfwGetMouseButton(g.window,GLFW_MOUSE_BUTTON_LEFT)==GLFW_PRESS)
+    /* The file grid's scroll position only moves while its scrollbar thumb is
+       dragged; ordinary hover never writes it. */
+    if(luna_platform_get_mouse_button(LUNA_MOUSE_BUTTON_LEFT)==LUNA_PRESS)
         store_grid_scroll_if_changed();
     request_redraw();
+    return 1;
 }
-static void mouse_cb(GLFWwindow *w,int button,int action,int mods){
-    double x,y;
-    (void)w;
-    glfwGetCursorPos(g.window,&x,&y);
+static int mouse_cb(int button,int action,int mods,double x,double y,void *ud){
+    (void)ud;
     apply_grid_scroll();
     luna_mouse_move(x,y);
     luna_mouse_button(button,action,mods,x,y);
-    if(button==GLFW_MOUSE_BUTTON_LEFT&&action==GLFW_RELEASE){
-        g_window_drag_mode=0;
-        g_window_resize_edges=LUNA_RESIZE_EDGE_NONE;
-    }
-
-    /* A left press may page the scrollbar track, and a release completes a
-       thumb drag.  File clicks leave the values unchanged and are not saved. */
-    if(button==GLFW_MOUSE_BUTTON_LEFT)store_grid_scroll_if_changed();
+    /* A left press may page the scrollbar track and a release completes a thumb
+       drag; plain file clicks leave the values unchanged and are not saved. */
+    if(button==LUNA_MOUSE_BUTTON_LEFT)store_grid_scroll_if_changed();
     request_redraw();
+    return 1;
 }
-static void scroll_cb(GLFWwindow *w,double x,double y){
-    (void)w;
+static int scroll_cb(double x,double y,void *ud){
+    (void)ud;
     apply_grid_scroll();
     luna_scroll(x,y);
     store_grid_scroll_if_changed();
     request_redraw();
+    return 1;
 }
-static void char_cb(GLFWwindow *w,unsigned int cp){(void)w;luna_char(cp);request_redraw();}
-static void window_size_cb(GLFWwindow *w,int width,int height){
-    (void)w;
-    if(width<1||height<1)return;
-    g.pending_window_width=width;
-    g.pending_window_height=height;
-    g.resize_pending=1;
-    request_redraw();
-}
-static void framebuffer_cb(GLFWwindow *w,int width,int height){
-    (void)w;(void)width;(void)height;
-    g.framebuffer_dirty=1;
-    request_redraw();
+static int key_cb(int key,int scancode,int action,int mods,void *ud){
+    (void)ud;
+    file_dialog_handle_key(key,scancode,action,mods);
+    return 1;
 }
 
 static void apply_pending_resize(void) {
-    if(!g.resize_pending&&!g.framebuffer_dirty)return;
-
-    /* Read the final GLFW sizes instead of trusting callback ordering.  On
-       Wayland and HiDPI displays the logical window and framebuffer callbacks
-       may arrive separately while the user is dragging the window edge. */
-    int width=0,height=0;
-    glfwGetWindowSize(g.window,&width,&height);
-    if(width<1||height<1){
-        width=g.pending_window_width;
-        height=g.pending_window_height;
-    }
+    /* The host owns luna_resize(); this only has to notice the result and
+       refresh the layout classes that depend on the window size. */
+    int width=(int)luna_window_width,height=(int)luna_window_height;
+    if(width==g.window_width&&height==g.window_height&&!g.framebuffer_dirty)return;
     if(width>0&&height>0){
         g.window_width=width;
         g.window_height=height;
-        luna_resize((float)width,(float)height);
         apply_display_classes();
     }
 
@@ -4673,24 +4727,179 @@ static void move_selection(int delta) {
     g.anchor_entry=entry;
     refresh_file_visuals();
 
-    char id[32];snprintf(id,sizeof(id),"item%03d",next_slot);
+    char id[32];snprintf(id,sizeof(id),"lfd-item%03d",next_slot);
     int item=luna_get_element_by_id(id);
     scroll_into_view(item);
     request_redraw();
 }
 
-static void key_cb(GLFWwindow *w,int key,int scancode,int action,int mods) {
+static void file_dialog_configure_actions(void) {
+    int name_id = luna_get_element_by_id("lfd-file-dialog-name");
+    if (g_file_dialog_config.mode == LUNA_FILE_DIALOG_SAVE_FILE) {
+        if (name_id >= 0) {
+            luna_remove_class(name_id, "hidden");
+            if (g_file_dialog_config.suggested_name)
+                luna_set_value(name_id, g_file_dialog_config.suggested_name);
+        }
+    } else if (name_id >= 0) {
+        luna_add_class(name_id, "hidden");
+    }
+    if (g_file_dialog_config.mode != LUNA_FILE_DIALOG_MANAGER) {
+        int accept_id = luna_get_element_by_id("lfd-file-dialog-accept");
+        const char *label = g_file_dialog_config.accept_label ? g_file_dialog_config.accept_label :
+            (g_file_dialog_config.mode == LUNA_FILE_DIALOG_SAVE_FILE ? "保存" :
+             g_file_dialog_config.mode == LUNA_FILE_DIALOG_SELECT_FOLDER ? "選択" : "開く");
+        if (accept_id >= 0) luna_set_text(accept_id, label);
+    }
+}
+
+/* Reset dialog session fields.  Does not touch the Luna DOM — call cache_ids()
+ * (and create/parse HTML for standalone run) before file_dialog_open_path(). */
+static void file_dialog_reset_session(void) {
+    void *keep_window = g.window;
+    g_file_dialog_pending_save[0] = 0;
+    g_file_dialog_search_prev[0] = 0;
+    memset(&g, 0, sizeof(g));
+    g.window = keep_window;
+    g.anchor_entry = -1;
+    g.context_entry = -1;
+    g.modal_target = -1;
+    g.open_with_target = -1;
+    g.volume_context = -1;
+    g.history_pos = -1;
+    load_settings();
+    if (g_file_dialog_config.mode != LUNA_FILE_DIALOG_MANAGER) {
+        LunaWindowTheme system_theme;
+        luna_window_theme_load_system(&system_theme);
+        g.theme = system_theme.mode == LUNA_WINDOW_THEME_DARK ? 1 : 0;
+    }
+    if (g_file_dialog_config.width > 0) g.window_width = g_file_dialog_config.width;
+    else g.window_width = 920;
+    if (g_file_dialog_config.height > 0) g.window_height = g_file_dialog_config.height;
+    else g.window_height = 620;
+    apply_font_environment();
+    g.redraw = 1;
+}
+
+static void file_dialog_open_path(void) {
+    build_sidebar_paths();
+    refresh_sidebar_visibility();
+    apply_display_classes();
+    const char *start = g_file_dialog_config.initial_path && g_file_dialog_config.initial_path[0] ?
+        g_file_dialog_config.initial_path : home_dir();
+    navigate(start, 1);
+    clipboard_import();
+    update_toolbar_state();
+    file_dialog_configure_actions();
+    g.redraw = 1;
+}
+
+void luna_file_dialog_prepare(void) {
+    if (g_file_dialog_prepared) return;
+    register_handlers();
+    cache_ids();
+    luna_wire_onclick_handlers();
+    g_file_dialog_prepared = 1;
+}
+
+int luna_file_dialog_show(const LunaFileDialogConfig* config,
+                          LunaFileDialogCallback callback,
+                          void* userdata) {
+    if (!g_file_dialog_prepared) return -1;
+    if (g.id_overlay < 0) {
+        cache_ids();
+        if (g.id_overlay < 0) return -1;
+    }
+    if (g_file_dialog_open) return -2;
+
+    memset(&g_file_dialog_config, 0, sizeof(g_file_dialog_config));
+    if (config) g_file_dialog_config = *config;
+    if (!g_file_dialog_config.title) g_file_dialog_config.title = "ファイルを選択";
+    if (g_file_dialog_config.mode == LUNA_FILE_DIALOG_MANAGER)
+        g_file_dialog_config.mode = LUNA_FILE_DIALOG_OPEN_FILE;
+
+    g_file_dialog_overlay_mode = 1;
+    g_file_dialog_open = 1;
+    g_file_dialog_callback = callback;
+    g_file_dialog_userdata = userdata;
+    g_file_dialog_cancelled = 0;
+    memset(&g_file_dialog_result_storage, 0, sizeof(g_file_dialog_result_storage));
+    g_file_dialog_result = &g_file_dialog_result_storage;
+
+    file_dialog_reset_session();
+    cache_ids();
+    if (g.id_overlay < 0) {
+        g_file_dialog_open = 0;
+        g_file_dialog_overlay_mode = 0;
+        g_file_dialog_callback = NULL;
+        g_file_dialog_userdata = NULL;
+        g_file_dialog_result = NULL;
+        return -1;
+    }
+    file_dialog_open_path();
+
+    luna_remove_class(g.id_overlay, "hidden");
+    luna_push_focus_trap(g.id_overlay, NULL, 0);
+    if (g.id_app >= 0) luna_update_element_style(g.id_app);
+    luna_update_element_style(g.id_overlay);
+    luna_mark_layout_dirty();
+    luna_platform_request_redraw();
+    return 0;
+}
+
+void luna_file_dialog_render(int fbw, int fbh) {
+    if (!g_file_dialog_open || g.id_overlay < 0) return;
+    if (!luna_element_visible(g.id_overlay)) return;
+    float ww = luna_window_width > 1.0f ? luna_window_width : (float)fbw;
+    float hh = luna_window_height > 1.0f ? luna_window_height : (float)fbh;
+    /* Always paint the fullscreen overlay host (dimmer + panel). Using the
+     * inner shell size would clip the backdrop and leave host content on top. */
+    luna_render_region(g.id_overlay, fbw, fbh, 0, 0, ww, hh);
+}
+
+void luna_file_dialog_tick(double dt) {
+    if (!g_file_dialog_open) return;
+    double now = luna_platform_time();
+    if (g.volumes_next_refresh <= 0.0 || now >= g.volumes_next_refresh)
+        refresh_volumes(0);
+    const char *sv = luna_get_value(g.id_search);
+    if (sv && strcmp(sv, g_file_dialog_search_prev)) {
+        safe_copy(g_file_dialog_search_prev, sizeof(g_file_dialog_search_prev), sv);
+        safe_copy(g.search, sizeof(g.search), sv);
+        render_files();
+    }
+    if (g.toast_until > 0 && now >= g.toast_until) {
+        luna_add_class(g.id_toast, "hidden");
+        g.toast_until = 0;
+        request_redraw();
+    }
+    (void)dt;
+}
+
+int luna_file_dialog_is_open(void) { return g_file_dialog_open; }
+
+static int file_dialog_handle_key(int key, int scancode, int action, int mods) {
     apply_grid_scroll();
     int consumed = 0;
-    if(action==GLFW_PRESS||action==GLFW_REPEAT){
+    if(action==LUNA_PRESS||action==LUNA_REPEAT){
         int focused=g_focused_element_idx;
-        if(action==GLFW_PRESS && key==GLFW_KEY_TAB && focused==g.id_path &&
-           !(mods&(GLFW_MOD_SHIFT|GLFW_MOD_CONTROL|GLFW_MOD_ALT|GLFW_MOD_SUPER))){
+        if(action==LUNA_PRESS && key==LUNA_KEY_TAB && focused==g.id_path &&
+           !(mods&(LUNA_MOD_SHIFT|LUNA_MOD_CONTROL|LUNA_MOD_ALT|LUNA_MOD_SUPER))){
             complete_path_input();
             consumed = 1;
         }
-        else if(key==GLFW_KEY_ESCAPE){if(g.settings_open)close_settings_dialog();else if(g.desktop_edit_open)close_desktop_edit_dialog();else if(g.open_with_open)close_open_with_dialog();else if(g.modal_kind)close_modal();else if(g.volume_context>=0)hide_volume_context();else hide_context();}
-        else if(key==GLFW_KEY_ENTER||key==GLFW_KEY_KP_ENTER){
+        else if(key==LUNA_KEY_ESCAPE){
+            if(g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER && !g.settings_open && !g.desktop_edit_open &&
+               !g.open_with_open && !g.modal_kind && g.volume_context<0 && !luna_element_visible(g.id_context))
+                file_dialog_finish(0);
+            else if(g.settings_open)close_settings_dialog();
+            else if(g.desktop_edit_open)close_desktop_edit_dialog();
+            else if(g.open_with_open)close_open_with_dialog();
+            else if(g.modal_kind)close_modal();
+            else if(g.volume_context>=0)hide_volume_context();
+            else hide_context();
+        }
+        else if(key==LUNA_KEY_ENTER||key==LUNA_KEY_KP_ENTER){
             if(g.settings_open)close_settings_dialog();
             else if(g.desktop_edit_open)save_desktop_edit_dialog();
             else if(g.open_with_open){}
@@ -4698,220 +4907,136 @@ static void key_cb(GLFWwindow *w,int key,int scancode,int action,int mods) {
             else if(focused==g.id_path){const char *p=luna_get_value(g.id_path);navigate(p,1);}
             else if(focused!=g.id_search){int i=first_selected();if(i>=0)open_entry(i);}
         }
-        else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_COMMA)open_settings_dialog();
+        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_COMMA)open_settings_dialog();
         else if(g.settings_open||g.open_with_open||g.desktop_edit_open){}
-        else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_C&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(0);
-        else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_X&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(1);
-        else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_V&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)paste_clipboard();
-        else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_A&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input){for(int i=0;i<g.entry_count;i++)g.entries[i].selected=1;refresh_file_visuals();}
-        else if((mods&GLFW_MOD_CONTROL)&&key==GLFW_KEY_L){reset_path_completion();luna_set_value(g.id_path,g.cwd);luna_focus_element(g.id_path);show_toast("場所バーを選択しました");}
-        else if(key==GLFW_KEY_F2){int i=first_selected();if(i>=0)open_modal(2,i);}
-        else if(action==GLFW_PRESS&&key==GLFW_KEY_F4)open_terminal_here();
-        else if(key==GLFW_KEY_DELETE&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input){if(mods&GLFW_MOD_SHIFT){int i=first_selected();if(i>=0)open_modal(7,i);}else delete_selected();}
-        else if(key==GLFW_KEY_BACKSPACE&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)on_back(NULL);
-        else if(key==GLFW_KEY_UP&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)move_selection(-1);
-        else if(key==GLFW_KEY_DOWN&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)move_selection(1);
+        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_C&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(0);
+        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_X&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(1);
+        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_V&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)paste_clipboard();
+        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_A&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input){for(int i=0;i<g.entry_count;i++)g.entries[i].selected=1;refresh_file_visuals();}
+        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_L){reset_path_completion();luna_set_value(g.id_path,g.cwd);luna_focus_element(g.id_path);show_toast("場所バーを選択しました");}
+        else if(key==LUNA_KEY_F2){int i=first_selected();if(i>=0)open_modal(2,i);}
+        else if(action==LUNA_PRESS&&key==LUNA_KEY_F4)open_terminal_here();
+        else if(key==LUNA_KEY_DELETE&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input){if(mods&LUNA_MOD_SHIFT){int i=first_selected();if(i>=0)open_modal(7,i);}else delete_selected();}
+        else if(key==LUNA_KEY_BACKSPACE&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)on_back(NULL);
+        else if(key==LUNA_KEY_UP&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)move_selection(-1);
+        else if(key==LUNA_KEY_DOWN&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)move_selection(1);
     }
     if(!consumed) luna_key(key,scancode,action,mods);
 
-    /* Only keys which can move a scroll container are allowed to update the
-       saved file-grid position.  Escape/Enter/dialog actions never write it. */
-    if((action==GLFW_PRESS||action==GLFW_REPEAT) &&
-       (key==GLFW_KEY_UP||key==GLFW_KEY_DOWN||
-        key==GLFW_KEY_PAGE_UP||key==GLFW_KEY_PAGE_DOWN||
-        key==GLFW_KEY_HOME||key==GLFW_KEY_END))
+    if((action==LUNA_PRESS||action==LUNA_REPEAT) &&
+       (key==LUNA_KEY_UP||key==LUNA_KEY_DOWN||
+        key==LUNA_KEY_PAGE_UP||key==LUNA_KEY_PAGE_DOWN||
+        key==LUNA_KEY_HOME||key==LUNA_KEY_END))
         store_grid_scroll_if_changed();
     request_redraw();
-    (void)w;
+    return 1;
 }
 
-static void platform_cursor(int type){GLFWcursor*c=NULL;if(type==1)c=g_hand_cursor;else if(type==2)c=g_cursor_ibeam;else if(type==3)c=g_cursor_crosshair;else if(type==4)c=g_cursor_hresize;else if(type==5)c=g_cursor_vresize;if(g.window)glfwSetCursor(g.window,c);}
-static void platform_close(void){glfwSetWindowShouldClose(g.window,1);}
-static void platform_iconify(void){glfwIconifyWindow(g.window);}
-static void platform_maximize(void){if(glfwGetWindowAttrib(g.window,GLFW_MAXIMIZED))glfwRestoreWindow(g.window);else glfwMaximizeWindow(g.window);}
-static void platform_begin_move(void){
-    if(!g.window)return;
-#ifdef LUNA_WM_CLIENT_H
-    /* Prefer compositor grab on Luna/Wayland; glfwSetWindowPos is unavailable. */
-    if(luna_wm_client_available() && luna_wm_client_start_move(g.window))
-        return;
-#endif
-    glfwGetCursorPos(g.window,&g_window_drag_anchor_x,&g_window_drag_anchor_y);
-    g_window_drag_last_x=g_window_drag_anchor_x;
-    g_window_drag_last_y=g_window_drag_anchor_y;
-    g_window_drag_mode=1;
-    g_window_resize_edges=LUNA_RESIZE_EDGE_NONE;
+int luna_file_dialog_handle_key(int key, int scancode, int action, int mods) {
+    if (!g_file_dialog_open) return 0;
+    file_dialog_handle_key(key, scancode, action, mods);
+    return 1;
 }
-static void platform_begin_resize(int edge){
-    if(!g.window||edge==LUNA_RESIZE_EDGE_NONE)return;
-    glfwGetCursorPos(g.window,&g_window_drag_anchor_x,&g_window_drag_anchor_y);
-    g_window_drag_last_x=g_window_drag_anchor_x;
-    g_window_drag_last_y=g_window_drag_anchor_y;
-    g_window_drag_mode=2;
-    g_window_resize_edges=edge;
+
+static void file_dialog_app_init(void *userdata) {
+    (void)userdata;
+    register_handlers();
+    luna_parse_css(luna_window_standard_css());
+    luna_parse_css(UI_CSS);
+    {
+        char *html = build_html();
+        if (!html) { log_error("UI allocation failed"); luna_app_quit(); return; }
+        luna_parse_html(html);
+        free(html);
+    }
+    {
+        static const LunaWindowParts wp = { .root = "lfd-app" };
+        LunaWindowConfig wc = {0};
+        wc.parts = &wp;
+        wc.title = g_file_dialog_config.title;
+        wc.chrome = g_file_dialog_config.client_chrome ? LUNA_WINDOW_CHROME_CLIENT
+                                                       : LUNA_WINDOW_CHROME_AUTO;
+        wc.theme = g_file_dialog_config.mode == LUNA_FILE_DIALOG_MANAGER
+                       ? (g.theme ? LUNA_WINDOW_THEME_DARK : LUNA_WINDOW_THEME_LIGHT)
+                       : LUNA_WINDOW_THEME_SYSTEM;
+        luna_window_bind(&wc);
+    }
+    luna_wire_onclick_handlers();
+    cache_ids();
+    g_file_dialog_prepared = 1;
+    if (!validate_ui_ids()) { luna_app_quit(); return; }
+    luna_platform_set_size_limits(MIN_WINDOW_W, MIN_WINDOW_H,
+                                  LUNA_DONT_CARE, LUNA_DONT_CARE);
+    file_dialog_open_path();
+    request_redraw();
 }
-static void platform_set_title(const char*title){if(g.window)glfwSetWindowTitle(g.window,title?title:"");}
-static int platform_notify(const char*app,int kind,const char*title,const char*message){
-    const char*urgency=kind==LUNA_NOTIFY_ERROR?"critical":kind==LUNA_NOTIFY_WARNING?"normal":"low";
-    pid_t p=fork();if(p<0)return 0;
-    if(p==0){execlp("notify-send","notify-send","-a",app?app:"Luna Files","-u",urgency,title?title:"",message?message:"",(char*)NULL);_exit(127);}
-    int status=0;while(waitpid(p,&status,0)<0&&errno==EINTR){}
-    return WIFEXITED(status)&&WEXITSTATUS(status)==0;
+
+static void file_dialog_app_frame(double dt, void *userdata) {
+    static char old_search[MAX_SEARCH] = "";
+    double now = luna_platform_time();
+    const char *sv;
+    (void)userdata;
+    apply_pending_resize();
+    luna_window_tick(dt);
+    if (g.volumes_next_refresh <= 0.0 || now >= g.volumes_next_refresh)
+        refresh_volumes(0);
+    sv = luna_get_value(g.id_search);
+    if (sv && strcmp(sv, old_search)) {
+        safe_copy(old_search, sizeof(old_search), sv);
+        safe_copy(g.search, sizeof(g.search), sv);
+        render_files();
+    }
+    if (g.toast_until > 0 && now >= g.toast_until) {
+        luna_add_class(g.id_toast, "hidden");
+        g.toast_until = 0;
+        request_redraw();
+    }
+    apply_grid_scroll();
+}
+
+static void file_dialog_app_shutdown(void *userdata) {
+    (void)userdata;
+    save_settings();
+    luna_window_unbind();
 }
 
 int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResult* result) {
+    LunaAppConfig app;
+    int rc;
+    g_file_dialog_overlay_mode = 0;
     memset(&g_file_dialog_config,0,sizeof(g_file_dialog_config));
     if(config)g_file_dialog_config=*config;
-    if(!g_file_dialog_config.title)g_file_dialog_config.title=g_file_dialog_config.mode==LUNA_FILE_DIALOG_MANAGER?"Luna Files":"ファイルを選択";
+    if(!g_file_dialog_config.title)g_file_dialog_config.title=g_file_dialog_config.mode==LUNA_FILE_DIALOG_MANAGER?"Luna Files":"\u30d5\u30a1\u30a4\u30eb\u3092\u9078\u629e";
     if(g_file_dialog_config.width<=0)g_file_dialog_config.width=700;
     if(g_file_dialog_config.height<=0)g_file_dialog_config.height=460;
     g_file_dialog_result=result;
     if(result)memset(result,0,sizeof(*result));
     g_file_dialog_cancelled=0;
-    g_file_dialog_pending_save[0]=0;
-    memset(&g,0,sizeof(g));g.anchor_entry=-1;g.context_entry=-1;g.modal_target=-1;g.open_with_target=-1;g.volume_context=-1;g.history_pos=-1;
-    load_settings();
-    if(g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER){LunaWindowTheme system_theme;luna_window_theme_load_system(&system_theme);g.theme=system_theme.mode==LUNA_WINDOW_THEME_DARK?1:0;}
-    g.window_width=g_file_dialog_config.width;g.window_height=g_file_dialog_config.height;
+    file_dialog_reset_session();
+    g.window_width=g_file_dialog_config.width;
+    g.window_height=g_file_dialog_config.height;
     apply_font_environment();
-    if(!glfwInit()){log_error("GLFW initialization failed");return 1;}
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
-    /* X11: keep hidden until the first Luna frame is ready.  Wayland: a hidden
-       GLFW window may never get a usable EGL/wl_shm buffer, so create visible
-       (same rule as luna_linux.h) and still wait for the first swap before
-       treating the dialog as shown. */
-    {
-        const char* session_type=getenv("XDG_SESSION_TYPE");
-        const char* wayland_display=getenv("WAYLAND_DISPLAY");
-        int wayland_session=
-            (session_type && strcmp(session_type,"wayland")==0) ||
-            (wayland_display && wayland_display[0] && !getenv("DISPLAY"));
-        glfwWindowHint(GLFW_VISIBLE, wayland_session ? GLFW_TRUE : GLFW_FALSE);
-    }
-    glfwWindowHint(GLFW_DECORATED,g_file_dialog_config.client_chrome?GLFW_FALSE:GLFW_TRUE);
-    g.window=glfwCreateWindow(g.window_width,g.window_height,g_file_dialog_config.title,NULL,NULL);
-    if(!g.window){log_error("window creation failed");glfwTerminate();return 1;}
-    glfwSetWindowSizeLimits(g.window,MIN_WINDOW_W,MIN_WINDOW_H,GLFW_DONT_CARE,GLFW_DONT_CARE);
-    glfwMakeContextCurrent(g.window);glfwSwapInterval(1);
-#ifdef LUNA_WM_CLIENT_H
-    luna_wm_client_init(g.window);
-#endif
-    g_hand_cursor=glfwCreateStandardCursor(GLFW_HAND_CURSOR);g_cursor_ibeam=glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
-    g_cursor_crosshair=glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR);g_cursor_hresize=glfwCreateStandardCursor(GLFW_HRESIZE_CURSOR);g_cursor_vresize=glfwCreateStandardCursor(GLFW_VRESIZE_CURSOR);
-    LunaPlatform p={0};p.get_time=glfwGetTime;p.get_proc=(LunaGetProcFn)glfwGetProcAddress;p.set_cursor=platform_cursor;p.request_close=platform_close;p.iconify=platform_iconify;p.maximize_toggle=platform_maximize;p.request_redraw=platform_redraw;p.begin_move=platform_begin_move;p.begin_resize=platform_begin_resize;p.set_title=platform_set_title;p.system_notify=platform_notify;p.struct_size=sizeof(p);p.api_version=LUNA_UI_API_VERSION;luna_set_platform(&p);
-    LunaInitConfig cfg={(float)g.window_width,(float)g.window_height,(LunaGetProcFn)glfwGetProcAddress,g_file_dialog_config.client_chrome};
-    if(!luna_init(&cfg)){log_error("Luna UI initialization failed");glfwDestroyWindow(g.window);glfwTerminate();return 1;}
-    register_handlers();luna_parse_css(luna_window_standard_css());luna_parse_css(UI_CSS);char *html=build_html();if(!html){log_error("UI allocation failed");luna_shutdown();glfwDestroyWindow(g.window);glfwTerminate();return 1;}luna_parse_html(html);free(html);{LunaWindowConfig wc={0};wc.root_id="app";wc.title=g_file_dialog_config.title;wc.chrome=g_file_dialog_config.client_chrome?LUNA_WINDOW_CHROME_CLIENT:LUNA_WINDOW_CHROME_NATIVE;wc.theme=g_file_dialog_config.mode==LUNA_FILE_DIALOG_MANAGER?(g.theme?LUNA_WINDOW_THEME_DARK:LUNA_WINDOW_THEME_LIGHT):LUNA_WINDOW_THEME_SYSTEM;luna_window_bind(&wc);}luna_wire_onclick_handlers();cache_ids();
-    if(g_file_dialog_config.mode==LUNA_FILE_DIALOG_SAVE_FILE&&g_file_dialog_config.suggested_name){int name_id=luna_get_element_by_id("file-dialog-name");if(name_id>=0)luna_set_value(name_id,g_file_dialog_config.suggested_name);}
-    if(g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER){int accept_id=luna_get_element_by_id("file-dialog-accept");const char*label=g_file_dialog_config.accept_label?g_file_dialog_config.accept_label:(g_file_dialog_config.mode==LUNA_FILE_DIALOG_SAVE_FILE?"保存":g_file_dialog_config.mode==LUNA_FILE_DIALOG_SELECT_FOLDER?"選択":"開く");if(accept_id>=0)luna_set_text(accept_id,label);}
-    if(!validate_ui_ids()){luna_window_unbind();luna_shutdown();glfwDestroyWindow(g.window);glfwTerminate();return 1;}
-    apply_display_classes();
-    glfwSetCursorPosCallback(g.window,cursor_cb);glfwSetMouseButtonCallback(g.window,mouse_cb);glfwSetScrollCallback(g.window,scroll_cb);glfwSetCharCallback(g.window,char_cb);glfwSetKeyCallback(g.window,key_cb);glfwSetWindowSizeCallback(g.window,window_size_cb);glfwSetFramebufferSizeCallback(g.window,framebuffer_cb);
-    build_sidebar_paths();refresh_sidebar_visibility();
-    const char *start=g_file_dialog_config.initial_path&&g_file_dialog_config.initial_path[0]?g_file_dialog_config.initial_path:home_dir();
-    navigate(start,1);clipboard_import();update_toolbar_state();
-    g.redraw=1;
-    int window_shown=0;
-    double prev=glfwGetTime();char old_search[MAX_SEARCH]="";
-    while(!glfwWindowShouldClose(g.window)){
-        double before=glfwGetTime();
-        int settling=luna_visuals_settling();
-        if(!g.redraw&&!settling){
-            double wait=1.0;
-            if(g.toast_until>0){double remain=g.toast_until-before;if(remain<wait)wait=remain;if(wait<0.01)wait=0.01;}
-            if(g.volumes_next_refresh>0){double remain=g.volumes_next_refresh-before;if(remain<wait)wait=remain;if(wait<0.05)wait=0.05;}
-            glfwWaitEventsTimeout(wait);
-        }else glfwPollEvents();
-        apply_pending_resize();
-        double now=glfwGetTime(),dt=now-prev;prev=now;if(dt>0.1)dt=0.1;
-        luna_window_tick(dt);
-        if(g.volumes_next_refresh<=0.0||now>=g.volumes_next_refresh)refresh_volumes(0);
-        const char *sv=luna_get_value(g.id_search);if(sv&&strcmp(sv,old_search)){safe_copy(old_search,sizeof(old_search),sv);safe_copy(g.search,sizeof(g.search),sv);render_files();}
-        if(g.toast_until>0&&now>=g.toast_until){luna_add_class(g.id_toast,"hidden");g.toast_until=0;request_redraw();}
-        apply_grid_scroll();
-        settling=luna_update_settling(now,dt);
-        apply_grid_scroll();
-        if(g.redraw||settling||g.resize_redraw_frames>0){
-            int fbw,fbh;glfwGetFramebufferSize(g.window,&fbw,&fbh);
-            int presented=0;
-            if(fbw>0&&fbh>0){
-                apply_grid_scroll();luna_render(fbw,fbh);glfwSwapBuffers(g.window);
-                presented=1;
-                if(!window_shown){glfwShowWindow(g.window);window_shown=1;}
-            } else if(!window_shown) {
-                /* Some Wayland compositors do not allocate a framebuffer for
-                   an unmapped window.  Map it once, but keep redraw pending so
-                   the first configure immediately produces the Luna frame. */
-                glfwShowWindow(g.window);
-                window_shown=1;
-            }
-            /* Never consume the only redraw while the native framebuffer is
-               temporarily 0x0 (common during initial Wayland/HiDPI mapping). */
-            g.redraw=presented?0:1;
-            if(g.resize_redraw_frames>0&&presented){g.resize_redraw_frames--;if(g.resize_redraw_frames>0)g.redraw=1;}
-        }
-    }
-    save_settings();
-    luna_window_unbind();
-    luna_shutdown();
-#ifdef LUNA_WM_CLIENT_H
-    luna_wm_client_shutdown();
-#endif
-    if (g_hand_cursor) glfwDestroyCursor(g_hand_cursor);
-    if (g_cursor_ibeam) glfwDestroyCursor(g_cursor_ibeam);
-    if (g_cursor_crosshair) glfwDestroyCursor(g_cursor_crosshair);
-    if (g_cursor_hresize) glfwDestroyCursor(g_cursor_hresize);
-    if (g_cursor_vresize) glfwDestroyCursor(g_cursor_vresize);
-    glfwDestroyWindow(g.window);glfwTerminate();
-    return 0;
+
+    memset(&app,0,sizeof(app));
+    app.title=g_file_dialog_config.title;
+    app.width=g.window_width;
+    app.height=g.window_height;
+    app.resizable=1;
+    app.vsync=1;
+    app.frameless=g_file_dialog_config.client_chrome;
+    app.on_init=file_dialog_app_init;
+    app.on_frame=file_dialog_app_frame;
+    app.on_shutdown=file_dialog_app_shutdown;
+    app.on_mouse_move=cursor_cb;
+    app.on_mouse_button=mouse_cb;
+    app.on_scroll=scroll_cb;
+    app.on_key=key_cb;
+    /* Idle tick: the volume list and the toast timer need a slow heartbeat;
+       everything else redraws on demand. */
+    app.frame_interval=0.25;
+    rc=luna_app_run(&app);
+    return rc;
 }
-
-#if defined(__linux__) && (defined(__GNUC__) || defined(__clang__))
-static const char* luna_window_file_dialog_env_copy(const char* name,
-                                                     char* out,size_t cap) {
-    const char* value=getenv(name);
-    if (!value || !*value || !out || cap==0) return NULL;
-    snprintf(out,cap,"%s",value);
-    return out;
-}
-
-__attribute__((constructor))
-static void luna_window_file_dialog_child_entry(void) {
-    const char* marker=getenv("LUNA_WINDOW_INTERNAL_FILE_DIALOG_CHILD");
-    if (!marker || strcmp(marker,"1")!=0) return;
-    unsetenv("LUNA_WINDOW_INTERNAL_FILE_DIALOG_CHILD");
-
-    LunaFileDialogConfig c;
-    LunaFileDialogResult r;
-    char title[512],initial[LUNA_WINDOW_PATH_MAX],suggested[LUNA_WINDOW_PATH_MAX];
-    char accept[128],filter_name[256],filter_patterns[LUNA_WINDOW_PATH_MAX];
-    memset(&c,0,sizeof(c));
-    memset(&r,0,sizeof(r));
-    const char* v;
-    v=getenv("LUNA_WINDOW_FD_MODE"); c.mode=v?(LunaFileDialogMode)atoi(v):LUNA_FILE_DIALOG_OPEN_FILE;
-    c.backend=LUNA_FILE_DIALOG_BACKEND_LUNA;
-    c.title=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_TITLE",title,sizeof(title));
-    c.initial_path=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_INITIAL",initial,sizeof(initial));
-    c.suggested_name=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_NAME",suggested,sizeof(suggested));
-    c.accept_label=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_ACCEPT",accept,sizeof(accept));
-    c.filter_name=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_FILTER_NAME",filter_name,sizeof(filter_name));
-    c.filter_patterns=luna_window_file_dialog_env_copy("LUNA_WINDOW_FD_FILTER",filter_patterns,sizeof(filter_patterns));
-    v=getenv("LUNA_WINDOW_FD_WIDTH"); c.width=v?atoi(v):0;
-    v=getenv("LUNA_WINDOW_FD_HEIGHT"); c.height=v?atoi(v):0;
-    v=getenv("LUNA_WINDOW_FD_CLIENT_CHROME"); c.client_chrome=v?atoi(v):0;
-
-    int rc=luna_file_dialog_run(&c,&r);
-    if (rc==0 && r.accepted) {
-        for (int i=0;i<r.count;i++) {
-            if (!r.paths[i][0]) continue;
-            fputs(r.paths[i],stdout);
-            fputc('\n',stdout);
-        }
-        fflush(stdout);
-    }
-    _exit(rc==0?0:2);
-}
-#endif
 
 #undef MAX_ITEMS
 #undef MAX_CLIP_ITEMS

@@ -99,6 +99,10 @@ typedef struct {
 typedef struct {
     char property[CSS_MAX_STR];
     char value[CSS_MAX_VALUE];
+    /* Preserved only when the declaration contains var().  The resolver may
+     * rewrite value, while Luna's CSSOM uses this source to re-evaluate the
+     * declaration after a custom-property update. */
+    char *variable_source;
     bool important;
 } CSSDeclaration;
 
@@ -582,6 +586,7 @@ static void parse_declaration(Lexer *l, CSSDeclaration *decl) {
     }
     snprintf(decl->value, CSS_MAX_VALUE, "%s", raw);
     str_trim(decl->value);
+    if (strstr(decl->value, "var(")) decl->variable_source = css_strdup(decl->value);
 }
 
 static void parse_rule_block(Lexer *l, CSSRule *rule, CSSCallbacks *cb) {
@@ -1060,7 +1065,13 @@ void css_parse_cb(const char *text, size_t len, CSSCallbacks *cb) {
 
 void css_free(CSSStyleSheet *sheet) {
     if (!sheet) return;
+    for (int i = 0; i < sheet->rule_count; i++)
+        for (int d = 0; d < sheet->rules[i].decl_count; d++)
+            free(sheet->rules[i].decls[d].variable_source);
     for (int i = 0; i < sheet->at_rule_count; i++) {
+        for (int r = 0; r < sheet->at_rules[i].nested_rule_count; r++)
+            for (int d = 0; d < sheet->at_rules[i].nested_rules[r].decl_count; d++)
+                free(sheet->at_rules[i].nested_rules[r].decls[d].variable_source);
         free(sheet->at_rules[i].nested_rules);
     }
     free(sheet->rules);
