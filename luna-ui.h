@@ -173,7 +173,7 @@ extern "C" {
 #endif
 
 #ifndef LUNA_UI_MAX_ELEMENTS
-#define LUNA_UI_MAX_ELEMENTS 700
+#define LUNA_UI_MAX_ELEMENTS 2000
 #endif
 #ifndef LUNA_UI_MAX_RULES
 #define LUNA_UI_MAX_RULES 600
@@ -1971,6 +1971,10 @@ typedef struct {
     int has_top;    float top;
     int has_bottom; float bottom;
     int has_right;  float right;
+    /* `left/top/right/bottom: auto` clears a prior inset instead of becoming 0.
+     * Without this, skins that pin menus with `top: auto; bottom: Npx` stretch
+     * from y=0 and look like they open from the top of a bottom taskbar. */
+    int clear_left, clear_top, clear_right, clear_bottom;
     int pct_bottom; float raw_bottom, raw_bottom_off;
     int pct_right;  float raw_right, raw_right_off;
     int has_position; int position_fixed; int position_sticky;
@@ -4826,6 +4830,10 @@ static void apply_element_inline_style(LunaElement* e) {
         e->raw_max_height = rule.raw_max_height;
         e->raw_max_height_off = rule.raw_max_height_off;
     }
+    if (rule.clear_left) { e->has_left = 0; e->pct_left = 0; }
+    if (rule.clear_top)  { e->has_top = 0;  e->pct_top = 0; }
+    if (rule.clear_right) { e->has_right = 0; e->pct_right = 0; }
+    if (rule.clear_bottom) { e->has_bottom = 0; e->pct_bottom = 0; }
     if (rule.has_left) {
         e->has_left = 1;
         e->pct_left = rule.pct_left;
@@ -5759,10 +5767,38 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             else if (strcmp(key, "margin-bottom") == 0)    { rule->has_margin = 1; rule->has_margin_bottom = 1; if (strcmp(val,"auto")==0) rule->margin_bottom_auto=1; else rule->margin_bottom = parse_float_val(val); }
             else if (strcmp(key, "margin-left") == 0)      { rule->has_margin = 1; rule->has_margin_left = 1; if (strcmp(val,"auto")==0) rule->margin_left_auto=1; else rule->margin_left = parse_float_val(val); }
             else if (strcmp(key, "inset") == 0)            { parse_inset_shorthand(val, rule); }
-            else if (strcmp(key, "left") == 0) { rule->has_left = 1; parse_length_calc(val, &rule->left, &rule->pct_left, &rule->raw_left_off); if (rule->pct_left) rule->raw_left = rule->left; }
-            else if (strcmp(key, "top") == 0)  { rule->has_top = 1; parse_length_calc(val, &rule->top, &rule->pct_top, &rule->raw_top_off); if (rule->pct_top) rule->raw_top = rule->top; }
-            else if (strcmp(key, "bottom") == 0)           { rule->has_bottom = 1; parse_length_calc(val, &rule->bottom, &rule->pct_bottom, &rule->raw_bottom_off); if (rule->pct_bottom) rule->raw_bottom = rule->bottom; }
-            else if (strcmp(key, "right") == 0)            { rule->has_right = 1; parse_length_calc(val, &rule->right, &rule->pct_right, &rule->raw_right_off); if (rule->pct_right) rule->raw_right = rule->right; }
+            else if (strcmp(key, "left") == 0) {
+                if (strcmp(val, "auto") == 0) { rule->clear_left = 1; rule->has_left = 0; }
+                else {
+                    rule->has_left = 1; rule->clear_left = 0;
+                    parse_length_calc(val, &rule->left, &rule->pct_left, &rule->raw_left_off);
+                    if (rule->pct_left) rule->raw_left = rule->left;
+                }
+            }
+            else if (strcmp(key, "top") == 0) {
+                if (strcmp(val, "auto") == 0) { rule->clear_top = 1; rule->has_top = 0; }
+                else {
+                    rule->has_top = 1; rule->clear_top = 0;
+                    parse_length_calc(val, &rule->top, &rule->pct_top, &rule->raw_top_off);
+                    if (rule->pct_top) rule->raw_top = rule->top;
+                }
+            }
+            else if (strcmp(key, "bottom") == 0) {
+                if (strcmp(val, "auto") == 0) { rule->clear_bottom = 1; rule->has_bottom = 0; }
+                else {
+                    rule->has_bottom = 1; rule->clear_bottom = 0;
+                    parse_length_calc(val, &rule->bottom, &rule->pct_bottom, &rule->raw_bottom_off);
+                    if (rule->pct_bottom) rule->raw_bottom = rule->bottom;
+                }
+            }
+            else if (strcmp(key, "right") == 0) {
+                if (strcmp(val, "auto") == 0) { rule->clear_right = 1; rule->has_right = 0; }
+                else {
+                    rule->has_right = 1; rule->clear_right = 0;
+                    parse_length_calc(val, &rule->right, &rule->pct_right, &rule->raw_right_off);
+                    if (rule->pct_right) rule->raw_right = rule->right;
+                }
+            }
             else if (strcmp(key, "position") == 0) {
                 rule->has_position = 1;
                 rule->position_fixed = (strcmp(val, "fixed") == 0);
@@ -7354,6 +7390,22 @@ void update_element_style(LunaElement* e) {
         /* Sticky and relative elements stay in normal/flex flow.  Their offsets
            are applied after normal-flow layout; only absolute/fixed elements
            are removed from the flow via css_positioned. */
+        if (r->clear_left && !e->pos_overridden_x && offsets_should_apply(e)) {
+            e->has_left = 0; e->pct_left = 0;
+            if (e->position_sticky) e->sticky_use_left = 0;
+        }
+        if (r->clear_top && !e->pos_overridden_y && offsets_should_apply(e)) {
+            e->has_top = 0; e->pct_top = 0;
+            if (e->position_sticky) e->sticky_use_top = 0;
+        }
+        if (r->clear_right && !e->pos_overridden_x && offsets_should_apply(e)) {
+            e->has_right = 0; e->pct_right = 0;
+            if (e->position_sticky) e->sticky_use_right = 0;
+        }
+        if (r->clear_bottom && !e->pos_overridden_y && offsets_should_apply(e)) {
+            e->has_bottom = 0; e->pct_bottom = 0;
+            if (e->position_sticky) e->sticky_use_bottom = 0;
+        }
         if (r->has_left && offsets_should_apply(e)) {
             if (e->position_fixed || e->position_mode == POS_ABSOLUTE)
                 e->css_positioned |= 1;

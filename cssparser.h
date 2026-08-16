@@ -22,14 +22,22 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-/* ── Limits ──────────────────────────────────────────────────────────── */
+/* ── Limits ────────────────────────────────────────────────────────────
+ *
+ * CSSRule embeds these arrays inline, so sizeof(CSSRule) is
+ * O(SELECTORS × PARTS² × STR + DECLS × (STR+VALUE)).  Earlier caps
+ * (PARTS=16, STR=512, DECLS=128) made every rule ~3.2 MB; parsing
+ * luna-shell's ~400-rule sheet briefly mapped ~1.4 GB.  These limits
+ * still clear every skin / demo stylesheet in-tree (max ~51 decls,
+ * value length 766, short selectors) at ~100–150 KB per rule.
+ */
 #define CSS_MAX_SELECTORS     8
-#define CSS_MAX_PARTS        16
-#define CSS_MAX_DECLS       128
+#define CSS_MAX_PARTS         6
+#define CSS_MAX_DECLS        56
 #define CSS_MAX_RULES       512
 #define CSS_MAX_ATRULES      64
-#define CSS_MAX_STR         512
-#define CSS_MAX_VALUE      1024
+#define CSS_MAX_STR          96
+#define CSS_MAX_VALUE       1024
 
 /* ── Enums ───────────────────────────────────────────────────────────── */
 
@@ -655,10 +663,29 @@ static void skip_block(Lexer *l) {
 
 /* ── Main stylesheet parser ──────────────────────────────────────────── */
 
+static int nested_rules_push(CSSAtRule *at, const CSSRule *rule) {
+    if (at->nested_rule_count >= at->nested_rule_cap) {
+        int next = at->nested_rule_cap ? at->nested_rule_cap + 4 : 4;
+        CSSRule *grown = realloc(at->nested_rules, (size_t)next * sizeof(CSSRule));
+        if (!grown) return 0;
+        at->nested_rules = grown;
+        at->nested_rule_cap = next;
+    }
+    at->nested_rules[at->nested_rule_count++] = *rule;
+    return 1;
+}
+
 static void sheet_add_rule(CSSStyleSheet *sheet, const CSSRule *rule) {
     if (sheet->rule_count >= sheet->rule_cap) {
-        sheet->rule_cap = sheet->rule_cap ? sheet->rule_cap * 2 : 64;
-        sheet->rules = realloc(sheet->rules, sheet->rule_cap * sizeof(CSSRule));
+        /* Grow in modest steps.  Doubling from 256→512 with a large CSSRule
+         * briefly needs both buffers resident; +64 keeps the peak closer to
+         * the final sheet size. */
+        int next = sheet->rule_cap ? sheet->rule_cap + 64 : 32;
+        if (next < sheet->rule_count + 1) next = sheet->rule_count + 1;
+        CSSRule *grown = realloc(sheet->rules, (size_t)next * sizeof(CSSRule));
+        if (!grown) return;
+        sheet->rules = grown;
+        sheet->rule_cap = next;
     }
     sheet->rules[sheet->rule_count++] = *rule;
 }
@@ -725,8 +752,8 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                 lex_skip_ws(l);
                 if (lex_peek(l) == '{') {
                     lex_advance(l);
-                    at.nested_rule_cap = 16;
-                    at.nested_rules = calloc(at.nested_rule_cap, sizeof(CSSRule));
+                    at.nested_rule_cap = 0;
+                    at.nested_rules = NULL;
                     at.nested_rule_count = 0;
                     while (!lex_eof(l)) {
                         lex_skip_ws(l);
@@ -738,12 +765,7 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                         lex_skip_ws(l);
                         if (lex_peek(l) == '{') {
                             parse_rule_block(l, inner, NULL);
-                            if (at.nested_rule_count >= at.nested_rule_cap) {
-                                at.nested_rule_cap *= 2;
-                                at.nested_rules = realloc(at.nested_rules,
-                                    at.nested_rule_cap * sizeof(CSSRule));
-                            }
-                            at.nested_rules[at.nested_rule_count++] = *inner;
+                            if (!nested_rules_push(&at, inner)) { free(inner); return; }
                         } else {
                             /* skip garbage */
                             while (!lex_eof(l) && lex_peek(l) != '}' && lex_peek(l) != '{')
@@ -766,8 +788,9 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                 /* Parse keyframe blocks as nested rules with stop selectors */
                 if (lex_peek(l) == '{') {
                     lex_advance(l);
-                    at.nested_rule_cap = 16;
-                    at.nested_rules = calloc(at.nested_rule_cap, sizeof(CSSRule));
+                    at.nested_rule_cap = 0;
+                    at.nested_rules = NULL;
+                    at.nested_rule_count = 0;
                     while (!lex_eof(l)) {
                         lex_skip_ws(l);
                         if (lex_peek(l) == '}') { lex_advance(l); break; }
@@ -795,12 +818,7 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                         }
                         lex_skip_ws(l);
                         if (lex_peek(l) == '{') parse_rule_block(l, kf, NULL);
-                        if (at.nested_rule_count >= at.nested_rule_cap) {
-                            at.nested_rule_cap *= 2;
-                            at.nested_rules = realloc(at.nested_rules,
-                                at.nested_rule_cap * sizeof(CSSRule));
-                        }
-                        at.nested_rules[at.nested_rule_count++] = *kf;
+                        if (!nested_rules_push(&at, kf)) { free(kf); return; }
                         free(kf);
                     }
                 }
