@@ -654,6 +654,10 @@ int  luna_get_element_by_class(const char* class_name);
 int  luna_focused_element(void);
 void luna_focus_element(int idx);
 void luna_set_text(int idx, const char* text);
+/* Drop a cached GL texture so the next paint reloads it from disk. */
+void luna_invalidate_texture(const char* path);
+/* Set or clear element background-image via inline style (empty path clears). */
+void luna_set_background_image(int idx, const char* path);
 /* Update only the painted text, preserving the element's current geometry.
  * Use this for fixed-size status labels (clock, CPU, battery, etc.) whose text
  * changes frequently.  Unlike luna_set_text(), this does not invalidate the
@@ -1355,7 +1359,9 @@ const char* shadow_fs =
     "    vec4 rs = max(r4 + vec4(sp), vec4(0.0));\n"
     "    vec2 posShadow = FragPos - uShadowInset - uOffset;\n"
     "    float distShadow = rr_sdf4(posShadow - hs, hss, rs);\n"
-    "    float sigma = max(uBlur * 0.5, 0.001);\n"
+    "    // CSS blur-radius ≈ 2σ, but a 1D SDF erf is denser than a 2D box-blur.\n"
+    "    // A slightly wider σ keeps contact readable without a hard dark slab.\n"
+    "    float sigma = max(uBlur * 0.62, 0.001);\n"
     "    float alpha;\n"
     "    if (uInsetMode == 1) {\n"
     "        // Inset: dark where the shrunk/offset shape does NOT cover,\n"
@@ -1367,6 +1373,9 @@ const char* shadow_fs =
     "        // Clip shadow inside the element's own footprint to prevent dark\n"
     "        // bleed at transparent rounded corners.\n"
     "        alpha *= smoothstep(-1.0, 0.0, distElem);\n"
+    "        // Square the coverage so side-halos (α≈0.5 at the shape edge)\n"
+    "        // fade instead of drawing a second dark rectangle.\n"
+    "        alpha = alpha * alpha;\n"
     "    }\n"
     "    if (alpha < 0.004) discard;\n"
     "    FragColor = vec4(uShadowColor.rgb, uShadowColor.a * alpha);\n"
@@ -4902,6 +4911,17 @@ static void apply_element_inline_style(LunaElement* e) {
     if (rule.has_line_clamp) e->line_clamp = rule.line_clamp;
     if (rule.has_text_transform) e->text_transform = rule.text_transform;
     if (rule.has_text_decoration) e->text_decoration = rule.text_decoration;
+    if (rule.has_bg_image_reset) {
+        e->has_bg_image = 0;
+        e->bg_image_path[0] = '\0';
+        e->bg_image_tex = 0;
+    }
+    if (rule.has_bg_image) {
+        e->has_bg_image = 1;
+        strncpy(e->bg_image_path, rule.bg_image_path, sizeof(e->bg_image_path) - 1);
+        e->bg_image_path[sizeof(e->bg_image_path) - 1] = '\0';
+        e->bg_image_tex = 0;
+    }
     rule_bg_layers_release(rule.bg_layers);
     g_layout_dirty = 1; g_render_order_dirty = 1;
 }
@@ -11355,6 +11375,8 @@ static uint64_t damage_hash_element(int idx) {
     /* Text: only the used prefix, not the whole 512-byte slot. */
     for (const unsigned char* p = (const unsigned char*)e->text; *p; p++)
         MIX_U64(*p);
+    MIX_U64((uint64_t)(int64_t)e->caret);
+    MIX_F32(e->input_scroll_x);
     MIX_F32(c->eff_op); MIX_F32(c->anc_tx); MIX_F32(c->anc_ty);
     MIX_F32(c->cx); MIX_F32(c->cy); MIX_F32(c->cw); MIX_F32(c->ch);
     MIX_U64(c->clip_anc + 1);
@@ -12678,7 +12700,7 @@ static void draw_shadow(float ex, float ey, float ew, float eh,
     float blur = sh_blur > 0.0f ? sh_blur : 0.0f;
     // Gaussian tail is visible up to ~1.65*blur from the shadow shape edge (discard < 0.004).
     // Inset shadows never paint outside the element, so no halo padding needed.
-    float pad  = sh_inset ? 1.0f : blur * 1.75f + (sh_spread > 0.0f ? sh_spread : 0.0f) + 2.0f;
+    float pad  = sh_inset ? 1.0f : blur * 1.55f + (sh_spread > 0.0f ? sh_spread : 0.0f) + 2.0f;
 
     // Shadow rect covers the full blurred area including offset:
     //   left edge  : min(0, sh_dx) - pad
@@ -13793,6 +13815,12 @@ static void input_ensure_caret(LunaElement* e) {
         e->caret--;
 }
 
+static void input_mark_dirty(void) {
+    g_probe_prepared = 0;
+    luna_platform_request_redraw();
+    luna_app_request_redraw();
+}
+
 static void input_insert_utf8(LunaElement* e, const char* bytes, int blen) {
     if (!e || !bytes || blen <= 0) return;
     input_ensure_caret(e);
@@ -13803,6 +13831,7 @@ static void input_insert_utf8(LunaElement* e, const char* bytes, int blen) {
     memmove(e->text + e->caret + blen, e->text + e->caret, (size_t)(n - e->caret) + 1);
     memcpy(e->text + e->caret, bytes, (size_t)blen);
     e->caret += blen;
+    input_mark_dirty();
 }
 
 static void input_backspace(LunaElement* e) {
@@ -13812,6 +13841,7 @@ static void input_backspace(LunaElement* e) {
     int n = (int)strlen(e->text);
     memmove(e->text + prev, e->text + e->caret, (size_t)(n - e->caret) + 1);
     e->caret = prev;
+    input_mark_dirty();
 }
 
 static void input_delete_forward(LunaElement* e) {
@@ -13820,6 +13850,7 @@ static void input_delete_forward(LunaElement* e) {
     if (e->caret >= n) return;
     int next = utf8_next_boundary(e->text, e->caret);
     memmove(e->text + e->caret, e->text + next, (size_t)(n - next) + 1);
+    input_mark_dirty();
 }
 
 static float measure_prefix_width(LunaElement* e, int byte_len) {
@@ -13964,6 +13995,7 @@ void luna_ime_delete_surrounding(unsigned before_bytes, unsigned after_bytes) {
     if (end > start) {
         memmove(e->text + start, e->text + end, (size_t)(len - end) + 1);
         e->caret = start;
+        input_mark_dirty();
     }
 }
 
@@ -14035,7 +14067,7 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
         if (primary_mod && action == LUNA_PRESS && key == 'X') {
             if (!fe->input_password && g_luna_platform.set_clipboard)
                 g_luna_platform.set_clipboard(fe->text);
-            if (!fe->input_password) { fe->text[0] = '\0'; fe->caret = 0; }
+            if (!fe->input_password) { fe->text[0] = '\0'; fe->caret = 0; input_mark_dirty(); }
             return;
         }
         if (primary_mod && action == LUNA_PRESS && key == 'V') {
@@ -14052,14 +14084,14 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
         if (key == LUNA_KEY_DELETE) { input_delete_forward(fe); return; }
         if (key == LUNA_KEY_LEFT) {
             fe->caret = utf8_prev_boundary(fe->text, fe->caret);
-            input_ensure_caret(fe); return;
+            input_ensure_caret(fe); input_mark_dirty(); return;
         }
         if (key == LUNA_KEY_RIGHT) {
             fe->caret = utf8_next_boundary(fe->text, fe->caret);
-            input_ensure_caret(fe); return;
+            input_ensure_caret(fe); input_mark_dirty(); return;
         }
-        if (key == LUNA_KEY_HOME) { fe->caret = 0; return; }
-        if (key == LUNA_KEY_END) { fe->caret = (int)strlen(fe->text); return; }
+        if (key == LUNA_KEY_HOME) { fe->caret = 0; input_mark_dirty(); return; }
+        if (key == LUNA_KEY_END) { fe->caret = (int)strlen(fe->text); input_mark_dirty(); return; }
         if (key == LUNA_KEY_ENTER || key == LUNA_KEY_KP_ENTER) {
             if (fe->input_multiline) { char_callback_impl('\n'); return; }
             if (fe->on_click) fe->on_click(fe);
@@ -14301,6 +14333,39 @@ float luna_platform_scale(void) {
 }
 int luna_element_visible(int idx) { return (idx >= 0 && idx < elem_count) ? is_visible(idx) : 0; }
 void luna_set_text(int i, const char* t) { g_probe_prepared = 0; set_text(i, t); }
+void luna_invalidate_texture(const char* path) {
+    if (!path || !*path) return;
+    g_probe_prepared = 0;
+    for (int i = 0; i < g_tex_count; i++) {
+        if (strcmp(g_tex_cache[i].path, path) != 0) continue;
+        if (g_tex_cache[i].tex) glDeleteTextures(1, &g_tex_cache[i].tex);
+        g_tex_cache[i] = g_tex_cache[g_tex_count - 1];
+        g_tex_count--;
+        break;
+    }
+    for (int i = 0; i < elem_count; i++) {
+        if (elements[i].has_bg_image && strcmp(elements[i].bg_image_path, path) == 0)
+            elements[i].bg_image_tex = 0;
+    }
+}
+void luna_set_background_image(int idx, const char* path) {
+    if (idx < 0 || idx >= elem_count) return;
+    g_probe_prepared = 0;
+    LunaElement* e = &elements[idx];
+    if (!path || !*path) {
+        e->has_inline_style = 0;
+        e->inline_style[0] = 0;
+        e->has_bg_image = 0;
+        e->bg_image_path[0] = 0;
+        e->bg_image_tex = 0;
+        (void)restyle_element_checked(e);
+        return;
+    }
+    snprintf(e->inline_style, sizeof(e->inline_style),
+             "background-image:url('%s')", path);
+    e->has_inline_style = 1;
+    (void)restyle_element_checked(e);
+}
 void luna_set_text_paint_only(int i, const char* t) {
     g_probe_prepared = 0;
     set_text_paint_only(i, t);
@@ -14533,6 +14598,9 @@ int luna_needs_redraw(double now, double dt) {
     int mask = 0;
     if (layout) mask |= LUNA_REDRAW_LAYOUT | LUNA_REDRAW_PAINT;
     if (settling || css_anim) mask |= LUNA_REDRAW_ANIM | LUNA_REDRAW_PAINT;
+    if (g_focused_element_idx >= 0 && g_focused_element_idx < elem_count &&
+        elements[g_focused_element_idx].is_input)
+        mask |= LUNA_REDRAW_PAINT;
     return mask;
 }
 
@@ -14555,26 +14623,25 @@ int luna_needs_redraw_mask(double now, double dt, const int* roots,
         if (layout) flags |= LUNA_REDRAW_LAYOUT | LUNA_REDRAW_PAINT;
         if (settling_mask & (1u << i)) flags |= LUNA_REDRAW_ANIM | LUNA_REDRAW_PAINT;
         if (css_animation_active_under(roots[i])) flags |= LUNA_REDRAW_ANIM;
+        if (g_focused_element_idx >= 0 && g_focused_element_idx < elem_count &&
+            elements[g_focused_element_idx].is_input &&
+            element_contains_focus(roots[i]))
+            flags |= LUNA_REDRAW_PAINT;
         if (out_flags) out_flags[i] = flags;
         any |= (int)flags;
     }
     return any;
 }
 
-/* Ensure backdrop-blur FBOs/textures can hold the current framebuffer.
+/* Ensure backdrop-blur FBOs/textures can hold the requested scratch region.
  *
- * Sizing these to match the framebuffer *exactly* was a per-frame disaster on
- * the Wayland shell: every layer surface has its own size, so rendering the
- * menubar after the wallpaper tore down two full-screen RGBA textures and two
- * FBOs and allocated them again — and then the wallpaper's next repaint did it
- * all over again, in the opposite direction.  At 1920x1080 that is 16 MB of
- * driver allocation twice per frame, produced on a fixed timer by the clock and
- * the wallpaper tick: exactly the regular hitch it looked like.
- *
- * Grow-only sizing removes it.  A texture larger than the framebuffer costs
- * nothing to sample from — the capture is anchored at texture y=0 and the
- * shaders normalise by the real texture size — so the allocation happens once,
- * for the largest surface, and is reused by every smaller one. */
+ * The old caller requested the entire framebuffer even though the blur path
+ * already copied and filtered only the element's padded rectangle.  On a 4K
+ * desktop that permanently reserved two 3840x2160 RGBA textures (~63 MiB) as
+ * soon as a tiny menubar used backdrop-filter.  The caller now rebases the
+ * capture into a local work rectangle; grow-only allocation therefore keeps
+ * the no-thrash property while normally staying close to the largest blurred
+ * widget rather than the largest output. */
 static void ensure_blur_fbos(int w, int h) {
     if (!glGenFramebuffers_ || !glBindFramebuffer_ || !glFramebufferTexture2D_) return;
     if (g_blur_fbo[0] && g_blur_tex_w >= w && g_blur_tex_h >= h) return;
@@ -14614,18 +14681,10 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
                                  const float* rad4, int fbw, int fbh) {
     if (!blur_program || !backdrop_program) return;
     if (!glActiveTexture_) return;
-    /* Allocated here rather than at the top of every render: a surface with no
-     * backdrop-filter element never needs the capture textures at all. */
-    ensure_blur_fbos(fbw, fbh);
-    if (!g_blur_fbo[0]) return;
 
-    /* Geometry is laid out in logical CSS pixels, while framebuffer textures
-     * and glCopyTexSubImage2D use physical pixels.  Keeping those coordinate
-     * systems mixed made a 2x/1.25x scale capture only a fraction of the
-     * toolbar, which could leave the glass surface and its controls looking
-     * clipped or displaced. */
+    /* Geometry is laid out in logical CSS pixels, while framebuffer capture
+     * and scratch textures use physical pixels. */
     float fw = (float)fbw, fh = (float)fbh;
-    float tw = (float)g_blur_tex_w, th = (float)g_blur_tex_h;
     float res_x = LUNA_RRES_X > 0.0f ? LUNA_RRES_X : fw;
     float res_y = LUNA_RRES_Y > 0.0f ? LUNA_RRES_Y : fh;
     float px_scale_x = fw / res_x;
@@ -14636,46 +14695,54 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     float sh = eh * px_scale_y;
     float blur_px_scale = px_scale_x > px_scale_y ? px_scale_x : px_scale_y;
 
-    /* Every stage below works on the element rect grown by the blur reach
-     * instead of the whole screen.  A menubar with backdrop-filter used to
-     * cost a full-framebuffer texture copy plus two full-framebuffer blur
-     * passes *per blurred element, per frame*; the visible result is identical
-     * because nothing outside this region can influence the element's pixels. */
     float r   = (blur_radius > 0.5f ? blur_radius : 0.5f) * blur_px_scale;
     float pad = r + 2.0f;
 
-    /* Capture region in framebuffer pixels (y grows downward), clipped. */
+    /* Capture only the pixels that can influence this blurred element. */
     int cx0 = (int)floorf(sx - pad);            if (cx0 < 0) cx0 = 0;
     int cx1 = (int)ceilf(sx + sw + pad);        if (cx1 > fbw) cx1 = fbw;
     int cy0 = (int)floorf(sy - pad);            if (cy0 < 0) cy0 = 0;
     int cy1 = (int)ceilf(sy + sh + pad);        if (cy1 > fbh) cy1 = fbh;
     if (cx1 <= cx0 || cy1 <= cy0) return;
 
-    /* Step 1: Copy just that region of the default framebuffer into
-     * g_blur_tex[0].  Both the copy and the sample anchor the framebuffer at
-     * texture y=0, so the sub-rect lands at the texel coordinates the shaders
-     * read — GL window space counts y upward, hence the flip. */
+    int work_w = cx1 - cx0;
+    int work_h = cy1 - cy0;
+
+    /* Crucial memory fix: scratch storage follows the capture region, not the
+     * output.  A 32px menubar on a 4K screen now needs only a thin strip. */
+    ensure_blur_fbos(work_w, work_h);
+    if (!g_blur_fbo[0]) return;
+
+    float tw = (float)g_blur_tex_w;
+    float th = (float)g_blur_tex_h;
+    float ww = (float)work_w;
+    float wh = (float)work_h;
+
+    /* Rebase framebuffer coordinates into the local scratch rectangle.
+     * y remains a top-down coordinate for the shaders; the source copy uses
+     * OpenGL's bottom-up y when reading the default framebuffer. */
+    float lx = sx - (float)cx0;
+    float ly = sy - (float)cy0;
+
     glBindTexture(GL_TEXTURE_2D, g_blur_tex[0]);
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, cx0, fbh - cy1, cx0, fbh - cy1,
-                        cx1 - cx0, cy1 - cy0);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                        cx0, fbh - cy1, work_w, work_h);
     glBindTexture(GL_TEXTURE_2D, 0);
 
     glDisable(GL_SCISSOR_TEST);
     rc_scissor_reset();
     glDisable(GL_BLEND);
-    /* Step 2: Horizontal blur: read g_blur_tex[0] → write g_blur_fbo[1]/g_blur_tex[1].
-     * The vertical pass samples r pixels above and below the element, so the
-     * horizontal pass must produce that taller strip.  It used to write only
-     * the element rect, leaving the vertical pass to read whatever an earlier
-     * element or frame had left in g_blur_tex[1] — visible as a wrong band
-     * along the top and bottom edge of every backdrop-filter surface. */
-    float hy0 = sy - pad;           if (hy0 < 0.0f)        hy0 = 0.0f;
-    float hy1 = sy + sh + pad;      if (hy1 > (float)fbh)  hy1 = (float)fbh;
+
+    /* Horizontal pass.  Render into the scratch FBO's actual allocation;
+     * uFbSize limits valid samples to this capture rectangle when the
+     * grow-only texture is larger than the current request. */
+    float hy0 = ly - pad;       if (hy0 < 0.0f) hy0 = 0.0f;
+    float hy1 = ly + sh + pad;  if (hy1 > wh)   hy1 = wh;
     glBindFramebuffer_(GL_FRAMEBUFFER, g_blur_fbo[1]);
-    glViewport(0, 0, fbw, fbh);
+    glViewport(0, 0, g_blur_tex_w, g_blur_tex_h);
     luna_use_program(blur_program);
-    glUniform2f(blur_loc.uResolution, fw, fh);
-    glUniform2f(blur_loc.uPos,  sx, hy0);
+    glUniform2f(blur_loc.uResolution, tw, th);
+    glUniform2f(blur_loc.uPos, lx, hy0);
     glUniform2f(blur_loc.uSize, sw, hy1 - hy0);
     if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_blur_tex[0]);
@@ -14683,34 +14750,30 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     glUniform2f(blur_loc.uBlurDir, 1.0f / tw, 0.0f);
     glUniform1f(blur_loc.uBlurRadius, r);
     glUniform2f(blur_loc.uBlurTexSize, tw, th);
-    glUniform2f(blur_loc.uFbSize, fw, fh);
-    glUniform2f(blur_loc.uBlurOrigin, sx, hy0);
+    glUniform2f(blur_loc.uFbSize, ww, wh);
+    glUniform2f(blur_loc.uBlurOrigin, lx, hy0);
     luna_bind_vao(g_rect_vao);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
-    /* Step 3: Vertical blur over the element rect only: read g_blur_tex[1] →
-     * write g_blur_fbo[0]/g_blur_tex[0] */
+    /* Vertical pass over the element itself. */
     glBindFramebuffer_(GL_FRAMEBUFFER, g_blur_fbo[0]);
     glBindTexture(GL_TEXTURE_2D, g_blur_tex[1]);
-    glUniform2f(blur_loc.uPos,  sx, sy);
+    glUniform2f(blur_loc.uPos, lx, ly);
     glUniform2f(blur_loc.uSize, sw, sh);
-    glUniform2f(blur_loc.uBlurOrigin, sx, sy);
+    glUniform2f(blur_loc.uBlurOrigin, lx, ly);
     glUniform2f(blur_loc.uBlurDir, 0.0f, 1.0f / th);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    /* Step 4: Restore default FBO */
+    /* Restore the real target framebuffer. */
     glBindFramebuffer_(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, fbw, fbh);
     glEnable(GL_BLEND);
-    /* EGL/Wayland color buffers use premultiplied alpha.  RGB needs the
-     * ordinary straight-source factors to produce premultiplied output, while
-     * alpha must use SRC + DST*(1-SRC), not SRC*SRC. */
     glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
                         GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    g_current_program = 0; /* framebuffer switch may reset state */
+    g_current_program = 0;
 
-    /* Step 5: Draw the blurred texture clipped to the element's rounded rect */
+    /* Composite the local scratch result at the element's document position. */
     float c4[4] = {0,0,0,0};
     float half_min = (ew < eh ? ew : eh) * 0.5f;
     if (rad4) {
@@ -14722,15 +14785,15 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     }
     luna_use_program(backdrop_program);
     glUniform2f(backdrop_loc.uResolution, LUNA_RRES_X, LUNA_RRES_Y);
-    glUniform2f(backdrop_loc.uPos,  ex - g_render_off_x, ey - g_render_off_y);
+    glUniform2f(backdrop_loc.uPos, ex - g_render_off_x, ey - g_render_off_y);
     glUniform2f(backdrop_loc.uSize, ew, eh);
     glUniform4f(backdrop_loc.uRadius4, c4[0], c4[1], c4[2], c4[3]);
     if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_blur_tex[0]);
     glUniform1i_(backdrop_loc.uSrc, 0);
     glUniform2f(backdrop_loc.uBlurTexSize, tw, th);
-    glUniform2f(backdrop_loc.uFbSize, fw, fh);
-    glUniform2f(backdrop_loc.uBlurOrigin, sx, sy);
+    glUniform2f(backdrop_loc.uFbSize, ww, wh);
+    glUniform2f(backdrop_loc.uBlurOrigin, lx, ly);
     glUniform2f(backdrop_loc.uSampleScale, px_scale_x, px_scale_y);
     glUniform1f(backdrop_loc.uSaturate, saturate);
     glUniform1f(backdrop_loc.uBrightness, brightness);
@@ -14797,7 +14860,7 @@ int luna_redraw_probe_region(int root_idx, int fbw, int fbh,
             float pad = 4.0f;
             if (e->has_shadow) {
                 for (int s = 0; s < e->shadow_count; s++) {
-                    float ext = e->shadows[s].blur * 1.75f +
+                    float ext = e->shadows[s].blur * 1.55f +
                                 fabsf(e->shadows[s].dx) + fabsf(e->shadows[s].dy) +
                                 e->shadows[s].spread + 2.0f;
                     if (ext > pad) pad = ext;
@@ -14923,7 +14986,7 @@ void luna_render(int fbw, int fbh) {
             float pad = 4.0f;
             if (e->has_shadow) {
                 for (int s = 0; s < e->shadow_count; s++) {
-                    float ext = e->shadows[s].blur * 1.75f +
+                    float ext = e->shadows[s].blur * 1.55f +
                                 fabsf(e->shadows[s].dx) + fabsf(e->shadows[s].dy) +
                                 e->shadows[s].spread + 2.0f;
                     if (ext > pad) pad = ext;
