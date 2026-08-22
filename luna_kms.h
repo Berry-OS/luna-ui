@@ -59,9 +59,7 @@
 
 #if defined(LUNA_UI_IMPLEMENTATION)
 
-/* libinput reports raw evdev codes, which luna-keys.h maps exactly. */
-#define LUNA_KEYS_EVDEV_TABLE 1
-#include "luna-keys.h"
+/* luna-ui.h provides the host-neutral evdev key/button mapping helpers. */
 
 /* 64×64 is the size essentially every KMS driver accepts on the cursor plane. */
 #define LUNA_KMS_CURSOR_SIZE 64

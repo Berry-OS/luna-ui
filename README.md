@@ -49,8 +49,41 @@ make -C examples
 ./examples/opengl_gui --size 1024x700
 ./examples/sample_01
 ./examples/sample_02
+./examples/tooltip
 # or: LUNA_SCREENSHOT=sample.png ./examples/sample_01
 ```
+
+### CSS tooltips
+
+Luna UI supports dynamic pseudo-classes on ancestor selectors, so a tooltip can
+use the same nested HTML/CSS pattern as the web. Add keyboard focus selectors
+alongside hover so the description is not pointer-only:
+
+```html
+<button class="tooltip">
+  Save
+  <span class="tooltip-text">Save the current document</span>
+</button>
+```
+
+```css
+.tooltip { position: relative; }
+.tooltip-text {
+  position: absolute;
+  opacity: 0;
+  visibility: hidden;
+}
+.tooltip:hover .tooltip-text,
+.tooltip:focus .tooltip-text,
+.tooltip:focus-visible .tooltip-text {
+  opacity: 1;
+  visibility: visible;
+}
+```
+
+Build and run the complete example with `make -C examples tooltip` followed by
+`./examples/tooltip`. It includes above/below placement and an arrow made with
+`::before`.
 
 ## 🚀 Quick start
 

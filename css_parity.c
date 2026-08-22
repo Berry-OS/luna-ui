@@ -14,6 +14,9 @@ int luna_app_run(const LunaAppConfig *cfg) {
     return 0;
 }
 
+void luna_app_request_redraw(void) {
+}
+
 static int failures;
 static int touch_clicks;
 
@@ -180,6 +183,63 @@ static void test_live_custom_properties(void) {
                "custom-property color updates in place");
 }
 
+static void test_dynamic_ancestor_selector(void) {
+    luna_window_width = 320.0f;
+    luna_window_height = 200.0f;
+    luna_reset_css();
+    luna_parse_html("<body><button id=\"tip-host\" class=\"tooltip\">Save"
+                    "<span id=\"tip-text\" class=\"tooltip-text\">Help</span>"
+                    "</button></body>");
+    luna_parse_css("body{margin:0}.tooltip{position:absolute;left:20px;top:20px;"
+                   "width:100px;height:44px}.tooltip-text{opacity:0;visibility:hidden}"
+                   ".tooltip:hover .tooltip-text,.tooltip:focus .tooltip-text{"
+                   "opacity:1;visibility:visible}");
+    update_layout_pass();
+    int host = luna_get_element_by_id("tip-host");
+    int text = luna_get_element_by_id("tip-text");
+    check_true(host >= 0 && text >= 0, "tooltip fixtures are addressable");
+    if (host < 0 || text < 0) return;
+    check_true(elements[text].visibility_hidden && elements[text].opacity == 0.0f,
+               "tooltip starts hidden");
+
+    recompute_hover(NULL, elements[host].x + 8.0, elements[host].y + 8.0);
+    check_true(!elements[text].visibility_hidden && elements[text].opacity == 1.0f,
+               "hovered ancestor reveals tooltip descendant");
+    recompute_hover(NULL, 300.0, 180.0);
+    check_true(elements[text].visibility_hidden && elements[text].opacity == 0.0f,
+               "leaving ancestor hides tooltip descendant");
+
+    luna_focus_element(host);
+    check_true(!elements[text].visibility_hidden && elements[text].opacity == 1.0f,
+               "focused ancestor reveals tooltip descendant");
+    luna_focus_element(-1);
+}
+
+static void test_transform_none_reset(void) {
+    luna_window_width = 320.0f;
+    luna_window_height = 200.0f;
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"dock\"></div></body>");
+    luna_parse_css("body{margin:0}#dock{width:120px;height:40px;"
+                   "transform:translateX(-50%) scale(1.25) rotate(12deg)}"
+                   "#dock.layer{transform:none}");
+    update_layout_pass();
+    int dock = luna_get_element_by_id("dock");
+    check_true(dock >= 0, "transform:none fixture is addressable");
+    if (dock < 0) return;
+    check_true(elements[dock].transform_tx < -59.0f,
+               "base percentage translation is initially applied");
+    luna_update_classes(dock, NULL, "layer");
+    check_near(elements[dock].transform_tx, 0.0f, 0.001f,
+               "transform:none resets translation");
+    check_near(elements[dock].transform_ty, 0.0f, 0.001f,
+               "transform:none resets vertical translation");
+    check_near(elements[dock].transform_scale, 1.0f, 0.001f,
+               "transform:none resets scale");
+    check_near(elements[dock].transform_rotate, 0.0f, 0.001f,
+               "transform:none resets rotation");
+}
+
 static void test_touch_input(void) {
     LunaTouchEvent event;
     LunaTouchEvent active;
@@ -232,6 +292,8 @@ int main(void) {
     test_gradient_geometry_and_color();
     test_declaration_level_important();
     test_live_custom_properties();
+    test_dynamic_ancestor_selector();
+    test_transform_none_reset();
     test_touch_input();
     if (failures) {
         fprintf(stderr, "%d CSS parity check(s) failed\n", failures);
