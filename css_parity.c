@@ -287,6 +287,77 @@ static void test_touch_input(void) {
     check_true(touch_clicks == 1, "a touch pan does not synthesize a click");
 }
 
+static void test_hover_preserves_inherited_icon_face(void) {
+    luna_window_width = 640.0f;
+    luna_window_height = 480.0f;
+    luna_reset_css();
+    luna_parse_html("<body><div class=\"stab\" id=\"tab\"><span class=\"stab_icon luna_icon\" id=\"icon\">&#xf013;</span> Applications</div></body>");
+    luna_parse_css(".luna_icon{font-family:'Luna Symbols'}"
+                   ".stab{display:flex;color:#aaa}.stab:hover{color:#fff}"
+                   ".stab_icon{margin-right:8px;font-size:12px}");
+    update_layout_pass();
+
+    int tab = luna_get_element_by_id("tab");
+    int icon = luna_get_element_by_id("icon");
+    check_true(tab >= 0 && icon >= 0, "hover icon fixture is addressable");
+    if (tab < 0 || icon < 0) return;
+    check_true(elements[icon].font_face == 1,
+               "icon family is selected before hover");
+    check_true(elements[tab].has_inline_text_flow,
+               "icon followed by direct label has anonymous flex placement");
+    float label_x = elements[tab].inline_text_x;
+    luna_mouse_move(elements[icon].x + 1.0, elements[icon].y + 1.0);
+    check_true(elements[icon].font_face == 1,
+               "hover descendant restyle preserves icon family");
+    check_true(elements[tab].has_inline_text_flow,
+               "paint-only hover preserves anonymous flex placement");
+    check_near(elements[tab].inline_text_x, label_x, 0.001f,
+               "paint-only hover keeps label after its icon");
+}
+
+static void test_wrapping_flex_overflow_scroll(void) {
+    luna_window_width = 640.0f;
+    luna_window_height = 480.0f;
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"launchpad\"><input id=\"search\"><div id=\"grid\">"
+                    "<div class=\"app\"></div><div class=\"app\"></div>"
+                    "<div class=\"app\"></div><div class=\"app\"></div>"
+                    "<div class=\"app\"></div><div class=\"app\"></div>"
+                    "<div class=\"app\"></div><div class=\"app\"></div>"
+                    "</div><div id=\"hint\">hint</div></div></body>");
+    luna_parse_css("body{margin:0}#launchpad{position:absolute;inset:0;display:flex;"
+                   "flex-direction:column;align-items:center;padding:30px 0 10px;"
+                   "min-height:0;overflow:hidden}#search{width:180px;height:30px;flex:0 0 30px}"
+                   "#grid{width:220px;flex:1 1 0;min-height:0;padding:10px;"
+                   "display:flex;flex-direction:row;flex-wrap:wrap;align-content:flex-start;"
+                   "gap:10px;overflow-y:auto}.app{width:100px;height:100px;flex:none}"
+                   "#hint{height:20px;flex:0 0 20px}");
+    update_layout_pass();
+
+    int grid = luna_get_element_by_id("grid");
+    check_true(grid >= 0, "wrapping overflow fixture is addressable");
+    if (grid < 0) return;
+    check_true(elements[grid].scroll_content_h >
+               elements[grid].h - elements[grid].pad_t - elements[grid].pad_b,
+               "wrapped flex lines contribute to vertical scroll extent");
+
+    luna_mouse_move(elements[grid].x + 20.0, elements[grid].y + 20.0);
+    luna_scroll(0.0, -1.0);
+    check_true(elements[grid].scroll_dest_top > 0.0f,
+               "mouse wheel scrolls a wrapping flex overflow container");
+}
+
+static void test_calc_viewport_length(void) {
+    float value = 0.0f, offset = 0.0f;
+    int percent = 0;
+    check_true(parse_length_calc("calc(100vh - 36px)",
+                                 &value, &percent, &offset),
+               "calc viewport length is parsed");
+    check_true(percent == 1, "calc vh length keeps a viewport ratio");
+    check_near(value, 1.0f, 0.001f, "calc vh ratio is normalized");
+    check_near(offset, -36.0f, 0.001f, "calc vh pixel offset is retained");
+}
+
 int main(void) {
     test_example_layout();
     test_gradient_geometry_and_color();
@@ -295,6 +366,9 @@ int main(void) {
     test_dynamic_ancestor_selector();
     test_transform_none_reset();
     test_touch_input();
+    test_hover_preserves_inherited_icon_face();
+    test_wrapping_flex_overflow_scroll();
+    test_calc_viewport_length();
     if (failures) {
         fprintf(stderr, "%d CSS parity check(s) failed\n", failures);
         return 1;

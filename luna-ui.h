@@ -179,7 +179,7 @@ extern "C" {
 #define LUNA_UI_MAX_ELEMENTS 2000
 #endif
 #ifndef LUNA_UI_MAX_RULES
-#define LUNA_UI_MAX_RULES 600
+#define LUNA_UI_MAX_RULES 2400
 #endif
 /* Large DOM/CSS records are grown on demand instead of reserving their full
  * maximum in .bss. These values only control the first allocation; the public
@@ -3651,9 +3651,15 @@ static int parse_length_calc(const char* val, float* out_num, int* out_pct, floa
         /* parse: X% op Ypx */
         char* endp = NULL;
         float v1 = strtof(expr, &endp);
-        if (endp && *endp == '%') {
+        /* Viewport units use the same ratio representation as percentages;
+         * the property resolver supplies the width/height basis.  Previously
+         * calc(100vh - 36px) fell into the px branch at the `v`, producing
+         * 100px and clipping tall skinned menus to a header-sized strip. */
+        int first_is_ratio = endp && (*endp == '%' ||
+            strncmp(endp, "vh", 2) == 0 || strncmp(endp, "vw", 2) == 0);
+        if (first_is_ratio) {
             *out_pct = 1; *out_num = v1 / 100.0f;
-            endp++;
+            endp += (*endp == '%') ? 1 : 2;
             while (isspace((unsigned char)*endp)) endp++;
             char op = *endp; if (op == '+' || op == '-') endp++;
             while (isspace((unsigned char)*endp)) endp++;
@@ -7306,8 +7312,13 @@ void update_element_style(LunaElement* e) {
     e->has_flex_basis = 0;
     e->flex_basis = 0.0f;
     e->flex_basis_auto = 1;
-    e->has_inline_text_flow = 0;
-    e->inline_text_x = e->inline_text_w = 0.0f;
+    /* Anonymous flex-text placement is layout output, not computed style.
+     * Preserve it across paint-only restyles such as :hover.  Clearing it
+     * here made a row containing an icon child plus direct label text forget
+     * the label's post-icon position; since color/background hover rules do
+     * not dirty layout, the label then stayed painted over the icon.  A real
+     * flex layout resets and recomputes these fields in
+     * layout_inline_text_after_flex(). */
     /* Browser UA styles size form controls with border-box semantics.  Keep
        ordinary elements content-box unless author CSS overrides box-sizing. */
     e->box_sizing = (strcmp(e->type, "button") == 0 ||
@@ -15286,6 +15297,22 @@ void luna_invalidate_gl_state(void) {
 
 void luna_render(int fbw, int fbh) {
     if (fbw <= 0 || fbh <= 0) return;
+    /* CSS mutations are public operations and may be followed directly by a
+     * paint (not every host has a browser-style update phase between an input
+     * callback and its next surface commit).  Never build paint coordinates
+     * from the previous layout in that case.  This was especially visible
+     * when exposing a display:none flex panel: its text was painted at the
+     * parent's padding for one frame, then moved after an icon child once the
+     * deferred layout ran.
+     *
+     * luna_update_prepare() normally consumes this flag.  Keeping the same
+     * invariant at the renderer boundary makes CSS-driven show/hide atomic
+     * without requiring applications to force a layout from event handlers. */
+    if (g_layout_dirty) {
+        update_layout_pass();
+        g_layout_dirty = 0;
+        g_visual_scan_needed = 1;
+    }
     luna_invalidate_gl_state();
     g_luna_fbw = fbw;
     g_luna_fbh = fbh;
@@ -15387,7 +15414,12 @@ void luna_render(int fbw, int fbh) {
                 rc_element_draw_bounds(clip_anc, &adx, &ady, &adw, &adh);
                 float asc = anc->cur_scale;
                 g_bg_clip_enabled = 1;
-                g_bg_clip_pos[0]  = adx; g_bg_clip_pos[1]  = ady;
+                /* Clip uniforms use the region-local shader coordinate space.
+                 * Full-frame rendering has a zero origin, which hid this bug;
+                 * compact Wayland surfaces otherwise shifted rounded overflow
+                 * clips and cut away the right/bottom of dialogs. */
+                g_bg_clip_pos[0]  = adx - g_render_off_x;
+                g_bg_clip_pos[1]  = ady - g_render_off_y;
                 g_bg_clip_size[0] = adw; g_bg_clip_size[1] = adh;
                 g_bg_clip_rad4[0] = anc->rad_c[0]*asc; g_bg_clip_rad4[1] = anc->rad_c[1]*asc;
                 g_bg_clip_rad4[2] = anc->rad_c[2]*asc; g_bg_clip_rad4[3] = anc->rad_c[3]*asc;
