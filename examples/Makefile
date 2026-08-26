@@ -10,7 +10,7 @@
 #   make web
 #   make all-platforms   # builds everything supported by the current host/toolchain
 
-.DEFAULT_GOAL := native
+.DEFAULT_GOAL := all
 
 ROOT := ..
 BUILD ?= build
@@ -23,7 +23,7 @@ COMMON_CFLAGS := -O2 -std=gnu11 -Wall -Wextra
 UNAME_S := $(shell uname -s 2>/dev/null || echo Unknown)
 HOST_WINDOWS := $(if $(filter Windows_NT,$(OS)),1,0)
 
-.PHONY: native linux windows macos android android-so ios ios-sim web \
+.PHONY: all example tooltip native linux windows macos android android-so ios ios-sim web \
         all-platforms check css-parity clean help
 
 help:
@@ -54,6 +54,19 @@ endif
 CC ?= cc
 GLFW_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 GLFW_LIBS := $(shell pkg-config --libs glfw3 2>/dev/null)
+
+# Preserve the historical Linux/GLFW example targets used by the README and
+# existing scripts. The new platform targets below write into build/.
+TARGET := example
+SAMPLES := tooltip
+
+all: $(TARGET) $(SAMPLES)
+
+example: example.c $(ROOT)/luna-ui.h $(ROOT)/luna_glfw.h
+	$(CC) $(COMMON_CPPFLAGS) $(COMMON_CFLAGS) $(GLFW_CFLAGS) -o $@ $< $(GLFW_LIBS) -lGL -lm
+
+tooltip: tooltip.c $(ROOT)/luna-ui.h $(ROOT)/luna_glfw.h
+	$(CC) $(COMMON_CPPFLAGS) $(COMMON_CFLAGS) $(GLFW_CFLAGS) -o $@ $< $(GLFW_LIBS) -lGL -lm
 
 linux: $(BUILD)/linux/luna-example
 
@@ -226,11 +239,10 @@ $(WEB_JS): example.c $(ROOT)/luna-ui.h $(ROOT)/luna_web.h
 # Existing parity test
 # -----------------------------------------------------------------------------
 css-parity: $(ROOT)/css_parity.c $(ROOT)/luna-ui.h example.c
-	@mkdir -p $(BUILD)
-	$(CC) $(COMMON_CPPFLAGS) $(COMMON_CFLAGS) -o $(BUILD)/css-parity $(ROOT)/css_parity.c -lGL -lm
+	$(CC) $(COMMON_CPPFLAGS) $(COMMON_CFLAGS) -o $@ $(ROOT)/css_parity.c -lGL -lm
 
 check: css-parity
-	$(BUILD)/css-parity
+	./css-parity
 
 # Build what the current host can reasonably support without pretending that
 # Apple SDKs are cross-platform.
@@ -244,3 +256,4 @@ endif
 
 clean:
 	rm -rf $(BUILD)
+	rm -f $(TARGET) $(SAMPLES) css-parity
