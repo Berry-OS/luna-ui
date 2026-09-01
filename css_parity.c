@@ -144,6 +144,40 @@ static void test_gradient_geometry_and_color(void) {
     check_near(a, 136.0f / 255.0f, 0.0001f, "#RGBA alpha nibble expands");
 }
 
+static void test_conic_and_ellipse_cascade(void) {
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"ring\" class=\"ring p0\"></div>"
+                    "<div id=\"wash\" class=\"wash\"></div></body>");
+    luna_parse_css(":root{--arc:#123fb8;--ring-track:rgba(248,251,255,.8)}"
+                   ".ring{background:conic-gradient(from -90deg at 50% 50%,"
+                   "rgba(40,103,238,.16) 0%,rgba(40,103,238,.16) 100%)}"
+                   ".ring.p95{background:conic-gradient(from -90deg at 50% 50%,"
+                   "var(--arc) 0%,var(--arc) 95%,var(--ring-track) 95%,"
+                   "var(--ring-track) 100%)}"
+                   ".wash{background:radial-gradient(ellipse at 50% 50%,"
+                   "#40a8ff 0%,rgba(42,100,236,0) 100%)}");
+
+    int ring = luna_get_element_by_id("ring");
+    int wash = luna_get_element_by_id("wash");
+    check_true(ring >= 0 && wash >= 0, "gradient fixtures are addressable");
+    if (ring < 0 || wash < 0) return;
+    check_true(elements[ring].has_gradient &&
+               elements[ring].grad_type == GRAD_CONIC,
+               "conic-gradient participates in the background cascade");
+    check_true(elements[wash].has_gradient &&
+               elements[wash].grad_type == GRAD_ELLIPSE,
+               "unsized ellipse participates in the background cascade");
+
+    luna_update_classes(ring, "p0", "p95");
+    check_true(elements[ring].has_gradient &&
+               elements[ring].grad_stop_count == 4,
+               "dynamic class restyle replaces the conic gradient");
+    check_near(elements[ring].grad_stop_pos[1], 0.95f, 0.001f,
+               "dynamic conic restyle keeps its progress hard stop");
+    check_near(elements[ring].grad_stop_b[0], 184.0f / 255.0f, 0.001f,
+               "dynamic conic restyle updates its arc colour");
+}
+
 static void test_declaration_level_important(void) {
     luna_reset_css();
     luna_parse_html("<body><div id=\"cascade\" class=\"mixed\">x</div></body>");
@@ -158,6 +192,27 @@ static void test_declaration_level_important(void) {
                "!important color does not incorrectly promote sibling width");
     check_near(probe->t_r, 1.0f, 0.001f, "important color wins later normal color");
     check_near(probe->t_b, 0.0f, 0.001f, "important red remains red");
+}
+
+static void test_live_conic_progress(void) {
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"ring\" class=\"ring\"></div></body>");
+    luna_parse_css(":root{--progress:0%;--arc:#fff;--track:rgba(255,255,255,.3)}"
+                   ".ring{width:140px;height:140px;background:conic-gradient("
+                   "from -90deg at 50% 50%,var(--arc) 0%,var(--arc) var(--progress),"
+                   "var(--track) var(--progress),var(--track) 100%)}");
+    int ring = luna_get_element_by_id("ring");
+    check_true(ring >= 0, "live conic progress fixture is addressable");
+    if (ring < 0) return;
+    check_near(elements[ring].grad_stop_pos[1], 0.0f, 0.001f,
+               "initial --progress resolves to 0% on the ring");
+
+    LunaCssVariable vars[] = { {"--progress", "55%"} };
+    luna_css_set_variables(vars, 1);
+    check_near(elements[ring].grad_stop_pos[1], 0.55f, 0.001f,
+               "luna_css_set_variables advances the conic hard stop");
+    check_near(elements[ring].grad_stop_pos[2], 0.55f, 0.001f,
+               "luna_css_set_variables moves both progress stops together");
 }
 
 static void test_live_custom_properties(void) {
@@ -238,6 +293,37 @@ static void test_transform_none_reset(void) {
                "transform:none resets scale");
     check_near(elements[dock].transform_rotate, 0.0f, 0.001f,
                "transform:none resets rotation");
+}
+
+static void test_ancestor_scale_transform(void) {
+    luna_window_width = 640.0f;
+    luna_window_height = 480.0f;
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"stage\"><div id=\"child\"></div></div></body>");
+    luna_parse_css("body{margin:0}#stage{position:absolute;left:100px;top:100px;"
+                   "width:200px;height:100px}#child{position:absolute;left:20px;"
+                   "top:40px;width:50px;height:20px}");
+    update_layout_pass();
+
+    int stage = luna_get_element_by_id("stage");
+    int child = luna_get_element_by_id("child");
+    check_true(stage >= 0 && child >= 0,
+               "ancestor transform fixture is addressable");
+    if (stage < 0 || child < 0) return;
+
+    /* An animated transform writes cur_scale directly between layout passes. */
+    elements[stage].cur_scale = 0.5f;
+    rc_build();
+    float x, y, w, h;
+    rc_element_draw_bounds(child, &x, &y, &w, &h);
+    check_near(x, 160.0f, 0.01f,
+               "ancestor scale moves a child around the ancestor center");
+    check_near(y, 145.0f, 0.01f,
+               "ancestor scale maps the child vertical position");
+    check_near(w, 25.0f, 0.01f,
+               "ancestor scale changes child paint width");
+    check_near(h, 10.0f, 0.01f,
+               "ancestor scale changes child paint height");
 }
 
 static void test_touch_input(void) {
@@ -361,10 +447,13 @@ static void test_calc_viewport_length(void) {
 int main(void) {
     test_example_layout();
     test_gradient_geometry_and_color();
+    test_conic_and_ellipse_cascade();
     test_declaration_level_important();
+    test_live_conic_progress();
     test_live_custom_properties();
     test_dynamic_ancestor_selector();
     test_transform_none_reset();
+    test_ancestor_scale_transform();
     test_touch_input();
     test_hover_preserves_inherited_icon_face();
     test_wrapping_flex_overflow_scroll();
