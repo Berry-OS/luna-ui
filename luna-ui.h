@@ -162,6 +162,9 @@ typedef char GLchar;
 #ifndef GL_ONE_MINUS_DST_COLOR
 #define GL_ONE_MINUS_DST_COLOR 0x0307
 #endif
+#ifndef GL_ONE_MINUS_SRC_COLOR
+#define GL_ONE_MINUS_SRC_COLOR 0x0301
+#endif
 #ifndef GL_DST_COLOR
 #define GL_DST_COLOR 0x0306
 #endif
@@ -1336,7 +1339,7 @@ const char* bg_vs =
     "}\0";
 
 // uGradient: 0=solid, 1=linear, 2=radial, 3=conic, 4=ellipse
-// Up to 8 color stops via uGradStopCount, uGradColors[], uGradStops[]
+// Up to 12 color stops via uGradStopCount, uGradColors[], uGradStops[]
 // uRadius4: per-corner radius (tl, tr, br, bl in screen orientation).
 // FragPos.y is flipped (0=bottom), so p.y > 0 means the screen-top half.
 const char* bg_fs =
@@ -1350,13 +1353,14 @@ const char* bg_fs =
     "uniform vec4 uRadius4;\n"
     "uniform int uGradient;\n"
     "uniform int uGradStopCount;\n"
-    "uniform vec4 uGradColors[8];\n"
-    "uniform float uGradStops[8];\n"
+    "uniform vec4 uGradColors[12];\n"
+    "uniform float uGradStops[12];\n"
     "uniform float uGradAngle;\n"
     "uniform vec2 uGradCenter;\n"
     "uniform float uGradRadius;\n"
     "uniform float uGradRadRx;\n"
     "uniform float uGradRadRy;\n"
+    "uniform int uPremulAlpha;\n"
     "uniform float uFilterBrightness;\n"
     "uniform float uFilterContrast;\n"
     "uniform float uFilterSaturate;\n"
@@ -1385,7 +1389,7 @@ const char* bg_fs =
     "    t = clamp(t, 0.0, 1.0);\n"
     "    if(uGradStopCount <= 1) return uGradColors[0];\n"
     "    if(t <= uGradStops[0]) return uGradColors[0];\n"
-    "    for(int i = 0; i < 7; i++) {\n"
+    "    for(int i = 0; i < 11; i++) {\n"
     "        if(i + 1 >= uGradStopCount) break;\n"
     "        float a = uGradStops[i];\n"
     "        float b = uGradStops[i + 1];\n"
@@ -1457,7 +1461,9 @@ const char* bg_fs =
     "        if(uFilterHue != 0.0) fc = hue_rotate(fc, uFilterHue);\n"
     "        finalColor.rgb = clamp(fc, 0.0, 1.0);\n"
     "    }\n"
-    "    FragColor = vec4(finalColor.rgb, finalColor.a * alpha);\n"
+    "    float outA = finalColor.a * alpha;\n"
+    "    if(uPremulAlpha != 0) finalColor.rgb *= outA;\n"
+    "    FragColor = vec4(finalColor.rgb, outA);\n"
     "}\0";
 
 // CSS box-shadow: Gaussian soft shadow via SDF of the rounded rect.
@@ -1602,6 +1608,8 @@ const char* img_fs =
     "uniform vec2 uSize;\n"
     "uniform float uRadius;\n"
     "uniform float uAlpha;\n"
+    "uniform vec2 uImgOrigin;\n"
+    "uniform vec2 uImgDrawSize;\n"
     "void main() {\n"
     "    vec2 halfSize = uSize / 2.0;\n"
     "    float r = max(uRadius, 0.001);\n"
@@ -1609,7 +1617,9 @@ const char* img_fs =
     "    float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);\n"
     "    float alpha = 1.0 - smoothstep(r - 1.0, r + 0.5, dist);\n"
     "    if(alpha <= 0.0) discard;\n"
-    "    vec2 uv = FragPos / uSize;\n"
+    "    vec2 p = FragPos - uImgOrigin;\n"
+    "    if(any(lessThan(p, vec2(0.0))) || any(greaterThan(p, uImgDrawSize))) discard;\n"
+    "    vec2 uv = p / uImgDrawSize;\n"
     "    vec4 tc = texture(uImage, uv);\n"
     "    FragColor = vec4(tc.rgb, tc.a * alpha * uAlpha);\n"
     "}\0";
@@ -1696,7 +1706,7 @@ const char* backdrop_fs =
     "    FragColor = vec4(clamp(filtered, 0.0, 1.0), alpha);\n"
     "}\0";
 
-#define MAX_GRAD_STOPS 8
+#define MAX_GRAD_STOPS 12
 #define GRAD_NONE    0
 #define GRAD_LINEAR  1
 #define GRAD_RADIAL  2
@@ -2731,6 +2741,7 @@ static struct {
     GLint uResolution, uPos, uSize, uRotate, uColor, uBorderColor, uBorderWidth, uRadius4;
     GLint uGradient, uGradStopCount, uGradAngle, uGradCenter, uGradRadius;
     GLint uGradRadRx, uGradRadRy;
+    GLint uPremulAlpha;
     GLint uGradColors[MAX_GRAD_STOPS], uGradStops[MAX_GRAD_STOPS];
     GLint uFilterMode, uFilterBrightness, uFilterContrast, uFilterSaturate, uFilterHue;
     GLint uClipEnabled, uClipPos, uClipSize, uClipRadius4;
@@ -2741,12 +2752,15 @@ static struct {
     LunaUniShadow uResolution, uPos, uSize, uRotate, uColor, uBorderColor, uBorderWidth, uRadius4;
     LunaUniShadow uGradient, uGradStopCount, uGradAngle, uGradCenter, uGradRadius;
     LunaUniShadow uGradRadRx, uGradRadRy;
+    LunaUniShadow uPremulAlpha;
     LunaUniShadow uGradColors[MAX_GRAD_STOPS], uGradStops[MAX_GRAD_STOPS];
     LunaUniShadow uFilterMode, uFilterBrightness, uFilterContrast, uFilterSaturate, uFilterHue;
     LunaUniShadow uClipEnabled, uClipPos, uClipSize, uClipRadius4;
 } bg_uni;
 /* Global rounded-clip state for bg_fs: set before each draw_rect_full call */
 static int   g_bg_clip_enabled = 0;
+/* When set, bg_fs premultiplies rgb by alpha for mix-blend-mode screen/multiply. */
+static int   g_blend_premul_rgb = 0;
 static float g_bg_clip_pos[2]  = {0, 0};
 static float g_bg_clip_size[2] = {0, 0};
 static float g_bg_clip_rad4[4] = {0, 0, 0, 0};
@@ -2771,6 +2785,7 @@ static struct {
 } tx_uni;
 static struct {
     GLint uResolution, uPos, uSize, uRadius, uAlpha, uImage;
+    GLint uImgOrigin, uImgDrawSize;
 } img_loc;
 static struct {
     GLint uResolution, uPos, uSize;
@@ -2784,7 +2799,7 @@ static struct {
 
 // Texture cache — path → GL texture ID (loaded once, reused)
 #define MAX_TEXTURES 64
-typedef struct { char path[512]; GLuint tex; } TexEntry;
+typedef struct { char path[512]; GLuint tex; int tw, th; } TexEntry;
 static TexEntry g_tex_cache[MAX_TEXTURES];
 static int g_tex_count = 0;
 void* g_window_ptr_ptr = NULL;
@@ -6724,12 +6739,29 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             }
             else if (strcmp(key, "background-position") == 0) {
                 rule->has_bg_pos = 1;
-                if (strstr(val, "center")) { rule->bg_pos_x = 0.5f; rule->bg_pos_y = 0.5f; }
-                else {
-                    rule->bg_pos_x = parse_float_val(val) / 100.0f;
-                    const char* sp2 = strchr(val, ' ');
-                    rule->bg_pos_y = sp2 ? parse_float_val(sp2 + 1) / 100.0f : 0.5f;
+                char posbuf[128];
+                snprintf(posbuf, sizeof(posbuf), "%s", val);
+                trim_whitespace(posbuf);
+                char* tok1 = strtok(posbuf, " \t");
+                char* tok2 = tok1 ? strtok(NULL, " \t") : NULL;
+                float px = 0.5f, py = 0.5f;
+                if (tok1) {
+                    if (!strcmp(tok1, "left"))   px = 0.0f;
+                    else if (!strcmp(tok1, "center")) px = 0.5f;
+                    else if (!strcmp(tok1, "right"))  px = 1.0f;
+                    else if (!strcmp(tok1, "top") || !strcmp(tok1, "bottom")) {
+                        py = !strcmp(tok1, "top") ? 0.0f : 1.0f;
+                        px = 0.5f;
+                    } else px = parse_float_val(tok1) / 100.0f;
                 }
+                if (tok2) {
+                    if (!strcmp(tok2, "top"))    py = 0.0f;
+                    else if (!strcmp(tok2, "center")) py = 0.5f;
+                    else if (!strcmp(tok2, "bottom")) py = 1.0f;
+                    else py = parse_float_val(tok2) / 100.0f;
+                }
+                rule->bg_pos_x = px;
+                rule->bg_pos_y = py;
             }
             else if (strcmp(key, "backdrop-filter") == 0 ||
                      strcmp(key, "-webkit-backdrop-filter") == 0) {
@@ -12943,21 +12975,76 @@ static GLuint LUNA_UNUSED load_or_get_texture(const char* path) {
     strncpy(g_tex_cache[g_tex_count].path, path, sizeof(g_tex_cache[0].path) - 1);
     g_tex_cache[g_tex_count].path[sizeof(g_tex_cache[0].path) - 1] = '\0';
     g_tex_cache[g_tex_count].tex = tex;
+    g_tex_cache[g_tex_count].tw = w;
+    g_tex_cache[g_tex_count].th = h;
     g_tex_count++;
     return tex;
 }
 
+static int tex_cache_dims(GLuint tex, int* out_w, int* out_h) {
+    for (int i = 0; i < g_tex_count; i++) {
+        if (g_tex_cache[i].tex != tex) continue;
+        if (out_w) *out_w = g_tex_cache[i].tw;
+        if (out_h) *out_h = g_tex_cache[i].th;
+        return 1;
+    }
+    return 0;
+}
+
+static void bg_image_dest_rect(const LunaElement* e, float box_w, float box_h,
+                               int tex_w, int tex_h,
+                               float* ox, float* oy, float* iw, float* ih) {
+    float tw = (float)tex_w, th = (float)tex_h;
+    if (tw <= 0.0f || th <= 0.0f || box_w <= 0.0f || box_h <= 0.0f) {
+        if (ox) *ox = 0.0f;
+        if (oy) *oy = 0.0f;
+        if (iw) *iw = box_w;
+        if (ih) *ih = box_h;
+        return;
+    }
+    float draw_w = box_w, draw_h = box_h;
+    if (e->bg_size_mode != 0) {
+        if (e->bg_size_mode == 1) {
+            float s = (box_w / tw > box_h / th) ? box_w / tw : box_h / th;
+            draw_w = tw * s;
+            draw_h = th * s;
+        } else if (e->bg_size_mode == 2) {
+            float s = (box_w / tw < box_h / th) ? box_w / tw : box_h / th;
+            draw_w = tw * s;
+            draw_h = th * s;
+        } else if (e->bg_size_mode == 3) {
+            draw_w = e->bg_size_w > 0.0f ? e->bg_size_w : box_w;
+            draw_h = e->bg_size_h > 0.0f ? e->bg_size_h : box_h;
+        }
+    }
+    float px = e->bg_pos_x;
+    float py = e->bg_pos_y;
+    float off_x = (box_w - draw_w) * px;
+    float off_y_top = (box_h - draw_h) * py;
+    if (ox) *ox = off_x;
+    if (oy) *oy = box_h - off_y_top - draw_h;
+    if (iw) *iw = draw_w;
+    if (ih) *ih = draw_h;
+}
+
 // Draw a texture cropped to a rounded rect element.
-static void draw_image(float x, float y, float w, float h, float radius, GLuint tex, float alpha) {
+static void draw_image(float x, float y, float w, float h, float radius, GLuint tex, float alpha,
+                       const LunaElement* e) {
     if (!img_program || !tex || alpha <= 0.004f || w <= 0.0f || h <= 0.0f) return;
     float half_min = (w < h ? w : h) * 0.5f;
     if (radius > half_min) radius = half_min;
+    int tw = 0, th = 0;
+    tex_cache_dims(tex, &tw, &th);
+    float img_x = 0.0f, img_y = 0.0f, img_w = w, img_h = h;
+    if (e) bg_image_dest_rect(e, w, h, tw, th, &img_x, &img_y, &img_w, &img_h);
     luna_use_program(img_program);
     glUniform2f(img_loc.uResolution, LUNA_RRES_X, LUNA_RRES_Y);
     glUniform2f(img_loc.uPos,  x - g_render_off_x, y - g_render_off_y);
     glUniform2f(img_loc.uSize, w, h);
     glUniform1f(img_loc.uRadius, radius);
     glUniform1f(img_loc.uAlpha, alpha);
+    glUniform2f(img_loc.uImgOrigin, img_x, img_y);
+    glUniform2f(img_loc.uImgDrawSize, img_w, img_h);
     if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     glUniform1i_(img_loc.uImage, 0);
@@ -13067,6 +13154,7 @@ static void draw_bg_layer(float x, float y, float w, float h,
     uni1f(bg_loc.uFilterContrast,   &bg_uni.uFilterContrast,   1.0f);
     uni1f(bg_loc.uFilterSaturate,   &bg_uni.uFilterSaturate,   1.0f);
     uni1f(bg_loc.uFilterHue,        &bg_uni.uFilterHue,        0.0f);
+    uni1i(bg_loc.uPremulAlpha, &bg_uni.uPremulAlpha, g_blend_premul_rgb);
     uni1i(bg_loc.uClipEnabled, &bg_uni.uClipEnabled, g_bg_clip_enabled);
     if (g_bg_clip_enabled) {
         uni2f(bg_loc.uClipPos,  &bg_uni.uClipPos,  g_bg_clip_pos[0],  g_bg_clip_pos[1]);
@@ -13153,6 +13241,7 @@ void draw_rect_full(float x, float y, float w, float h,
         uni1f(bg_loc.uFilterSaturate,   &bg_uni.uFilterSaturate,   1.0f);
         uni1f(bg_loc.uFilterHue,        &bg_uni.uFilterHue,        0.0f);
     }
+    uni1i(bg_loc.uPremulAlpha, &bg_uni.uPremulAlpha, g_blend_premul_rgb);
     uni1i(bg_loc.uClipEnabled, &bg_uni.uClipEnabled, g_bg_clip_enabled);
     if (g_bg_clip_enabled) {
         uni2f(bg_loc.uClipPos,  &bg_uni.uClipPos,  g_bg_clip_pos[0],  g_bg_clip_pos[1]);
@@ -15733,16 +15822,19 @@ void luna_render(int fbw, int fbh) {
         }
         rc_set_element_scissor(i, fbw, fbh);
         /* mix-blend-mode: switch GL blend equation before drawing element */
+        g_blend_premul_rgb = 0;
         if (e->mix_blend_mode == 1) {
-            /* screen: result = src + dst - src*dst */
-            glBlendFuncSeparate(GL_ONE_MINUS_DST_COLOR, GL_ONE,
+            /* screen: premultiplied src + dst*(1-src) per channel */
+            g_blend_premul_rgb = 1;
+            glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_COLOR,
                                 GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         } else if (e->mix_blend_mode == 3) {
             /* add/lighter: result = src*a + dst */
             glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE,
                                 GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         } else if (e->mix_blend_mode == 2) {
-            /* multiply: result = src*dst (approx via ONE_MINUS_SRC_ALPHA for semi-transparent) */
+            /* multiply: premultiplied src * dst */
+            g_blend_premul_rgb = 1;
             glBlendFuncSeparate(GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA,
                                 GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         }
@@ -15806,7 +15898,7 @@ void luna_render(int fbw, int fbh) {
             }
             if (e->bg_image_tex) {
                 float bw = e->border_width;
-                draw_image(dx+bw, dy+bw, dw-2*bw, dh-2*bw, e->border_radius*scale, e->bg_image_tex, eff_op);
+                draw_image(dx+bw, dy+bw, dw-2*bw, dh-2*bw, e->border_radius*scale, e->bg_image_tex, eff_op, e);
             }
         }
         {
@@ -15901,9 +15993,11 @@ void luna_render(int fbw, int fbh) {
                       ow, e->ol_r, e->ol_g, e->ol_b, e->ol_a*eff_op);
         }
         /* Restore default blend mode after mix-blend-mode element */
-        if (e->mix_blend_mode != 0)
+        if (e->mix_blend_mode != 0) {
+            g_blend_premul_rgb = 0;
             glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
                                 GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        }
         glDisable(GL_SCISSOR_TEST);
         rc_scissor_reset();
     }
@@ -16163,6 +16257,7 @@ static void cache_uniform_locations(void) {
     bg_loc.uGradRadius  = glGetUniformLocation(bg_program, "uGradRadius");
     bg_loc.uGradRadRx   = glGetUniformLocation(bg_program, "uGradRadRx");
     bg_loc.uGradRadRy   = glGetUniformLocation(bg_program, "uGradRadRy");
+    bg_loc.uPremulAlpha = glGetUniformLocation(bg_program, "uPremulAlpha");
     for (int i = 0; i < MAX_GRAD_STOPS; i++) {
         char uname[32];
         snprintf(uname, sizeof(uname), "uGradColors[%d]", i);
@@ -16209,6 +16304,8 @@ static void cache_uniform_locations(void) {
     img_loc.uRadius     = glGetUniformLocation(img_program, "uRadius");
     img_loc.uAlpha      = glGetUniformLocation(img_program, "uAlpha");
     img_loc.uImage      = glGetUniformLocation(img_program, "uImage");
+    img_loc.uImgOrigin  = glGetUniformLocation(img_program, "uImgOrigin");
+    img_loc.uImgDrawSize = glGetUniformLocation(img_program, "uImgDrawSize");
     if (blur_program) {
         blur_loc.uResolution  = glGetUniformLocation(blur_program, "uResolution");
         blur_loc.uPos         = glGetUniformLocation(blur_program, "uPos");
