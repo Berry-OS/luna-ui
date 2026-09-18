@@ -13090,18 +13090,16 @@ static float gradient_stop_basis(int type, float angle,
 
 /* Draw one LunaBgLayer on top of the current framebuffer at (x,y,w,h).
    Used by luna_render to render stacked background layers. */
+static void luna_normalize_border_radii(float w, float h, float* r4);
+
 static void draw_bg_layer(float x, float y, float w, float h,
                            const float* rad4, float eff_op,
                            float rotate, const LunaBgLayer* layer) {
     if (!layer) return;
     float c4[4] = {0,0,0,0};
-    float half_min = (w < h ? w : h) * 0.5f;
     if (rad4) {
-        for (int i = 0; i < 4; i++) {
-            c4[i] = rad4[i];
-            if (c4[i] > half_min) c4[i] = half_min;
-            if (c4[i] < 0.0f) c4[i] = 0.0f;
-        }
+        for (int i = 0; i < 4; i++) c4[i] = rad4[i];
+        luna_normalize_border_radii(w, h, c4);
     }
     int grad_mode = layer->has_gradient ? layer->grad_type : GRAD_NONE;
     float lr = 0, lg = 0, lb = 0, la = 0;
@@ -13166,6 +13164,23 @@ static void draw_bg_layer(float x, float y, float w, float h,
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 }
 
+/* CSS Backgrounds §5.5: radii are scaled together when adjacent corners do
+ * not fit the box. Independent clamping changes asymmetric small controls. */
+static void luna_normalize_border_radii(float w, float h, float* r4) {
+    if (!r4) return;
+    for (int i = 0; i < 4; i++) if (r4[i] < 0.0f) r4[i] = 0.0f;
+    float sums[4] = { r4[0] + r4[1], r4[3] + r4[2],
+                      r4[0] + r4[3], r4[1] + r4[2] };
+    float edges[4] = { w, w, h, h }, scale = 1.0f;
+    for (int i = 0; i < 4; i++)
+        if (sums[i] > edges[i] && sums[i] > 0.0f) {
+            float s = edges[i] / sums[i];
+            if (s < scale) scale = s;
+        }
+    if (scale < 1.0f)
+        for (int i = 0; i < 4; i++) r4[i] *= scale;
+}
+
 // Full-featured rect draw: solid color or gradient (linear/radial/conic/ellipse, multi-stop).
 // rad4: per-corner radius {tl, tr, br, bl}; NULL means square corners.
 void draw_rect_full(float x, float y, float w, float h,
@@ -13178,14 +13193,10 @@ void draw_rect_full(float x, float y, float w, float h,
 
     // CSS border-radius: 50% is stored as 50 (parse_float_val ignores %).
     // Cap to min(w,h)/2 so "50%" on small elements (e.g. 13px buttons) forms a circle.
-    float half_min = (w < h ? w : h) * 0.5f;
     float c4[4] = { 0, 0, 0, 0 };
     if (rad4) {
-        for (int i = 0; i < 4; i++) {
-            c4[i] = rad4[i];
-            if (c4[i] > half_min) c4[i] = half_min;
-            if (c4[i] < 0.0f) c4[i] = 0.0f;
-        }
+        for (int i = 0; i < 4; i++) c4[i] = rad4[i];
+        luna_normalize_border_radii(w, h, c4);
     }
 
     luna_use_program(bg_program);
