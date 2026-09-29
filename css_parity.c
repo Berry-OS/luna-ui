@@ -238,6 +238,88 @@ static void test_live_custom_properties(void) {
                "custom-property color updates in place");
 }
 
+/* Custom properties cascade and inherit per element: a later rule that does
+ * not match must not replace the value an ancestor declared. */
+static void test_scoped_custom_properties(void) {
+    luna_reset_css();
+    luna_parse_html("<body><div class=\"light\"><p id=\"scoped\">x</p></div>"
+                    "<div class=\"dark\"><p id=\"scoped-dark\" style=\"--pad:6px\">x</p></div>"
+                    "<p id=\"scoped-none\">x</p></body>");
+    luna_parse_css(".light{--bg:#ff0000}.dark{--bg:#00ff00}"
+                   "p{background:var(--bg);width:var(--pad,3px);--twice:var(--pad,3px)}"
+                   "#scoped-none{height:var(--twice)}");
+    int a = luna_get_element_by_id("scoped");
+    int b = luna_get_element_by_id("scoped-dark");
+    int c = luna_get_element_by_id("scoped-none");
+    check_true(a >= 0 && b >= 0 && c >= 0, "scoped custom-property fixture is addressable");
+    if (a < 0 || b < 0 || c < 0) return;
+    check_near(elements[a].r, 1.0f, 0.001f, "custom property inherits from its own ancestor");
+    check_near(elements[b].g, 1.0f, 0.001f, "sibling subtree sees its own value");
+    check_near(elements[c].a, 0.0f, 0.001f, "undefined var() without fallback is dropped");
+    check_near(elements[a].css_width, 3.0f, 0.01f, "var() fallback applies");
+    check_near(elements[b].css_width, 6.0f, 0.01f, "inline custom property is seen");
+    check_near(elements[c].css_height, 3.0f, 0.01f, "custom property referencing var() resolves");
+}
+
+/* <body> is the document root; the <html> above it is implied, so `html X`
+ * and `html > body` selectors match.  A custom property built from an
+ * undefined var() is invalid: var() of it takes its fallback. */
+static void test_implied_html_and_invalid_vars(void) {
+    luna_reset_css();
+    luna_reset_document();
+    luna_parse_html("<body class=\"t-light\"><div id=\"html-desc\">x</div></body>");
+    luna_parse_css("html body.t-light{--ib:#0000ff}html>body{--w:21px}"
+                   "html > div{height:9px}"
+                   "#html-desc{--iv:var(--nowhere);background:var(--ib);"
+                   "color:var(--iv,#00ff00);width:var(--w)}");
+    int d = luna_get_element_by_id("html-desc");
+    check_true(d >= 0, "implied-html fixture is addressable");
+    if (d < 0) return;
+    check_near(elements[d].b, 1.0f, 0.001f, "html descendant selector reaches body");
+    check_near(elements[d].css_width, 21.0f, 0.01f, "html > body matches");
+    check_true(!elements[d].has_css_height, "html > div does not match body's child");
+    check_near(elements[d].t_g, 1.0f, 0.001f, "invalid custom property takes the fallback");
+}
+
+/* Long data: URLs pass through fixed value buffers as short keys that decode
+ * back to the original bytes. */
+static void test_long_data_url(void) {
+    static char css[4096];
+    char payload[2049];
+    memset(payload, 'A', sizeof payload - 1);
+    payload[sizeof payload - 1] = '\0';
+    snprintf(css, sizeof css, ":root{--logo:url(data:image/png;base64,%s)}"
+             "#data-img{background-image:var(--logo)}", payload);
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"data-img\">x</div></body>");
+    luna_parse_css(css);
+    int d = luna_get_element_by_id("data-img");
+    check_true(d >= 0 && strncmp(elements[d].bg_image_path, "data:@", 6) == 0,
+               "long data: URL reaches the element as a key");
+    long n = 0;
+    unsigned char* bytes = d >= 0 ? data_url_bytes(elements[d].bg_image_path, &n) : NULL;
+    check_true(bytes && n == 2048 / 4 * 3, "data: URL key decodes to the full payload");
+    free(bytes);
+}
+
+/* background-size percentages are of the box; auto keeps the aspect. */
+static void test_background_size_units(void) {
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"bgs-a\">x</div><div id=\"bgs-b\">x</div></body>");
+    luna_parse_css("#bgs-a{width:400px;height:200px;background-size:100% 100%}"
+                   "#bgs-b{width:400px;height:200px;background-size:50%}");
+    int a = luna_get_element_by_id("bgs-a"), b = luna_get_element_by_id("bgs-b");
+    check_true(a >= 0 && b >= 0, "background-size fixture is addressable");
+    if (a < 0 || b < 0) return;
+    float ox, oy, w, h;
+    bg_image_dest_rect(&elements[a], 400.0f, 200.0f, 100, 50, &ox, &oy, &w, &h);
+    check_near(w, 400.0f, 0.01f, "background-size 100% spans the box width");
+    check_near(h, 200.0f, 0.01f, "background-size 100% spans the box height");
+    bg_image_dest_rect(&elements[b], 400.0f, 200.0f, 100, 50, &ox, &oy, &w, &h);
+    check_near(w, 200.0f, 0.01f, "background-size 50% is half the box width");
+    check_near(h, 100.0f, 0.01f, "background-size auto height keeps the aspect");
+}
+
 static void test_dynamic_ancestor_selector(void) {
     luna_window_width = 320.0f;
     luna_window_height = 200.0f;
@@ -451,6 +533,10 @@ int main(void) {
     test_declaration_level_important();
     test_live_conic_progress();
     test_live_custom_properties();
+    test_scoped_custom_properties();
+    test_implied_html_and_invalid_vars();
+    test_long_data_url();
+    test_background_size_units();
     test_dynamic_ancestor_selector();
     test_transform_none_reset();
     test_ancestor_scale_transform();

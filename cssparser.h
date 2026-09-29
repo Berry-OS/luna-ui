@@ -24,16 +24,16 @@
 
 /* ── Limits ────────────────────────────────────────────────────────────
  *
- * CSSRule embeds these arrays inline, so sizeof(CSSRule) is
- * O(SELECTORS × PARTS² × STR + DECLS × (STR+VALUE)).  Earlier caps
- * (PARTS=16, STR=512, DECLS=128) made every rule ~3.2 MB; parsing
- * luna-shell's ~400-rule sheet briefly mapped ~1.4 GB.  These limits
- * still clear every skin / demo stylesheet in-tree (max ~51 decls,
- * value length 766, short selectors) at ~100–150 KB per rule.
+ * A rule's selector list and declarations are heap arrays that grow as the
+ * sheet asks (framework themes declare hundreds of custom properties in one
+ * block, and selector lists run long); only the parts inside one selector
+ * and the string sizes are fixed.  Long values such as data: URLs are
+ * replaced by short keys before parsing (luna-ui), so CSS_MAX_VALUE bounds
+ * ordinary values only.
  */
-#define CSS_MAX_SELECTORS     8
+#define CSS_MAX_SELECTORS  4096   /* per rule: a sanity bound, not storage */
 #define CSS_MAX_PARTS         6
-#define CSS_MAX_DECLS        56
+#define CSS_MAX_DECLS      4096   /* per rule: a sanity bound, not storage */
 #define CSS_MAX_RULES       512
 #define CSS_MAX_ATRULES      64
 #define CSS_MAX_STR          96
@@ -116,10 +116,10 @@ typedef struct {
 
 /* One CSS rule: selector list + declaration block */
 typedef struct {
-    CSSSelector selectors[CSS_MAX_SELECTORS];
-    int selector_count;
-    CSSDeclaration decls[CSS_MAX_DECLS];
-    int decl_count;
+    CSSSelector *selectors;   /* malloc'd; owned by the rule */
+    int selector_count, selector_cap;
+    CSSDeclaration *decls;    /* malloc'd; owned by the rule */
+    int decl_count, decl_cap;
     int specificity; /* max of all selectors */
 } CSSRule;
 
@@ -540,22 +540,58 @@ static int parse_one_selector(Lexer *l, CSSSelector *sel) {
     return ci > 0 || (sel->compound_count == 1 && sel->compounds[0].part_count == 0) ? 1 : 0;
 }
 
-/* Parse selector list (comma-separated). Returns count. */
-static int parse_selector_list(Lexer *l, CSSSelector *sels, int max) {
-    int count = 0;
+/* The next free selector / declaration of a rule, grown on demand (NULL
+ * past the sanity bound or out of memory). */
+static CSSSelector *rule_selector_slot(CSSRule *r) {
+    if (r->selector_count >= CSS_MAX_SELECTORS) return NULL;
+    if (r->selector_count == r->selector_cap) {
+        int cap = r->selector_cap ? r->selector_cap * 2 : 2;
+        CSSSelector *g = realloc(r->selectors, (size_t)cap * sizeof(*g));
+        if (!g) return NULL;
+        r->selectors = g;
+        r->selector_cap = cap;
+    }
+    return &r->selectors[r->selector_count];
+}
+
+static CSSDeclaration *rule_decl_slot(CSSRule *r) {
+    if (r->decl_count >= CSS_MAX_DECLS) return NULL;
+    if (r->decl_count == r->decl_cap) {
+        int cap = r->decl_cap ? r->decl_cap * 2 : 8;
+        CSSDeclaration *g = realloc(r->decls, (size_t)cap * sizeof(*g));
+        if (!g) return NULL;
+        r->decls = g;
+        r->decl_cap = cap;
+    }
+    return &r->decls[r->decl_count];
+}
+
+/* Frees what a rule owns (not the rule itself). */
+static void css_rule_release(CSSRule *r) {
+    for (int d = 0; d < r->decl_count; d++) free(r->decls[d].variable_source);
+    free(r->decls);
+    free(r->selectors);
+    r->decls = NULL;
+    r->selectors = NULL;
+    r->decl_count = r->decl_cap = r->selector_count = r->selector_cap = 0;
+}
+
+/* Parse selector list (comma-separated) into the rule. Returns count. */
+static int parse_selector_list(Lexer *l, CSSRule *rule) {
     while (!lex_eof(l) && lex_peek(l) != '{') {
         lex_skip_ws(l);
         if (lex_peek(l) == '{') break;
-        if (count >= max) {
+        CSSSelector *slot = rule_selector_slot(rule);
+        if (!slot) {
             /* skip remaining selectors */
             while (!lex_eof(l) && lex_peek(l) != '{') lex_advance(l);
             break;
         }
-        if (parse_one_selector(l, &sels[count])) count++;
+        if (parse_one_selector(l, slot)) rule->selector_count++;
         lex_skip_ws(l);
         if (lex_peek(l) == ',') lex_advance(l);
     }
-    return count;
+    return rule->selector_count;
 }
 
 /* ── Declaration parser ──────────────────────────────────────────────── */
@@ -608,8 +644,8 @@ static void parse_rule_block(Lexer *l, CSSRule *rule, CSSCallbacks *cb) {
         if (c == ';') { lex_advance(l); continue; }
         if (c == '\0') break;
 
-        if (rule->decl_count < CSS_MAX_DECLS) {
-            CSSDeclaration *d = &rule->decls[rule->decl_count];
+        CSSDeclaration *d = rule_decl_slot(rule);
+        if (d) {
             parse_declaration(l, d);
             if (d->property[0]) {
                 if (cb && cb->on_declaration) cb->on_declaration(cb->user_data, d);
@@ -683,7 +719,7 @@ static void sheet_add_rule(CSSStyleSheet *sheet, const CSSRule *rule) {
         int next = sheet->rule_cap ? sheet->rule_cap + 64 : 32;
         if (next < sheet->rule_count + 1) next = sheet->rule_count + 1;
         CSSRule *grown = realloc(sheet->rules, (size_t)next * sizeof(CSSRule));
-        if (!grown) return;
+        if (!grown) { css_rule_release((CSSRule *)rule); return; }
         sheet->rules = grown;
         sheet->rule_cap = next;
     }
@@ -761,15 +797,16 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                         if (lex_peek(l) == '@') { skip_block(l); continue; }
                         CSSRule *inner = calloc(1, sizeof(*inner));
                         if (!inner) return;
-                        inner->selector_count = parse_selector_list(l, inner->selectors, CSS_MAX_SELECTORS);
+                        parse_selector_list(l, inner);
                         lex_skip_ws(l);
                         if (lex_peek(l) == '{') {
                             parse_rule_block(l, inner, NULL);
-                            if (!nested_rules_push(&at, inner)) { free(inner); return; }
+                            if (!nested_rules_push(&at, inner)) { css_rule_release(inner); free(inner); return; }
                         } else {
                             /* skip garbage */
                             while (!lex_eof(l) && lex_peek(l) != '}' && lex_peek(l) != '{')
                                 lex_advance(l);
+                            css_rule_release(inner);
                         }
                         free(inner);
                     }
@@ -802,12 +839,14 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                         str_trim(stop_sel);
                         /* A block may target several stops: `0%, 100% {...}`. */
                         char *stop = stop_sel;
-                        while (*stop && kf->selector_count < CSS_MAX_SELECTORS) {
+                        while (*stop) {
                             char *comma = strchr(stop, ',');
                             if (comma) *comma = '\0';
                             str_trim(stop);
-                            if (*stop) {
-                                CSSSelector *sel = &kf->selectors[kf->selector_count++];
+                            CSSSelector *sel = *stop ? rule_selector_slot(kf) : NULL;
+                            if (sel) {
+                                memset(sel, 0, sizeof(*sel));
+                                kf->selector_count++;
                                 snprintf(sel->compounds[0].parts[0].name, CSS_MAX_STR, "%s", stop);
                                 sel->compounds[0].parts[0].type = CSS_SEL_TYPE;
                                 sel->compounds[0].part_count = 1;
@@ -818,7 +857,7 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                         }
                         lex_skip_ws(l);
                         if (lex_peek(l) == '{') parse_rule_block(l, kf, NULL);
-                        if (!nested_rules_push(&at, kf)) { free(kf); return; }
+                        if (!nested_rules_push(&at, kf)) { css_rule_release(kf); free(kf); return; }
                         free(kf);
                     }
                 }
@@ -863,7 +902,7 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
         if (!rule) return;
         if (cb && cb->on_rule_start) cb->on_rule_start(cb->user_data);
 
-        rule->selector_count = parse_selector_list(l, rule->selectors, CSS_MAX_SELECTORS);
+        parse_selector_list(l, rule);
         lex_skip_ws(l);
 
         if (lex_peek(l) == '{') {
@@ -881,8 +920,11 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
             }
 
             if (rule->selector_count > 0 || rule->decl_count > 0)
-                sheet_add_rule(sheet, rule);
+                sheet_add_rule(sheet, rule);      /* the sheet now owns its arrays */
+            else
+                css_rule_release(rule);
         } else {
+            css_rule_release(rule);
             /* malformed: skip to next brace or semicolon */
             while (!lex_eof(l) && lex_peek(l) != '{' && lex_peek(l) != ';')
                 lex_advance(l);
@@ -899,57 +941,31 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
 
 /* ── CSS custom property resolver ───────────────────────────────── */
 
+static void custom_props_take(CSSStyleSheet *sheet, const CSSRule *rule) {
+    for (int di = 0; di < rule->decl_count; di++) {
+        const char *prop = rule->decls[di].property;
+        if (prop[0] != '-' || prop[1] != '-') continue;
+        int ci = 0;
+        while (ci < sheet->custom_prop_count && strcmp(sheet->custom_props[ci].name, prop) != 0) ci++;
+        if (ci == sheet->custom_prop_count) {
+            if (ci >= 128) continue;
+            sheet->custom_prop_count++;
+            snprintf(sheet->custom_props[ci].name, sizeof sheet->custom_props[ci].name, "%.63s", prop);
+        }
+        snprintf(sheet->custom_props[ci].value, sizeof sheet->custom_props[ci].value, "%.1023s",
+                 rule->decls[di].value);
+    }
+}
+
 static void css_collect_custom_props(CSSStyleSheet *sheet) {
     sheet->custom_prop_count = 0;
-    /* Pass 1: collect all --name: value declarations */
-    for (int ri = 0; ri < sheet->rule_count; ri++) {
-        CSSRule *rule = &sheet->rules[ri];
-        for (int di = 0; di < rule->decl_count; di++) {
-            const char *prop = rule->decls[di].property;
-            if (prop[0] == '-' && prop[1] == '-') {
-                int found = 0;
-                for (int ci = 0; ci < sheet->custom_prop_count; ci++) {
-                    if (strcmp(sheet->custom_props[ci].name, prop) == 0) {
-                        strncpy(sheet->custom_props[ci].value, rule->decls[di].value, 1023);
-                        sheet->custom_props[ci].value[1023] = '\0';
-                        found = 1; break;
-                    }
-                }
-                if (!found && sheet->custom_prop_count < 128) {
-                    strncpy(sheet->custom_props[sheet->custom_prop_count].name, prop, 63);
-                    sheet->custom_props[sheet->custom_prop_count].name[63] = '\0';
-                    strncpy(sheet->custom_props[sheet->custom_prop_count].value, rule->decls[di].value, 1023);
-                    sheet->custom_props[sheet->custom_prop_count].value[1023] = '\0';
-                    sheet->custom_prop_count++;
-                }
-            }
-        }
-    }
+    /* Pass 1: collect all --name: value declarations (later ones win) */
+    for (int ri = 0; ri < sheet->rule_count; ri++)
+        custom_props_take(sheet, &sheet->rules[ri]);
     /* Also check nested (at-rule) rules */
-    for (int ai = 0; ai < sheet->at_rule_count; ai++) {
-        CSSAtRule *at = &sheet->at_rules[ai];
-        for (int ri2 = 0; ri2 < at->nested_rule_count; ri2++) {
-            CSSRule *rule = &at->nested_rules[ri2];
-            for (int di = 0; di < rule->decl_count; di++) {
-                const char *prop = rule->decls[di].property;
-                if (prop[0] == '-' && prop[1] == '-') {
-                    int found = 0;
-                    for (int ci = 0; ci < sheet->custom_prop_count; ci++) {
-                        if (strcmp(sheet->custom_props[ci].name, prop) == 0) {
-                            strncpy(sheet->custom_props[ci].value, rule->decls[di].value, 1023);
-                            found = 1; break;
-                        }
-                    }
-                    if (!found && sheet->custom_prop_count < 128) {
-                        strncpy(sheet->custom_props[sheet->custom_prop_count].name, prop, 63);
-                        sheet->custom_props[sheet->custom_prop_count].name[63] = '\0';
-                        strncpy(sheet->custom_props[sheet->custom_prop_count].value, rule->decls[di].value, 1023);
-                        sheet->custom_prop_count++;
-                    }
-                }
-            }
-        }
-    }
+    for (int ai = 0; ai < sheet->at_rule_count; ai++)
+        for (int ri2 = 0; ri2 < sheet->at_rules[ai].nested_rule_count; ri2++)
+            custom_props_take(sheet, &sheet->at_rules[ai].nested_rules[ri2]);
 }
 
 static void resolve_var_in_value(const CSSStyleSheet *sheet, char *value, int maxlen) {
@@ -1084,12 +1100,10 @@ void css_parse_cb(const char *text, size_t len, CSSCallbacks *cb) {
 void css_free(CSSStyleSheet *sheet) {
     if (!sheet) return;
     for (int i = 0; i < sheet->rule_count; i++)
-        for (int d = 0; d < sheet->rules[i].decl_count; d++)
-            free(sheet->rules[i].decls[d].variable_source);
+        css_rule_release(&sheet->rules[i]);
     for (int i = 0; i < sheet->at_rule_count; i++) {
         for (int r = 0; r < sheet->at_rules[i].nested_rule_count; r++)
-            for (int d = 0; d < sheet->at_rules[i].nested_rules[r].decl_count; d++)
-                free(sheet->at_rules[i].nested_rules[r].decls[d].variable_source);
+            css_rule_release(&sheet->at_rules[i].nested_rules[r]);
         free(sheet->at_rules[i].nested_rules);
     }
     free(sheet->rules);
