@@ -80,6 +80,11 @@ typedef enum {
 /* ── Structures ──────────────────────────────────────────────────────── */
 
 /* One simple selector part (e.g., div, .class, #id, [attr=val], :hover) */
+/* Design systems declare hundreds of --tokens on :root (Yahoo's riff has ~200). */
+#ifndef CSS_MAX_CUSTOM_PROPS
+#define CSS_MAX_CUSTOM_PROPS 384
+#endif
+
 typedef struct {
     CSSSelectorPartType type;
     char name[CSS_MAX_STR];       /* tag / class / id / attr name / pseudo */
@@ -121,6 +126,11 @@ typedef struct {
     CSSDeclaration *decls;    /* malloc'd; owned by the rule */
     int decl_count, decl_cap;
     int specificity; /* max of all selectors */
+    /* The selector list as written, valid only while the sheet is being parsed
+     * (it points into the source, or into text a nested rule owns): nesting
+     * needs it to build the selectors of the rules inside this one. */
+    const char *sel_src;
+    size_t sel_len;
 } CSSRule;
 
 /* One @-rule */
@@ -146,7 +156,7 @@ typedef struct {
     int        error_count;
     char       last_error[256];
     /* CSS custom properties from :root / any rule */
-    struct { char name[64]; char value[1024]; } custom_props[128];
+    struct { char name[64]; char value[1024]; } custom_props[CSS_MAX_CUSTOM_PROPS];
     int custom_prop_count;
 } CSSStyleSheet;
 
@@ -401,6 +411,7 @@ static int calc_specificity(const CSSSelector *sel) {
 
 /* Forward declaration */
 static void parse_rule_block(Lexer *l, CSSRule *rule, CSSCallbacks *cb);
+static void skip_block(Lexer *l);
 
 static void parse_selector_part(Lexer *l, CSSSelectorPart *part) {
     char c = lex_peek(l);
@@ -576,8 +587,237 @@ static void css_rule_release(CSSRule *r) {
     r->decl_count = r->decl_cap = r->selector_count = r->selector_cap = 0;
 }
 
+/* ── Selector text rewriting ─────────────────────────────────────────────
+ * :is() / :where() / :matches() / :-webkit-any() lists, :not(a, b) and the `&`
+ * of nested rules are resolved on the selector text, before the ordinary
+ * selector parser sees it: one rule becomes several plain selectors. */
+
+typedef struct { char *p; size_t n, cap; } CssSelBuf;
+
+static void css_selbuf_put(CssSelBuf *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 128;
+        while (cap < b->n + n + 1) cap *= 2;
+        char *g = realloc(b->p, cap);
+        if (!g) return;
+        b->p = g; b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = '\0';
+}
+
+/* Index of the char that ends the nest opened at s[i] ('(' or '['), or n. */
+static size_t css_sel_match(const char *s, size_t n, size_t i) {
+    int depth = 0;
+    for (; i < n; i++) {
+        char c = s[i];
+        if (c == '"' || c == '\'') { char q = c; for (i++; i < n && s[i] != q; i++) if (s[i] == '\\') i++; }
+        else if (c == '(' || c == '[') depth++;
+        else if ((c == ')' || c == ']') && --depth == 0) return i;
+    }
+    return n;
+}
+
+/* Splits s[0..n) at top-level commas: calls fn(start, len, user) for each. */
+static void css_sel_split(const char *s, size_t n, void (*fn)(const char *, size_t, void *), void *user) {
+    size_t start = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i < n && (s[i] == '(' || s[i] == '[')) { i = css_sel_match(s, n, i); continue; }
+        if (i < n && (s[i] == '"' || s[i] == '\'')) { char q = s[i]; for (i++; i < n && s[i] != q; i++) if (s[i] == '\\') i++; continue; }
+        if (i == n || s[i] == ',') {
+            size_t a = start, b = i;
+            while (a < b && isspace((unsigned char)s[a])) a++;
+            while (b > a && isspace((unsigned char)s[b - 1])) b--;
+            if (b > a) fn(s + a, b - a, user);
+            start = i + 1;
+        }
+    }
+}
+
+static int css_sel_is_ident_start(char c) {
+    return isalpha((unsigned char)c) || c == '_' || c == '*' || (unsigned char)c >= 0x80;
+}
+
+/* Start of the last compound of s[0..n): after the last top-level space or combinator. */
+static size_t css_sel_last_compound(const char *s, size_t n) {
+    size_t cs = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '(' || s[i] == '[') { i = css_sel_match(s, n, i); continue; }
+        if (isspace((unsigned char)s[i]) || s[i] == '>' || s[i] == '+' || s[i] == '~') cs = i + 1;
+    }
+    return cs;
+}
+
+/* The leading type selector (ident or *) of a compound: its length, 0 if none. */
+static size_t css_sel_type_len(const char *s, size_t n) {
+    if (!n || !css_sel_is_ident_start(s[0])) return 0;
+    if (s[0] == '*') return 1;
+    size_t i = 0;
+    while (i < n && (isalnum((unsigned char)s[i]) || s[i] == '-' || s[i] == '_' || (unsigned char)s[i] >= 0x80)) i++;
+    return i;
+}
+
+static int css_sel_starts_ci(const char *s, const char *lit) { return css_strncasecmp(s, lit, strlen(lit)) == 0; }
+
+/* Length of the ":is(" style prefix at s, 0 if there is none. */
+static size_t css_sel_group_pseudo(const char *s) {
+    static const char *names[] = { ":is(", ":where(", ":matches(", ":-webkit-any(", ":-moz-any(", NULL };
+    for (int i = 0; names[i]; i++) if (css_sel_starts_ci(s, names[i])) return strlen(names[i]);
+    return 0;
+}
+
+typedef struct { const char *prefix; size_t plen; const char *suffix; size_t slen; CssSelBuf *out; int depth; } CssSelAlt;
+static void css_sel_expand_one(const char *s, size_t n, CssSelBuf *out, int depth);
+
+static void css_sel_alt_cb(const char *alt, size_t an, void *user) {
+    CssSelAlt *a = (CssSelAlt *)user;
+    size_t cs = css_sel_last_compound(a->prefix, a->plen);
+    const char *pc = a->prefix + cs;
+    size_t pcn = a->plen - cs;
+    /* the alternative's own last compound is what merges with the prefix's */
+    size_t ac = css_sel_last_compound(alt, an);
+    size_t tp = css_sel_type_len(pc, pcn), ta = css_sel_type_len(alt + ac, an - ac);
+    CssSelBuf r = {0};
+    css_selbuf_put(&r, a->prefix, cs);                 /* everything before the compound */
+    css_selbuf_put(&r, alt, ac);                       /* the alternative's ancestors */
+    if (tp && ta) {
+        if (pc[0] == '*') { css_selbuf_put(&r, alt + ac, ta); }
+        else if (alt[ac] == '*' || (tp == ta && !css_strncasecmp(pc, alt + ac, tp))) { css_selbuf_put(&r, pc, tp); }
+        else { free(r.p); return; }                // div:is(p) can match nothing
+    } else if (tp) css_selbuf_put(&r, pc, tp);
+    else if (ta) css_selbuf_put(&r, alt + ac, ta);
+    css_selbuf_put(&r, pc + tp, pcn - tp);
+    css_selbuf_put(&r, alt + ac + ta, an - ac - ta);
+    css_selbuf_put(&r, a->suffix, a->slen);
+    if (r.p) css_sel_expand_one(r.p, r.n, a->out, a->depth + 1);
+    free(r.p);
+}
+
+static void css_sel_not_cb(const char *alt, size_t an, void *user) {
+    CssSelBuf *b = (CssSelBuf *)user;
+    css_selbuf_put(b, ":not(", 5); css_selbuf_put(b, alt, an); css_selbuf_put(b, ")", 1);
+}
+
+/* One complex selector -> its plain forms, appended to out (comma separated). */
+static void css_sel_expand_one(const char *s, size_t n, CssSelBuf *out, int depth) {
+    for (size_t i = 0; i < n && depth < 8; i++) {
+        if (s[i] == '[') { i = css_sel_match(s, n, i); continue; }
+        if (s[i] == '"' || s[i] == '\'') { char q = s[i]; for (i++; i < n && s[i] != q; i++) if (s[i] == '\\') i++; continue; }
+        if (s[i] != ':') continue;
+        size_t gl = css_sel_group_pseudo(s + i);
+        if (gl) {
+            size_t close = css_sel_match(s, n, i + gl - 1);
+            if (close >= n) break;
+            CssSelAlt a = { s, i, s + close + 1, n - close - 1, out, depth };
+            css_sel_split(s + i + gl, close - i - gl, css_sel_alt_cb, &a);
+            return;
+        }
+        if (css_sel_starts_ci(s + i, ":not(")) {
+            size_t close = css_sel_match(s, n, i + 4);
+            if (close >= n) break;
+            const char *arg = s + i + 5; size_t an = close - i - 5;
+            int has_comma = 0;
+            for (size_t k = 0; k < an; k++) { if (arg[k] == '(' || arg[k] == '[') { k = css_sel_match(arg, an, k); continue; } if (arg[k] == ',') has_comma = 1; }
+            if (has_comma) {
+                CssSelBuf r = {0};
+                css_selbuf_put(&r, s, i);
+                css_sel_split(arg, an, css_sel_not_cb, &r);
+                css_selbuf_put(&r, s + close + 1, n - close - 1);
+                css_sel_expand_one(r.p, r.n, out, depth + 1);
+                free(r.p);
+                return;
+            }
+            i = close;
+        }
+    }
+    if (out->n) css_selbuf_put(out, ", ", 2);
+    css_selbuf_put(out, s, n);
+}
+
+static void css_sel_expand_cb(const char *sel, size_t n, void *user) { css_sel_expand_one(sel, n, (CssSelBuf *)user, 0); }
+
+/* Whether a selector list needs the rewrite at all. */
+static int css_sel_needs_expansion(const char *s, size_t n) {
+    for (size_t i = 0; i + 4 < n; i++) {
+        if (s[i] != ':') continue;
+        if (css_sel_group_pseudo(s + i)) return 1;
+        if (css_sel_starts_ci(s + i, ":not(")) {
+            size_t close = css_sel_match(s, n, i + 4);
+            for (size_t k = i + 5; k < close && k < n; k++) if (s[k] == ',') return 1;
+        }
+    }
+    return 0;
+}
+
+/* The selector list s[0..n) with every group rewritten; malloc'd. */
+static char *css_sel_expand_list(const char *s, size_t n) {
+    CssSelBuf out = {0};
+    css_sel_split(s, n, css_sel_expand_cb, &out);
+    if (!out.p) { out.p = calloc(1, 1); }
+    return out.p;
+}
+
+/* The selectors of a nested rule: for every child selector and parent
+ * selector, `&` becomes the parent (as :is(parent)); without `&` the child is
+ * a descendant of it. */
+typedef struct { const char *child; size_t cn; CssSelBuf *out; } CssSelNest;
+static void css_sel_nest_parent_cb(const char *par, size_t pn, void *user) {
+    CssSelNest *nst = (CssSelNest *)user;
+    CssSelBuf r = {0};
+    int amp = 0;
+    for (size_t i = 0; i < nst->cn; i++) {
+        if (nst->child[i] == '&') {
+            amp = 1;
+            css_selbuf_put(&r, ":is(", 4); css_selbuf_put(&r, par, pn); css_selbuf_put(&r, ")", 1);
+        } else css_selbuf_put(&r, nst->child + i, 1);
+    }
+    if (!amp) {
+        free(r.p); r.p = NULL; r.n = r.cap = 0;
+        css_selbuf_put(&r, par, pn); css_selbuf_put(&r, " ", 1); css_selbuf_put(&r, nst->child, nst->cn);
+    }
+    if (nst->out->n) css_selbuf_put(nst->out, ", ", 2);
+    css_selbuf_put(nst->out, r.p, r.n);
+    free(r.p);
+}
+typedef struct { const char *parent; size_t pn; CssSelBuf *out; } CssSelNestC;
+static void css_sel_nest_child_cb(const char *ch, size_t cn, void *user) {
+    CssSelNestC *c = (CssSelNestC *)user;
+    CssSelNest nst = { ch, cn, c->out };
+    css_sel_split(c->parent, c->pn, css_sel_nest_parent_cb, &nst);
+}
+
 /* Parse selector list (comma-separated) into the rule. Returns count. */
+static int parse_selector_list_text(const char *text, size_t n, CSSRule *rule) {
+    Lexer sub;
+    lex_init(&sub, text, n);
+    while (!lex_eof(&sub)) {
+        lex_skip_ws(&sub);
+        if (lex_eof(&sub)) break;
+        CSSSelector *slot = rule_selector_slot(rule);
+        if (!slot) break;
+        size_t before = sub.pos;
+        if (parse_one_selector(&sub, slot)) rule->selector_count++;
+        lex_skip_ws(&sub);
+        if (lex_peek(&sub) == ',') lex_advance(&sub);
+        else if (sub.pos == before) lex_advance(&sub);     /* always progress */
+    }
+    return rule->selector_count;
+}
+
 static int parse_selector_list(Lexer *l, CSSRule *rule) {
+    lex_skip_ws(l);
+    size_t start = l->pos;
+    const char *brace = memchr(l->src + start, '{', l->len - start);
+    size_t end = brace ? (size_t)(brace - l->src) : l->len;
+    if (!rule->sel_src) { rule->sel_src = l->src + start; rule->sel_len = end - start; }
+    if (css_sel_needs_expansion(l->src + start, end - start)) {
+        char *ex = css_sel_expand_list(l->src + start, end - start);
+        parse_selector_list_text(ex, strlen(ex), rule);
+        free(ex);
+        l->pos = end;
+        return rule->selector_count;
+    }
     while (!lex_eof(l) && lex_peek(l) != '{') {
         lex_skip_ws(l);
         if (lex_peek(l) == '{') break;
@@ -587,9 +827,11 @@ static int parse_selector_list(Lexer *l, CSSRule *rule) {
             while (!lex_eof(l) && lex_peek(l) != '{') lex_advance(l);
             break;
         }
+        size_t before = l->pos;
         if (parse_one_selector(l, slot)) rule->selector_count++;
         lex_skip_ws(l);
         if (lex_peek(l) == ',') lex_advance(l);
+        else if (l->pos == before && !lex_eof(l) && lex_peek(l) != '{') lex_advance(l);
     }
     return rule->selector_count;
 }
@@ -611,7 +853,7 @@ static void parse_declaration(Lexer *l, CSSDeclaration *decl) {
         }
     }
     lex_skip_ws(l);
-    if (lex_peek(l) != ':') return;
+    if (lex_peek(l) != ':') { decl->property[0] = '\0'; return; }
     lex_advance(l); /* consume ':' */
     lex_skip_ws(l);
 
@@ -633,6 +875,63 @@ static void parse_declaration(Lexer *l, CSSDeclaration *decl) {
     if (strstr(decl->value, "var(")) decl->variable_source = css_strdup(decl->value);
 }
 
+/* Rules nested in a rule's block (`.a { &:hover {..} .b {..} }`) are collected
+ * here while the block is parsed and added after their parent, in order. */
+typedef struct { CSSRule rule; char *text; } NestItem;
+typedef struct { NestItem *items; int n, cap; } NestList;
+static NestList *g_nest_list;
+
+static void nest_release(NestList *nl) {
+    for (int i = 0; i < nl->n; i++) { css_rule_release(&nl->items[i].rule); free(nl->items[i].text); }
+    free(nl->items);
+    nl->items = NULL; nl->n = nl->cap = 0;
+}
+
+/* Whether the item at the lexer starts a nested rule: a '{' comes before any
+ * ';' or '}' at the top level. */
+static int looks_nested(const Lexer *l) {
+    if (l->src[l->pos] == '-' && l->pos + 1 < l->len && l->src[l->pos + 1] == '-') return 0;
+    for (size_t i = l->pos; i < l->len; i++) {
+        char c = l->src[i];
+        if (c == '(' || c == '[') { i = css_sel_match(l->src, l->len, i); continue; }
+        if (c == '"' || c == '\'') { char q = c; for (i++; i < l->len && l->src[i] != q; i++) if (l->src[i] == '\\') i++; continue; }
+        if (c == '{') return 1;
+        if (c == ';' || c == '}') return 0;
+    }
+    return 0;
+}
+
+static void parse_nested_rule(Lexer *l, CSSRule *parent, CSSCallbacks *cb) {
+    size_t start = l->pos;
+    while (!lex_eof(l) && lex_peek(l) != '{') lex_advance(l);
+    size_t end = l->pos;
+    if (l->src[start] == '@' || !parent->sel_src) { skip_block(l); return; }
+    CssSelBuf out = {0};
+    CssSelNestC c = { parent->sel_src, parent->sel_len, &out };
+    css_sel_split(l->src + start, end - start, css_sel_nest_child_cb, &c);
+    if (!out.p) { skip_block(l); return; }
+    NestList *nl = g_nest_list;
+    CSSRule child;
+    memset(&child, 0, sizeof child);
+    child.sel_src = out.p;
+    child.sel_len = out.n;
+    char *ex = css_sel_expand_list(out.p, out.n);
+    parse_selector_list_text(ex, strlen(ex), &child);
+    free(ex);
+    parse_rule_block(l, &child, cb);
+    for (int i = 0; i < child.selector_count; i++)
+        if (child.selectors[i].specificity > child.specificity) child.specificity = child.selectors[i].specificity;
+    if (nl->n == nl->cap) {
+        int cap = nl->cap ? nl->cap * 2 : 4;
+        NestItem *g = realloc(nl->items, (size_t)cap * sizeof *g);
+        if (!g) { css_rule_release(&child); free(out.p); return; }
+        nl->items = g; nl->cap = cap;
+    }
+    nl->items[nl->n].rule = child;
+    nl->items[nl->n].text = out.p;
+    nl->n++;
+}
+
 static void parse_rule_block(Lexer *l, CSSRule *rule, CSSCallbacks *cb) {
     if (lex_peek(l) != '{') return;
     lex_advance(l); /* consume '{' */
@@ -644,12 +943,23 @@ static void parse_rule_block(Lexer *l, CSSRule *rule, CSSCallbacks *cb) {
         if (c == ';') { lex_advance(l); continue; }
         if (c == '\0') break;
 
+        if (g_nest_list && looks_nested(l)) { parse_nested_rule(l, rule, cb); continue; }
+
         CSSDeclaration *d = rule_decl_slot(rule);
         if (d) {
+            size_t before = l->pos;
             parse_declaration(l, d);
             if (d->property[0]) {
                 if (cb && cb->on_declaration) cb->on_declaration(cb->user_data, d);
                 rule->decl_count++;
+            } else {
+                /* Not a declaration (a nested rule, stray token): drop it up to
+                 * the next ';' or past its {block}, always making progress. */
+                l->pos = before;
+                while (!lex_eof(l) && lex_peek(l) != ';' && lex_peek(l) != '}' && lex_peek(l) != '{')
+                    lex_advance(l);
+                if (lex_peek(l) == '{') skip_block(l);
+                else if (l->pos == before && !lex_eof(l) && lex_peek(l) != '}') lex_advance(l);
             }
         } else {
             /* skip remaining */
@@ -734,12 +1044,91 @@ static void sheet_add_at(CSSStyleSheet *sheet, const CSSAtRule *at) {
     sheet->at_rules[sheet->at_rule_count++] = *at;
 }
 
-static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks *cb) {
+static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks *cb, int in_block);
+
+/* @media / @supports { rules }.  Nested conditional groups are flattened: the
+ * inner group is emitted as its own at-rule whose prelude carries the outer
+ * condition (media conditions are ANDed; @supports is assumed true). */
+static void parse_cond_group(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks *cb,
+                             CSSAtRuleType type, const char *outer)
+{
+    CSSAtRule at = {0};
+    at.type = type;
+    char tmp[CSS_MAX_VALUE] = {0};
+    lex_until(l, tmp, CSS_MAX_VALUE, "{");
+    str_trim(tmp);
+    if (outer && *outer) {
+        at.type = CSS_AT_MEDIA;      /* @supports is assumed true: only media conditions survive */
+        if (type == CSS_AT_MEDIA) snprintf(at.prelude, CSS_MAX_VALUE, "%s and %s", outer, tmp);
+        else snprintf(at.prelude, CSS_MAX_VALUE, "%s", outer);
+    } else {
+        snprintf(at.prelude, CSS_MAX_VALUE, "%s", tmp);
+    }
+    lex_skip_ws(l);
+    if (lex_peek(l) == '{') {
+        lex_advance(l);
+        while (!lex_eof(l)) {
+            lex_skip_ws(l);
+            char c = lex_peek(l);
+            if (c == '}') { lex_advance(l); break; }
+            if (c == '@') {
+                lex_advance(l);
+                char kw[128] = {0};
+                lex_ident(l, kw, 128);
+                lex_skip_ws(l);
+                CSSAtRuleType t = classify_at(kw);
+                if (t == CSS_AT_MEDIA || t == CSS_AT_SUPPORTS) {
+                    parse_cond_group(l, sheet, cb, t, at.type == CSS_AT_MEDIA ? at.prelude : NULL);
+                } else {
+                    char skip[CSS_MAX_VALUE] = {0};
+                    lex_until(l, skip, CSS_MAX_VALUE, ";{");
+                    if (lex_peek(l) == ';') lex_advance(l);
+                    else skip_block(l);
+                }
+                continue;
+            }
+            CSSRule *inner = calloc(1, sizeof(*inner));
+            if (!inner) return;
+            parse_selector_list(l, inner);
+            lex_skip_ws(l);
+            if (lex_peek(l) == '{') {
+                NestList nest = {0};
+                NestList *saved_nest = g_nest_list;
+                g_nest_list = &nest;
+                parse_rule_block(l, inner, NULL);
+                g_nest_list = saved_nest;
+                if (!nested_rules_push(&at, inner)) { css_rule_release(inner); free(inner); nest_release(&nest); return; }
+                for (int ni = 0; ni < nest.n; ni++) {
+                    CSSRule *nr = &nest.items[ni].rule;
+                    if (nr->selector_count > 0 && nr->decl_count > 0 && nested_rules_push(&at, nr)) { }
+                    else css_rule_release(nr);
+                    free(nest.items[ni].text);
+                }
+                free(nest.items);
+            } else {
+                size_t before = l->pos;
+                while (!lex_eof(l) && lex_peek(l) != '}' && lex_peek(l) != '{' && lex_peek(l) != ';')
+                    lex_advance(l);
+                if (lex_peek(l) == ';') lex_advance(l);
+                if (l->pos == before && !lex_eof(l) && lex_peek(l) != '}') lex_advance(l);
+                css_rule_release(inner);
+            }
+            free(inner);
+        }
+    }
+    if (cb && cb->on_at_rule) cb->on_at_rule(cb->user_data, &at);
+    sheet_add_at(sheet, &at);
+}
+
+static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks *cb, int in_block) {
     while (!lex_eof(l)) {
         lex_skip_ws(l);
         if (lex_eof(l)) break;
 
         char c = lex_peek(l);
+
+        /* a '}' closes an enclosing @layer-style group; elsewhere it is stray */
+        if (c == '}') { lex_advance(l); if (in_block) return; continue; }
 
         /* CDO/CDC (HTML comment markers in CSS) */
         if (c == '<' && (l->pos + 3 < l->len) &&
@@ -780,39 +1169,20 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
             }
 
             if (at.type == CSS_AT_MEDIA || at.type == CSS_AT_SUPPORTS) {
-                /* read prelude until '{' */
+                parse_cond_group(l, sheet, cb, at.type, NULL);
+                continue;
+            }
+
+            /* @layer / @container wrap ordinary rules: parse the body in place. */
+            if (css_starts_with_ci(kw, "layer") || css_starts_with_ci(kw, "container") ||
+                css_starts_with_ci(kw, "scope")) {
                 char tmp[CSS_MAX_VALUE] = {0};
-                lex_until(l, tmp, CSS_MAX_VALUE, "{");
-                str_trim(tmp);
-                snprintf(at.prelude, CSS_MAX_VALUE, "%s", tmp);
-                lex_skip_ws(l);
+                lex_until(l, tmp, CSS_MAX_VALUE, ";{");
+                if (lex_peek(l) == ';') { lex_advance(l); continue; }
                 if (lex_peek(l) == '{') {
                     lex_advance(l);
-                    at.nested_rule_cap = 0;
-                    at.nested_rules = NULL;
-                    at.nested_rule_count = 0;
-                    while (!lex_eof(l)) {
-                        lex_skip_ws(l);
-                        if (lex_peek(l) == '}') { lex_advance(l); break; }
-                        if (lex_peek(l) == '@') { skip_block(l); continue; }
-                        CSSRule *inner = calloc(1, sizeof(*inner));
-                        if (!inner) return;
-                        parse_selector_list(l, inner);
-                        lex_skip_ws(l);
-                        if (lex_peek(l) == '{') {
-                            parse_rule_block(l, inner, NULL);
-                            if (!nested_rules_push(&at, inner)) { css_rule_release(inner); free(inner); return; }
-                        } else {
-                            /* skip garbage */
-                            while (!lex_eof(l) && lex_peek(l) != '}' && lex_peek(l) != '{')
-                                lex_advance(l);
-                            css_rule_release(inner);
-                        }
-                        free(inner);
-                    }
+                    parse_stylesheet_inner(l, sheet, cb, 1);   /* stops at the matching '}' */
                 }
-                if (cb && cb->on_at_rule) cb->on_at_rule(cb->user_data, &at);
-                sheet_add_at(sheet, &at);
                 continue;
             }
 
@@ -911,7 +1281,11 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                 for (int i = 0; i < rule->selector_count; i++)
                     cb->on_selector(cb->user_data, &rule->selectors[i], i, rule->selector_count);
             }
+            NestList nest = {0};
+            NestList *saved_nest = g_nest_list;
+            g_nest_list = &nest;
             parse_rule_block(l, rule, cb);
+            g_nest_list = saved_nest;
 
             /* compute max specificity */
             for (int i = 0; i < rule->selector_count; i++) {
@@ -923,6 +1297,13 @@ static void parse_stylesheet_inner(Lexer *l, CSSStyleSheet *sheet, CSSCallbacks 
                 sheet_add_rule(sheet, rule);      /* the sheet now owns its arrays */
             else
                 css_rule_release(rule);
+            for (int ni = 0; ni < nest.n; ni++) {
+                CSSRule *nr = &nest.items[ni].rule;
+                if (nr->selector_count > 0 && nr->decl_count > 0) sheet_add_rule(sheet, nr);
+                else css_rule_release(nr);
+                free(nest.items[ni].text);
+            }
+            free(nest.items);
         } else {
             css_rule_release(rule);
             /* malformed: skip to next brace or semicolon */
@@ -948,7 +1329,7 @@ static void custom_props_take(CSSStyleSheet *sheet, const CSSRule *rule) {
         int ci = 0;
         while (ci < sheet->custom_prop_count && strcmp(sheet->custom_props[ci].name, prop) != 0) ci++;
         if (ci == sheet->custom_prop_count) {
-            if (ci >= 128) continue;
+            if (ci >= CSS_MAX_CUSTOM_PROPS) continue;
             sheet->custom_prop_count++;
             snprintf(sheet->custom_props[ci].name, sizeof sheet->custom_props[ci].name, "%.63s", prop);
         }
@@ -1066,7 +1447,7 @@ CSSStyleSheet *css_parse(const char *text, size_t len) {
     CSSStyleSheet *sheet = calloc(1, sizeof(CSSStyleSheet));
     Lexer l;
     lex_init(&l, text, len);
-    parse_stylesheet_inner(&l, sheet, NULL);
+    parse_stylesheet_inner(&l, sheet, NULL, 0);
     css_resolve_vars(sheet);
     return sheet;
 }
@@ -1093,7 +1474,7 @@ void css_parse_cb(const char *text, size_t len, CSSCallbacks *cb) {
     CSSStyleSheet *sheet = calloc(1, sizeof(CSSStyleSheet));
     Lexer l;
     lex_init(&l, text, len);
-    parse_stylesheet_inner(&l, sheet, cb);
+    parse_stylesheet_inner(&l, sheet, cb, 0);
     css_free(sheet);
 }
 

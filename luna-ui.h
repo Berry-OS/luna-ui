@@ -171,6 +171,9 @@ typedef char GLchar;
 #ifndef GL_ONE
 #define GL_ONE 1
 #endif
+#ifndef GL_ZERO
+#define GL_ZERO 0
+#endif
 #ifndef GL_COLOR_BUFFER_BIT
 #define GL_COLOR_BUFFER_BIT 0x00004000
 #endif
@@ -186,10 +189,10 @@ extern "C" {
 #endif
 
 #ifndef LUNA_UI_MAX_ELEMENTS
-#define LUNA_UI_MAX_ELEMENTS 2000
+#define LUNA_UI_MAX_ELEMENTS (1 << 22)   /* a sanity bound; storage grows on demand */
 #endif
 #ifndef LUNA_UI_MAX_RULES
-#define LUNA_UI_MAX_RULES 2400
+#define LUNA_UI_MAX_RULES (1 << 22)   /* a sanity bound; storage grows on demand */
 #endif
 /* Large DOM/CSS records are grown on demand instead of reserving their full
  * maximum in .bss. These values only control the first allocation; the public
@@ -514,6 +517,17 @@ const LunaHostOps* luna_host_kms(void);    /* luna_kms.h  */
  * opposite: repaint the same type because its frame advanced. */
 void luna_host_kms_refresh_cursor(int cursor_type);
 void  luna_clipboard_set(const char* utf8);
+/* The built-in right-click menu of text fields (on by default). */
+void  luna_context_menu_enable(int enabled);
+/* The selected text (a field's selection, else page text) as a malloc'd UTF-8 string; free() it. */
+char* luna_selection_text(void);
+void  luna_selection_clear(void);
+/* Find in page: selects the next/previous match and scrolls to it; 1 if found. */
+int   luna_find_text(const char* needle, int forward);
+void  luna_input_select_all(int idx);
+char* luna_link_at_point(double x, double y);
+/* Hosts that load pages by URL: how a link's href becomes an absolute address. */
+void  luna_set_url_resolver(char* (*fn)(const char*));
 char* luna_clipboard_get(void); /* free with luna_clipboard_free() */
 void  luna_clipboard_free(char* utf8);
 float luna_platform_scale(void);
@@ -685,6 +699,10 @@ int  luna_load_css_file(const char* path);
  * this to replace a desktop skin at runtime, then load the base sheet and the
  * selected skin in cascade order. */
 void luna_reset_css(void);
+/* Optional decoder for picture formats stb_image lacks (WebP).  `fn` returns
+ * malloc'd top-down RGBA, or NULL when it does not know the bytes. */
+typedef unsigned char* (*LunaImageDecoder)(const unsigned char* bytes, size_t len, int* w, int* h);
+void luna_set_image_decoder(LunaImageDecoder fn);
 /* Drop the parsed document: every element, and the interaction state that
  * indexes into it.  parse_html() *appends*, so a host that republishes a
  * page — an embedder whose document changes as the application it is
@@ -693,6 +711,9 @@ void luna_reset_css(void);
  * separate (luna_reset_css); a host that keeps its sheet may reset only
  * this. */
 void luna_reset_document(void);
+/* Web viewport scrolling is independent of an element's overflow box. */
+void luna_document_scroll(float x, float y);
+void luna_document_scroll_state(float* x, float* y, float* width, float* height);
 /* Composite over whatever is already in the framebuffer instead of clearing it
  * first.  A full-document render normally starts from transparent black,
  * because for a window Luna owns the previous back buffer is undefined; an
@@ -704,6 +725,12 @@ void luna_set_preserve_backdrop(int enabled);
  * height at that size.  Font metrics only — no atlas is baked and no GL call
  * is made — but they read the loaded fonts, so a host calling from another
  * thread must serialise with its render. */
+/* Loads CPU font metrics without creating GL objects. Caller serializes access. */
+int luna_prepare_font_metrics(void);
+typedef struct LunaFontMetrics {
+    float top, ascent, descent, bottom, leading;
+} LunaFontMetrics;
+int luna_get_font_metrics(float css_px, int bold, LunaFontMetrics* metrics);
 float luna_measure_text(const char* text, float css_px, int bold);
 float luna_line_height(float css_px);
 void luna_parse_html(const char* html);
@@ -718,6 +745,7 @@ void luna_css_set_variables(const LunaCssVariable* variables, int count);
 uint32_t luna_css_generation(void);
 void luna_inject_body_background(void);
 void luna_wire_onclick_handlers(void);
+/* backdrop_dismiss: 0=Escape only, 1=backdrop click, 2=outside click/Tab (popup). */
 void luna_push_focus_trap(int idx, LunaTrapDismissFn on_dismiss, int backdrop_dismiss);
 void luna_pop_focus_trap(int idx);
 void luna_set_mouse_press_hook(LunaMousePressHook fn);
@@ -741,6 +769,13 @@ int  luna_needs_redraw_mask(double now, double dt, const int* roots,
 /* Native EGL hosts call this before luna_init; custom hosts default to GL. */
 void luna_set_gles3(int enabled);
 void luna_update(double now, double dt);
+/* Batch DOM restyling.  With deferral on, a DOM mutation under a stylesheet
+ * that has structural selectors (:first-child, + ~ ...) no longer restyles the
+ * whole document at once; the work is done once by the next luna_update() or
+ * luna_dom_flush_restyle().  A host reading style or layout between mutations
+ * must call luna_dom_flush_restyle() (luna_update does).  Off by default. */
+void luna_dom_defer_restyle(int enabled);
+void luna_dom_flush_restyle(void);
 /* Forget cached OpenGL bindings before a host/custom renderer hands control
  * back to Luna UI. Safe to call once at the start of every frame. */
 void luna_invalidate_gl_state(void);
@@ -764,6 +799,16 @@ int  luna_redraw_damage_region(float* x, float* y, float* w, float* h);
 int  luna_redraw_probe_region(int root_idx, int fbw, int fbh,
                               float origin_x, float origin_y,
                               float region_w, float region_h);
+/* Walk like probe, but fill luna_redraw_damage_region() with the union of
+ * every rect that would change.  Draw records stay untouched so a following
+ * paint still sees the previous frame as its baseline. */
+int  luna_redraw_collect_region(int root_idx, int fbw, int fbh,
+                                float origin_x, float origin_y,
+                                float region_w, float region_h);
+/* Restrict the next luna_render()/luna_render_region() to elements that
+ * intersect this surface-local rect.  The host must clear that rect first.
+ * Pass w/h <= 0 to disable (full redraw). */
+void luna_redraw_set_paint_clip(float x, float y, float w, float h);
 void luna_render_region(int root_idx, int fbw, int fbh,
                         float origin_x, float origin_y,
                         float region_w, float region_h);
@@ -788,6 +833,10 @@ void luna_context_scroll(LunaContext* ctx, double xoffset, double yoffset);
 void luna_context_touch(LunaContext* ctx, const LunaTouchEvent* event);
 int  luna_element_count(void);
 LunaElement* luna_element_at(int idx);
+/* Native canvas hosts may clear the destination at an element's paint point.
+ * Render into a transparent layer, then composite that layer onto its backdrop.
+ * The operation respects visibility, transforms and ancestor clipping. */
+void luna_set_clear_before_paint(int idx, int clear);
 int  luna_element_parent(int idx);
 /* 1 when no display:none anywhere between idx and the root — i.e. changing
  * this element's text or style can actually change pixels. */
@@ -795,6 +844,8 @@ int  luna_element_visible(int idx);
 int  luna_get_element_by_id(const char* id);
 /* Topmost visible element at a viewport position, or -1. */
 int  luna_element_at_point(double x, double y);
+/* Viewport bounds, including CSS transforms; returns zero for an invalid index. */
+int luna_element_bounds(int idx, float* x, float* y, float* w, float* h);
 /* First element carrying the class, in document order; -1 when none does.
  * Lets a library bind to markup by role instead of demanding that every
  * application hand it a list of element ids. */
@@ -911,6 +962,8 @@ const char* luna_dom_attrs(int idx);
 /* Re-resolves the element's (and its subtree's) style after a change made
  * behind the engine's back. */
 void luna_dom_restyle(int idx);
+/* A checkbox / radio's checked state (what :checked matches). */
+void luna_dom_set_checked(int idx, int checked);
 
 extern float luna_window_width;
 extern float luna_window_height;
@@ -1009,6 +1062,62 @@ static const char* luna_strcasestr_local(const char* haystack, const char* needl
 #undef MAX_RULES
 #define MAX_ELEMENTS LUNA_UI_MAX_ELEMENTS
 #define MAX_RULES    LUNA_UI_MAX_RULES
+
+/* Per-call scratch arrays sized to the document.  A LIFO arena (released when
+ * the declaring scope ends, returns included) keeps them off the stack, so the
+ * element count is not bounded by stack size.  GCC/Clang cleanup attribute. */
+static int g_aux_cap;      /* capacity of the per-element side tables */
+#define LUNA_AUX_ZERO(a) do { if (a) memset((a), 0, sizeof(*(a)) * (size_t)g_aux_cap); } while (0)
+
+typedef struct { int chunk; size_t off; } LunaScratchMark;
+static struct { char* p; size_t cap; }* g_scratch_chunks;
+static int g_scratch_n, g_scratch_cap;
+static LunaScratchMark g_scratch_top;
+
+static LunaScratchMark luna_scratch_mark(void) { return g_scratch_top; }
+static void luna_scratch_release(const LunaScratchMark* m) { g_scratch_top = *m; }
+
+static void* luna_scratch_alloc(size_t n) {
+    n = (n + 15) & ~(size_t)15;
+    for (;;) {
+        int c = g_scratch_top.chunk;
+        if (c < g_scratch_n) {
+            if (g_scratch_chunks[c].cap - g_scratch_top.off >= n) {
+                void* r = g_scratch_chunks[c].p + g_scratch_top.off;
+                g_scratch_top.off += n;
+                return r;
+            }
+            if (g_scratch_top.off == 0) {          /* an unused, too-small chunk: regrow it */
+                free(g_scratch_chunks[c].p);
+                g_scratch_chunks[c].cap = n > ((size_t)4 << 20) ? n : ((size_t)4 << 20);
+                g_scratch_chunks[c].p = (char*)malloc(g_scratch_chunks[c].cap);
+                if (!g_scratch_chunks[c].p) { g_scratch_chunks[c].cap = 0; abort(); }
+                continue;
+            }
+            g_scratch_top.chunk++;
+            g_scratch_top.off = 0;
+            continue;
+        }
+        if (g_scratch_n >= g_scratch_cap) {
+            g_scratch_cap = g_scratch_cap ? g_scratch_cap * 2 : 8;
+            g_scratch_chunks = realloc(g_scratch_chunks, sizeof(*g_scratch_chunks) * (size_t)g_scratch_cap);
+            if (!g_scratch_chunks) abort();
+        }
+        g_scratch_chunks[g_scratch_n].cap = 0;
+        g_scratch_chunks[g_scratch_n].p = NULL;
+        g_scratch_n++;
+    }
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define LUNA_SCRATCH(T, name, count) \
+    LunaScratchMark name##_mark __attribute__((cleanup(luna_scratch_release))) = luna_scratch_mark(); \
+    T* name = (T*)luna_scratch_alloc(sizeof(T) * (size_t)(count))
+#else
+#  error "luna-ui needs the GCC/Clang cleanup attribute for LUNA_SCRATCH"
+#endif
+#define LUNA_SCRATCH_ZERO(T, name, count) \
+    LUNA_SCRATCH(T, name, count); memset(name, 0, sizeof(T) * (size_t)(count))
 
 static LunaPlatform g_luna_platform;
 static int g_luna_gles3;
@@ -1787,6 +1896,16 @@ const char* backdrop_fs =
 #define DISPLAY_NONE  1
 #define DISPLAY_FLEX  2
 #define DISPLAY_GRID  3
+/* Table model: the table box, its row groups and rows, and cells.  A table lays
+ * its rows and cells out itself (layout_table_container); a caption is a block. */
+#define DISPLAY_TABLE       4
+#define DISPLAY_TABLE_GROUP 5
+#define DISPLAY_TABLE_ROW   6
+#define DISPLAY_TABLE_CELL  7
+#define DISPLAY_TABLE_CAPTION 8
+#define TBL_VALIGN_TOP 1
+#define TBL_VALIGN_MIDDLE 2
+#define TBL_VALIGN_BOTTOM 3
 /* display_mode is the *inner* display type; inline_level (below) is the outer
  * one.  `display:inline` / `inline-block` / `inline-flex` are an inline-level
  * box whose contents lay out as block / flex / grid. */
@@ -1839,6 +1958,9 @@ typedef struct {
 
 /* One CSS box-shadow layer (multiple layers per element supported). */
 #define LUNA_MAX_SHADOWS 4
+/* Utility-class frameworks put 20+ classes on one element (~250 bytes). */
+#define LUNA_CLASS_CAP 640
+
 typedef struct {
     float dx, dy, blur, spread;
     float r, g, b, a;
@@ -1851,9 +1973,10 @@ typedef LunaEventHandler EventHandler;
 struct LunaElement {
     int id_idx;
     int parent_idx;
+    int clear_before_paint;
     float rel_x, rel_y;
     float x, y, w, h;
-    char text[LUNA_UI_TEXT_CAP], type[32], class_name[96], id[64];
+    char text[LUNA_UI_TEXT_CAP], type[32], class_name[LUNA_CLASS_CAP], id[64];
     int is_hovered, is_active, is_draggable;
     /* Text controls (<input>/<textarea>) — value lives in text[] */
     int is_input;
@@ -1861,6 +1984,9 @@ struct LunaElement {
     int input_password;
     char placeholder[160];
     int caret;             /* UTF-8 byte offset into text */
+    int sel_anchor, sel_has; /* the other end of the selection (when sel_has) */
+    int no_select;         /* user-select: none (inherited) */
+    int checked_state;     /* checkbox/radio set from code: 1 checked, 2 unchecked, 0 as in the markup */
     float input_scroll_x;
     float caret_r, caret_g, caret_b, caret_a;
     int has_caret_color;
@@ -1876,6 +2002,7 @@ struct LunaElement {
     int position_fixed;
     int position_sticky;
     int position_mode; /* 0 unset 1 static 2 relative 3 absolute */
+    int css_float, css_clear; /* 0 none, 1 left, 2 right, 3 both (clear) */
     float sticky_top;
     int sticky_use_top;
     int sticky_use_bottom;
@@ -1984,6 +2111,7 @@ struct LunaElement {
     int display_mode; // 0 block 1 none 2 flex 3 grid
     int inline_level; // outer display: 1 inline, 2 inline-block/-flex/-grid
     int flex_direction;
+    int flex_reverse;               /* row-reverse / column-reverse */
     int justify_content;
     int align_items;
     int justify_items;
@@ -2015,6 +2143,7 @@ struct LunaElement {
     int box_sizing;
     float css_width, css_height;
     float css_min_width, css_min_height;
+    float raw_min_width; int min_width_pct;      /* min-width: <n>% of the container */
     float css_max_width, css_max_height;
     int has_css_width, has_css_height;
     int has_min_width, has_min_height;
@@ -2077,6 +2206,8 @@ struct LunaElement {
     int z_override;
     int visibility_hidden;
     float transform_scale;
+    float tf_ox, tf_oy;             /* transform-origin as a fraction of the box (0.5: centre) */
+    float tf_oxpx, tf_oypx;         /* ... plus a length in px */
     float transform_tx, transform_ty;
     float transform_rotate;
     float raw_transform_tx, raw_transform_ty;
@@ -2133,6 +2264,8 @@ struct LunaElement {
 
     int has_bg_image;
     char bg_image_path[256];
+    int mask_tint;                  /* mask-image: the picture is a shape painted in the background colour */
+    int svg_src;                    /* inline <svg>: 1-based index of its markup (g_svg_src), drawn as a picture */
     GLuint bg_image_tex;
 
     /* CSS border-image (stretch): the image cut by `slice` into nine and
@@ -2158,6 +2291,9 @@ struct LunaElement {
     unsigned dom_uid;
     int dom_detached;
     char* dom_attrs;
+    /* Script/style source belongs to the DOM, without the display text's
+       fixed-size limit or HTML entity decoding. */
+    char* dom_raw_text;
     /* Inline formatting (web documents): anon_text marks an anonymous text
      * run materialized between element siblings; ws_before records source
      * whitespace before the box, which an inline line renders as a space. */
@@ -2166,6 +2302,19 @@ struct LunaElement {
     /* The custom properties this element declares ("--name:value\n"...,
      * malloc'd; NULL for none).  Lookups walk up the parents: inheritance. */
     char* css_vars;
+    /* Table cells: vertical-align (TBL_VALIGN_*, 0 = inherit from row/default);
+     * tables: border-spacing in px (tbl_spacing_set) and the padding the
+     * last table layout added to a cell, top and bottom (undone before a relayout). */
+    int tbl_valign;
+    float tbl_spacing; int tbl_spacing_set;
+    float tbl_pad_t0, tbl_pad_b0;
+    /* Lazy name index over css_vars once it is long (a theme's :root can hold
+     * thousands): open addressing, entries are line offset + 1.  state 0 =
+     * not built, 1 = list is short (scan it), 2 = table.  Reset whenever
+     * css_vars is replaced (css_vars_reset). */
+    uint32_t* css_idx;
+    uint32_t css_idx_cap;
+    int css_idx_state;
     /* The containing block an absolute box was last sized against. */
     float abs_cb_w, abs_cb_h;
 };
@@ -2181,6 +2330,13 @@ struct LunaElement {
 #define LUNA_REL_ADJ   2   /* adjacent:   "A + B" */
 #define LUNA_REL_SIB   3   /* sibling:    "A ~ B" */
 
+typedef struct { int rel; char type[32], id[64]; char cls[2][64]; int ncls; char aname[32], aval[64]; char aop; int has_attr; } HasSelT;
+#define LUNA_PS_LINK     1u
+#define LUNA_PS_CHECKED  2u
+#define LUNA_PS_DISABLED 4u
+#define LUNA_PS_ENABLED  8u
+#define LUNA_PS_EMPTY    16u
+
 typedef struct {
     char sel_type[32];
     char sel_id[64];
@@ -2190,8 +2346,16 @@ typedef struct {
     int  rel;                       /* ancestors only: LUNA_REL_* */
     int  is_first_child, is_last_child;
     int  has_nth, nth_a, nth_b;     /* :nth-child(An+B), 1-based index */
-    int  has_not;                   /* :not(simple) — single type/id/class */
-    char not_type[32], not_id[64], not_class[64];
+    /* :not(x) for a single simple selector x, up to three of them */
+    int  not_count;
+    struct { int kind; char name[64]; char op; char val[64]; } nots[3];   /* kind: 0 type 1 id 2 class 3 attribute */
+    /* :nth-of-type, :nth-last-child, :nth-last-of-type (first/last/only-of-type too) */
+    int  nthx_count;
+    struct { int kind, a, b; } nthx[3];                                 /* kind: 1 of-type 2 last-child 3 last-of-type */
+    unsigned pflags;                /* LUNA_PS_* state pseudo-classes */
+    /* :has(rel simple): descendant / child / next sibling / later sibling having x */
+    int  has_count;
+    HasSelT has[2];
     /* Dynamic pseudo-classes belong to the compound on which they appear.
        Keeping them here is required for selectors such as
        `.tooltip:hover .tooltip-text`; storing state only on the final target
@@ -2199,6 +2363,9 @@ typedef struct {
     int  is_hover, is_active, is_focus, is_focus_visible, is_focus_within;
     int  is_root;
     int  unsupported_pseudo;         /* fail closed; never broaden a selector */
+    /* [name], [name=v], [name~=v] [name|=v] [name^=v] [name$=v] [name*=v] */
+    int  attr_count;
+    struct { char name[32]; char op; char val[64]; } attrs[3];
 } SimpleSelector;
 
 typedef struct {
@@ -2250,13 +2417,17 @@ typedef struct {
     int pct_right;  float raw_right, raw_right_off;
     int has_position; int position_fixed; int position_sticky;
     int position_mode; /* 0 unset 1 static 2 relative 3 absolute */
+    int has_float, css_float, has_clear, css_clear;
 
     int has_opacity; float opacity;
     int has_cursor;  int cursor_pointer; int cursor_type;
     int has_display; int display_none;
-    int display_mode; // 0 block 1 none 2 flex 3 grid
+    int has_valign, valign;
+    int has_user_select, user_select_none;
+    int has_tbl_spacing; float tbl_spacing;
+    int display_mode; // 0 block 1 none 2 flex 3 grid 4.. table
     int inline_level; // outer display: 1 inline, 2 inline-block/-flex/-grid
-    int has_flex_direction; int flex_direction;
+    int has_flex_direction; int flex_direction; int flex_reverse;
     int has_justify_content; int justify_content;
     int has_align_items; int align_items;
     int has_justify_items; int justify_items;
@@ -2268,7 +2439,7 @@ typedef struct {
     int has_flex_grow; float flex_grow;
     int has_flex_shrink; float flex_shrink;
     int has_flex_basis; float flex_basis; int flex_basis_auto;
-    int has_min_width; float min_width;
+    int has_min_width; float min_width; int min_width_pct;
     int has_min_height; float min_height;
     int has_max_width; float max_width;
     int max_width_pct; float raw_max_width, raw_max_width_off;
@@ -2320,6 +2491,7 @@ typedef struct {
     float scroll_padding_top, scroll_padding_right, scroll_padding_bottom, scroll_padding_left;
     int has_text_align; int text_align;
     int has_font_size;  float font_size;
+    int font_size_rel;              /* font_size is a multiple of the parent's size (em, %) */
     int has_font_weight; int font_bold;
     int has_font_face; int font_face;
     int has_line_height; float line_height;
@@ -2371,6 +2543,7 @@ typedef struct {
 
     int has_visibility; int visibility_hidden;
     int has_transform; float transform_scale;
+    int has_tf_origin; float tf_ox, tf_oy, tf_oxpx, tf_oypx;
     int has_transform_tx; float transform_tx;
     int has_transform_ty; float transform_ty;
     int has_transform_rotate; float transform_rotate;
@@ -2390,6 +2563,7 @@ typedef struct {
 
     int has_bg_image;
     char bg_image_path[256];
+    int has_mask_image;             /* bg_image_path came from mask-image */
     int has_bg_image_reset; /* background-image:none clears prior image */
 
     /* border-image and its longhands; each part is kept only when given. */
@@ -2469,6 +2643,8 @@ LunaElement* elements = NULL;
 int elem_count = 0;
 static int g_elements_cap = 0;
 
+static int luna_aux_grow(int cap);   /* the per-element side tables */
+
 static int luna_ensure_element_capacity(int needed) {
     if (needed <= g_elements_cap) return 1;
     if (needed > MAX_ELEMENTS) return 0;
@@ -2486,37 +2662,37 @@ static int luna_ensure_element_capacity(int needed) {
         memset(grown + g_elements_cap, 0, sizeof(*grown) * (size_t)(cap - g_elements_cap));
     elements = grown;
     g_elements_cap = cap;
-    return 1;
+    return luna_aux_grow(cap);
 }
 
 /* Hot-path registries.  Most frames have only a handful of active elements;
  * scanning the full DOM for scroll/keyframe/easing work made idle cost scale
  * with document size.  Style changes lazily rebuild the capability lists,
  * while visual candidates remain active only until their interpolation settles. */
-static int g_scroll_tick_idx[MAX_ELEMENTS];
+static int* g_scroll_tick_idx;
 static int g_scroll_tick_count = 0;
 /* Layout owns this list because it also owns scrollbar geometry.  Pointer and
  * overlay paths then inspect only real scroll containers, not every element. */
-static int g_scroll_container_idx[MAX_ELEMENTS];
+static int* g_scroll_container_idx;
 static int g_scroll_container_count = 0;
-static int g_css_anim_idx[MAX_ELEMENTS];
+static int* g_css_anim_idx;
 static int g_css_anim_count = 0;
 static int g_activity_registry_dirty = 1;
-static int g_visual_active_idx[MAX_ELEMENTS];
-static unsigned char g_visual_active_flag[MAX_ELEMENTS];
+static int* g_visual_active_idx;
+static unsigned char* g_visual_active_flag;
 static int g_visual_active_count = 0;
 static int g_visual_scan_needed = 1;
 
 static void visual_activate_idx(int idx) {
     if (idx < 0 || idx >= elem_count || g_visual_active_flag[idx]) return;
-    if (g_visual_active_count >= MAX_ELEMENTS) return;
+    if (g_visual_active_count >= g_aux_cap) return;
     g_visual_active_flag[idx] = 1;
     g_visual_active_idx[g_visual_active_count++] = idx;
 }
 
 static void visual_remove_pos(int pos) {
     int idx = g_visual_active_idx[pos];
-    if (idx >= 0 && idx < MAX_ELEMENTS) g_visual_active_flag[idx] = 0;
+    if (idx >= 0 && idx < g_aux_cap) g_visual_active_flag[idx] = 0;
     g_visual_active_idx[pos] = g_visual_active_idx[--g_visual_active_count];
 }
 
@@ -2527,10 +2703,10 @@ static void rebuild_activity_registries(void) {
     for (int i = 0; i < elem_count; i++) {
         LunaElement* e = &elements[i];
         if ((e->scroll_smooth || e->scroll_snap_type) &&
-            g_scroll_tick_count < MAX_ELEMENTS)
+            g_scroll_tick_count < g_aux_cap)
             g_scroll_tick_idx[g_scroll_tick_count++] = i;
         if (e->has_css_animation && e->anim_name[0] && !e->anim_finished &&
-            g_css_anim_count < MAX_ELEMENTS)
+            g_css_anim_count < g_aux_cap)
             g_css_anim_idx[g_css_anim_count++] = i;
     }
     g_activity_registry_dirty = 0;
@@ -2564,12 +2740,14 @@ static void luna_css_variable_store(CSSStyleSheet* t, const char* name, const ch
     int i = 0;
     while (i < t->custom_prop_count && strcmp(t->custom_props[i].name, full) != 0) i++;
     if (i == t->custom_prop_count) {
-        if (i >= 128) return;
+        if (i >= CSS_MAX_CUSTOM_PROPS) return;
         t->custom_prop_count++;
         snprintf(t->custom_props[i].name, sizeof t->custom_props[i].name, "%s", full);
     }
     snprintf(t->custom_props[i].value, sizeof t->custom_props[i].value, "%s", value ? value : "");
 }
+
+static int* g_rule_order;
 
 static int luna_ensure_rule_capacity(int needed) {
     if (needed <= g_rules_cap) return 1;
@@ -2584,6 +2762,9 @@ static int luna_ensure_rule_capacity(int needed) {
     if (cap > MAX_RULES) cap = MAX_RULES;
     StyleRule* grown = (StyleRule*)realloc(css_rules, sizeof(*css_rules) * (size_t)cap);
     if (!grown) return 0;
+    int* order = (int*)realloc(g_rule_order, sizeof(int) * (size_t)cap);
+    if (!order) { css_rules = grown; return 0; }
+    g_rule_order = order;
     if (cap > g_rules_cap)
         memset(grown + g_rules_cap, 0, sizeof(*grown) * (size_t)(cap - g_rules_cap));
     css_rules = grown;
@@ -2593,23 +2774,30 @@ static int luna_ensure_rule_capacity(int needed) {
 
 /* Keep large rule records stationary.  Cascade sorting moves only these small
  * indices instead of repeatedly copying multi-kilobyte StyleRule values. */
-static int g_rule_order[MAX_RULES];
 /* parse_html only needs a final whole-document restyle when sibling-dependent
  * selectors exist.  Most application stylesheets do not use them. */
 static int g_has_structural_selectors = 0;
-CssKeyframe g_keyframes[MAX_KF_ANIMS];
+static int g_restyle_deferred = 0, g_restyle_pending = 0, g_pseudo_pending = 0;
+/* Bumped whenever the tree's shape may have changed (sibling-index cache key). */
+static unsigned g_dom_struct_ver = 1;
+CssKeyframe* g_keyframes;          /* grows with the @keyframes a page declares */
 int g_keyframe_count = 0;
+static int g_keyframe_cap = 0;
 JsHandlerEntry g_js_handlers[MAX_JS_HANDLERS];
 int g_js_handler_count = 0;
 
 /* Multi-background storage is cold and rare.  Keeping twelve full layers in
  * every element and every rule consumed several megabytes even when unused. */
-#define LUNA_RULE_BG_ALLOC_MAX (MAX_RULES * 2)
-static LunaBgLayer* g_rule_bg_allocs[LUNA_RULE_BG_ALLOC_MAX];
-static int g_rule_bg_alloc_count = 0;
+static LunaBgLayer** g_rule_bg_allocs;
+static int g_rule_bg_alloc_count = 0, g_rule_bg_alloc_cap = 0;
 
 static LunaBgLayer* rule_bg_layers_acquire(void) {
-    if (g_rule_bg_alloc_count >= LUNA_RULE_BG_ALLOC_MAX) return NULL;
+    if (g_rule_bg_alloc_count == g_rule_bg_alloc_cap) {
+        int cap = g_rule_bg_alloc_cap ? g_rule_bg_alloc_cap * 2 : 64;
+        LunaBgLayer** g = (LunaBgLayer**)realloc(g_rule_bg_allocs, sizeof(*g) * (size_t)cap);
+        if (!g) return NULL;
+        g_rule_bg_allocs = g; g_rule_bg_alloc_cap = cap;
+    }
     LunaBgLayer* layers = (LunaBgLayer*)calloc(LUNA_MAX_BG_LAYERS, sizeof(*layers));
     if (layers) g_rule_bg_allocs[g_rule_bg_alloc_count++] = layers;
     return layers;
@@ -2664,11 +2852,15 @@ static int element_bg_layers_ensure(LunaElement* e) {
  * expensive selector-chain matching is skipped when the target's required
  * id/type/first-class cannot match. Hash collisions only add false positives. */
 #define LUNA_RULE_BUCKETS 64u
-#define LUNA_RULE_WORDS ((MAX_RULES + 63) / 64)
-static uint64_t g_rule_any[LUNA_RULE_WORDS];
-static uint64_t g_rule_id[LUNA_RULE_BUCKETS][LUNA_RULE_WORDS];
-static uint64_t g_rule_type[LUNA_RULE_BUCKETS][LUNA_RULE_WORDS];
-static uint64_t g_rule_class[LUNA_RULE_BUCKETS][LUNA_RULE_WORDS];
+/* One block of bit sets, a word per 64 rules: [any][id x64][type x64][class x64]. */
+static int g_rule_words;
+static uint64_t* g_rule_bits;
+#define LUNA_RULE_WORDS g_rule_words
+#define g_rule_any    (g_rule_bits)
+#define LUNA_RULE_SET(kind, b)  (g_rule_bits + ((size_t)(1 + (kind) * (int)LUNA_RULE_BUCKETS + (int)(b))) * (size_t)g_rule_words)
+#define g_rule_id(b)    LUNA_RULE_SET(0, b)
+#define g_rule_type(b)  LUNA_RULE_SET(1, b)
+#define g_rule_class(b) LUNA_RULE_SET(2, b)
 static int g_rule_index_ready = 0;
 
 static unsigned rule_hash_span(const char* s, size_t n) {
@@ -2689,18 +2881,21 @@ static void rule_bit_set(uint64_t* bits, int rule) {
 }
 
 static void rebuild_rule_index(void) {
-    memset(g_rule_any, 0, sizeof(g_rule_any));
-    memset(g_rule_id, 0, sizeof(g_rule_id));
-    memset(g_rule_type, 0, sizeof(g_rule_type));
-    memset(g_rule_class, 0, sizeof(g_rule_class));
+    int words = (rule_count + 63) / 64 + 1;
+    size_t n = (size_t)(1 + 3 * (int)LUNA_RULE_BUCKETS) * (size_t)words;
+    uint64_t* bits = (uint64_t*)realloc(g_rule_bits, n * sizeof(uint64_t));
+    if (!bits) abort();
+    g_rule_bits = bits;
+    g_rule_words = words;
+    memset(g_rule_bits, 0, n * sizeof(uint64_t));
     for (int order = 0; order < rule_count; order++) {
         const SimpleSelector* t = &css_rules[g_rule_order[order]].target;
         if (t->sel_id[0])
-            rule_bit_set(g_rule_id[rule_hash_str(t->sel_id)], order);
+            rule_bit_set(g_rule_id(rule_hash_str(t->sel_id)), order);
         else if (t->sel_type[0])
-            rule_bit_set(g_rule_type[rule_hash_str(t->sel_type)], order);
+            rule_bit_set(g_rule_type(rule_hash_str(t->sel_type)), order);
         else if (t->sel_class_count > 0)
-            rule_bit_set(g_rule_class[rule_hash_str(t->sel_classes[0])], order);
+            rule_bit_set(g_rule_class(rule_hash_str(t->sel_classes[0])), order);
         else
             rule_bit_set(g_rule_any, order);
     }
@@ -2717,7 +2912,7 @@ static int rule_ws(unsigned char c) {
 
 static void build_rule_candidates(const LunaElement* e, uint64_t* out) {
     if (!g_rule_index_ready) rebuild_rule_index();
-    memcpy(out, g_rule_any, sizeof(g_rule_any));
+    memcpy(out, g_rule_any, sizeof(uint64_t) * (size_t)g_rule_words);
 
     /* Pseudo-element selectors target their host, not the synthetic node. */
     const LunaElement* key = e;
@@ -2725,11 +2920,11 @@ static void build_rule_candidates(const LunaElement* e, uint64_t* out) {
         key = &elements[e->parent_idx];
 
     if (key->id[0])
-        rule_mask_or(out, g_rule_id[rule_hash_str(key->id)]);
+        rule_mask_or(out, g_rule_id(rule_hash_str(key->id)));
     if (key->type[0])
-        rule_mask_or(out, g_rule_type[rule_hash_str(key->type)]);
+        rule_mask_or(out, g_rule_type(rule_hash_str(key->type)));
     if (key->parent_idx == -1 && strcmp(key->type, "body") == 0)
-        rule_mask_or(out, g_rule_type[rule_hash_str("html")]);
+        rule_mask_or(out, g_rule_type(rule_hash_str("html")));
 
     const char* q = key->class_name;
     while (*q) {
@@ -2737,7 +2932,7 @@ static void build_rule_candidates(const LunaElement* e, uint64_t* out) {
         const char* start = q;
         while (*q && !rule_ws((unsigned char)*q)) q++;
         if (q > start)
-            rule_mask_or(out, g_rule_class[rule_hash_span(start, (size_t)(q - start))]);
+            rule_mask_or(out, g_rule_class(rule_hash_span(start, (size_t)(q - start))));
     }
 }
 
@@ -2768,7 +2963,7 @@ static int rule_candidate_next(const uint64_t* bits, int previous) {
     }
 }
 
-static int render_order[MAX_ELEMENTS];
+static int* render_order;
 
 GLuint bg_program, text_program, shadow_program, img_program;
 GLuint blur_program, backdrop_program;
@@ -2910,10 +3105,9 @@ static struct {
 } backdrop_loc;
 
 // Texture cache — path → GL texture ID (loaded once, reused)
-#define MAX_TEXTURES 64
 typedef struct { char path[512]; GLuint tex; int tw, th; } TexEntry;
-static TexEntry g_tex_cache[MAX_TEXTURES];
-static int g_tex_count = 0;
+static TexEntry* g_tex_cache;      /* grows with the images a page uses */
+static int g_tex_count = 0, g_tex_cap = 0;
 void* g_window_ptr_ptr = NULL;
 static char g_html_base_dir[512] = "ui";
 int   drag_target_idx = -1;
@@ -2936,9 +3130,9 @@ static int    g_drag_moved = 0;
 static int    g_drag_mode  = 0;
 static double g_press_x = 0, g_press_y = 0;
 static unsigned g_hover_epoch = 1;
-static unsigned g_hover_mark[MAX_ELEMENTS];
-static int    g_hover_chain[MAX_ELEMENTS];
-static int    g_hover_next[MAX_ELEMENTS];
+static unsigned* g_hover_mark;
+static int*    g_hover_chain;
+static int*    g_hover_next;
 static int    g_hover_chain_count = 0;
 static int    g_focused_idx = -1;
 static int    g_focused_element_idx = -1;
@@ -3313,7 +3507,7 @@ static int codepoint_prefers_cjk(int cp) {
  * Japanese/CJK ranges prefer the CJK face. This matters when exact-size ASCII
  * is moved to the dynamic atlas on a HiDPI output: it must not silently switch
  * from the UI font to Noto CJK. */
-static stbtt_fontinfo* font_for_codepoint(int cp) {
+static stbtt_fontinfo* font_for_codepoint_slow(int cp) {
     int pua = (cp >= 0xE000 && cp <= 0xF8FF);
     int prefer_cjk = codepoint_prefers_cjk(cp);
     int icon_has  = font_has_cp(&g_icon_font_info,  g_icon_font_info_ok,  cp);
@@ -3353,6 +3547,29 @@ static stbtt_fontinfo* font_for_codepoint(int cp) {
     if (g_brand_font_info_ok) return &g_brand_font_info;
     return NULL;
 }
+
+/* Choosing a face tests the codepoint against up to six fonts, and layout
+ * measures every character of every text run; remember the answer.  The key
+ * includes what the choice depends on (family/bold hints, which fonts exist). */
+typedef struct { int cp; unsigned hints; stbtt_fontinfo* f; } FontPick;
+static FontPick g_font_pick[4096];
+
+static stbtt_fontinfo* font_for_codepoint(int cp) {
+    unsigned hints = (unsigned)(g_font_face_hint & 3) | (g_font_bold_hint ? 4u : 0u) |
+                     (g_font_info_ok ? 8u : 0u) | (g_cjk_font_info_ok ? 16u : 0u) |
+                     (g_bold_font_info_ok ? 32u : 0u) | (g_mono_font_info_ok ? 64u : 0u) |
+                     (g_icon_font_info_ok ? 128u : 0u) | (g_brand_font_info_ok ? 256u : 0u) | 0x8000u;
+    unsigned slot = ((unsigned)cp * 2654435761u >> 12) & 4095u;
+    FontPick* fp = &g_font_pick[slot];
+    if (fp->hints == hints && fp->cp == cp) return fp->f;
+    stbtt_fontinfo* f = font_for_codepoint_slow(cp);
+    fp->cp = cp; fp->hints = hints; fp->f = f;
+    return f;
+}
+
+/* Design-unit advances, by face and codepoint. */
+typedef struct { stbtt_fontinfo* f; int cp; int advance; } AdvanceMemo;
+static AdvanceMemo g_advance_memo[8192];
 
 static LunaDynGlyph* dyn_bake_glyph(int cp, float css_px) {
     stbtt_fontinfo* finfo = font_for_codepoint(cp);
@@ -3521,8 +3738,11 @@ static float glyph_metric_advance(int cp, float css_px) {
     int advance = 0, lsb = 0;
     if (!finfo || css_px < 4.0f) return css_px * 0.5f;
     float scale = stbtt_ScaleForMappingEmToPixels(finfo, css_px);
+    AdvanceMemo* m = &g_advance_memo[((unsigned)cp * 2654435761u >> 11) & 8191u];
+    if (m->f == finfo && m->cp == cp) return (float)m->advance * scale;
     stbtt_GetCodepointHMetrics(finfo, cp, &advance, &lsb);
     (void)lsb;
+    m->f = finfo; m->cp = cp; m->advance = advance;
     return (float)advance * scale;
 }
 
@@ -3536,16 +3756,22 @@ static char g_screenshot_path[512] = {0};
 static int g_screenshot_pending = 0;
 static int g_preserve_backdrop = 0;
 static int g_layout_dirty = 1;
+/* The only change since the last layout is the document's scroll position: the
+ * layout proper need not run again, only the positioning tail. */
+static int g_layout_scroll_only = 0;
+#define LUNA_LAYOUT_DIRTY() do { g_layout_dirty = 1; g_layout_scroll_only = 0; } while (0)
+static float g_document_scroll_x, g_document_scroll_y;
+static float g_document_width, g_document_height;
 /* Intrinsic widths are queried repeatedly while nested flex containers are
  * resolved.  Cache them for one layout pass: the DOM/style state is immutable
  * during a pass, and this turns the common nested-flex case from repeated
  * full element scans into one scan per element. */
-static float g_intrinsic_width_cache[MAX_ELEMENTS];
-static unsigned char g_intrinsic_width_valid[MAX_ELEMENTS];
-static float g_min_content_width_cache[MAX_ELEMENTS];
-static unsigned char g_min_content_width_valid[MAX_ELEMENTS];
+static float* g_intrinsic_width_cache;
+static unsigned char* g_intrinsic_width_valid;
+static float* g_min_content_width_cache;
+static unsigned char* g_min_content_width_valid;
 static int g_render_order_dirty = 1;
-static int g_cached_eff_z[MAX_ELEMENTS];
+static int* g_cached_eff_z;
 
 // ============================================================
 // Utilities
@@ -3742,19 +3968,236 @@ static const NamedColor named_colors[] = {
     {"skyblue",      0.53f, 0.81f, 0.92f, 1.00f},
 };
 
+/* Functional colors: rgb() hsl() hwb() lab() lch() oklab() oklch() color()
+ * color-mix() light-dark(), in the comma or the space + "/ alpha" syntax. */
+static float color_lin2srgb(float c) {
+    if (c <= 0.0f) return 0.0f;
+    if (c >= 1.0f) return 1.0f;
+    return c <= 0.0031308f ? 12.92f * c : 1.055f * powf(c, 1.0f / 2.4f) - 0.055f;
+}
+static float color_clamp01(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+
+static void color_hsl_to_rgb(float h, float s, float l, float* r, float* g, float* b) {
+    h = fmodf(h, 360.0f); if (h < 0) h += 360.0f;
+    s = color_clamp01(s); l = color_clamp01(l);
+    float c = (1.0f - fabsf(2.0f * l - 1.0f)) * s;
+    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = l - c * 0.5f, rr = 0, gg = 0, bb = 0;
+    if (h < 60) { rr = c; gg = x; } else if (h < 120) { rr = x; gg = c; } else if (h < 180) { gg = c; bb = x; }
+    else if (h < 240) { gg = x; bb = c; } else if (h < 300) { rr = x; bb = c; } else { rr = c; bb = x; }
+    *r = rr + m; *g = gg + m; *b = bb + m;
+}
+
+static void color_oklab_to_rgb(float L, float a, float b, float* r, float* g, float* bl) {
+    float l_ = L + 0.3963377774f * a + 0.2158037573f * b;
+    float m_ = L - 0.1055613458f * a - 0.0638541728f * b;
+    float s_ = L - 0.0894841775f * a - 1.2914855480f * b;
+    float l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;
+    *r = color_lin2srgb(4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s);
+    *g = color_lin2srgb(-1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s);
+    *bl = color_lin2srgb(-0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s);
+}
+
+static void color_lab_to_rgb(float L, float a, float b, float* r, float* g, float* bl) {
+    float fy = (L + 16.0f) / 116.0f, fx = fy + a / 500.0f, fz = fy - b / 200.0f;
+    float e = 216.0f / 24389.0f, k = 24389.0f / 27.0f;
+    float xr = fx * fx * fx > e ? fx * fx * fx : (116.0f * fx - 16.0f) / k;
+    float yr = L > k * e ? fy * fy * fy : L / k;
+    float zr = fz * fz * fz > e ? fz * fz * fz : (116.0f * fz - 16.0f) / k;
+    float X = xr * 0.96422f, Y = yr, Z = zr * 0.82521f;     /* D50 white */
+    float lr = 3.1338561f * X - 1.6168667f * Y - 0.4906146f * Z;
+    float lg = -0.9787684f * X + 1.9161415f * Y + 0.0334540f * Z;
+    float lb = 0.0719453f * X - 0.2289914f * Y + 1.4052427f * Z;
+    *r = color_lin2srgb(lr); *g = color_lin2srgb(lg); *bl = color_lin2srgb(lb);
+}
+
+void parse_color(const char* val, float* r, float* g, float* b, float* a);
+
+/* Splits "a, b" at top-level commas into at most n strings in buf. */
+static int color_split_commas(const char* s, char (*out)[160], int n) {
+    int count = 0, depth = 0;
+    const char* start = s;
+    for (const char* p = s;; p++) {
+        if (*p == '(') depth++;
+        else if (*p == ')') depth--;
+        if (!*p || (*p == ',' && depth == 0)) {
+            if (count < n) {
+                size_t l = (size_t)(p - start);
+                if (l > 159) l = 159;
+                memcpy(out[count], start, l);
+                out[count][l] = '\0';
+                count++;
+            }
+            if (!*p) break;
+            start = p + 1;
+        }
+    }
+    return count;
+}
+
+static int parse_color_func(const char* val, float* r, float* g, float* b, float* a) {
+    const char* paren = strchr(val, '(');
+    if (!paren || paren == val) return 0;
+    char name[24] = {0};
+    size_t nl = (size_t)(paren - val);
+    if (nl >= sizeof name) return 0;
+    for (size_t i = 0; i < nl; i++) name[i] = (char)tolower((unsigned char)val[i]);
+    char body[400];
+    snprintf(body, sizeof body, "%s", paren + 1);
+    char* close = strrchr(body, ')');
+    if (close) *close = '\0';
+
+    if (!strcmp(name, "light-dark")) {
+        char parts[2][160];
+        if (color_split_commas(body, parts, 2) < 1) return 0;
+        char* t = parts[0];
+        while (isspace((unsigned char)*t)) t++;
+        parse_color(t, r, g, b, a);
+        return 1;
+    }
+    if (!strcmp(name, "color-mix")) {
+        char parts[3][160];
+        if (color_split_commas(body, parts, 3) < 3) return 0;
+        float c[2][4], w[2];
+        for (int i = 0; i < 2; i++) {
+            char* t = parts[i + 1];
+            while (isspace((unsigned char)*t)) t++;
+            w[i] = -1.0f;
+            size_t l = strlen(t);
+            while (l && isspace((unsigned char)t[l - 1])) t[--l] = '\0';
+            char* sp = NULL;
+            for (char* q = t + l; q > t; q--) if (isspace((unsigned char)q[-1]) ) { sp = q; break; }
+            if (sp && strchr(sp, '%') && !strchr(sp, ')')) { w[i] = (float)atof(sp) / 100.0f; sp[-1] = '\0'; }
+            c[i][3] = 1.0f;
+            parse_color(t, &c[i][0], &c[i][1], &c[i][2], &c[i][3]);
+        }
+        if (w[0] < 0 && w[1] < 0) w[0] = w[1] = 0.5f;
+        else if (w[0] < 0) w[0] = 1.0f - w[1];
+        else if (w[1] < 0) w[1] = 1.0f - w[0];
+        float sum = w[0] + w[1];
+        float alpha = c[0][3] * w[0] + c[1][3] * w[1];
+        if (sum > 0) {
+            float pa0 = c[0][3] * w[0] / sum, pa1 = c[1][3] * w[1] / sum, pa = pa0 + pa1;
+            float* o[3] = { r, g, b };
+            for (int k = 0; k < 3; k++) *o[k] = pa > 0 ? (c[0][k] * pa0 + c[1][k] * pa1) / pa : 0.0f;
+            *a = sum < 1.0f ? alpha : pa;
+        }
+        return 1;
+    }
+    int is_rgb = !strcmp(name, "rgb") || !strcmp(name, "rgba");
+    int is_hsl = !strcmp(name, "hsl") || !strcmp(name, "hsla");
+    int is_hwb = !strcmp(name, "hwb");
+    int is_lab = !strcmp(name, "lab"), is_lch = !strcmp(name, "lch");
+    int is_oklab = !strcmp(name, "oklab"), is_oklch = !strcmp(name, "oklch");
+    int is_color = !strcmp(name, "color");
+    if (!(is_rgb || is_hsl || is_hwb || is_lab || is_lch || is_oklab || is_oklch || is_color)) return 0;
+    if (!strncmp(body, "from", 4) && isspace((unsigned char)body[4])) return 0;   /* relative colors: not supported */
+
+    float v[4] = { 0, 0, 0, 1 };
+    int pct[4] = { 0, 0, 0, 0 }, none[4] = { 0, 0, 0, 0 };
+    int n = 0, slash = 0;
+    char* p = body;
+    if (is_color) {                                    /* color(srgb r g b) */
+        while (isspace((unsigned char)*p)) p++;
+        while (*p && !isspace((unsigned char)*p)) p++;
+    }
+    while (*p && n < 4) {
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (*p == '/') { slash = 1; p++; n = 3; continue; }
+        if (!*p) break;
+        char* start = p;
+        while (*p && !isspace((unsigned char)*p) && *p != ',' && *p != '/') p++;
+        char tok[40];
+        size_t l = (size_t)(p - start);
+        if (l >= sizeof tok) l = sizeof tok - 1;
+        memcpy(tok, start, l); tok[l] = '\0';
+        if (!strcmp(tok, "none")) { none[n++] = 1; continue; }
+        char* end;
+        float f = strtof(tok, &end);
+        if (end == tok) return 0;
+        if (*end == '%') pct[n] = 1;
+        else if (!strncmp(end, "turn", 4)) f *= 360.0f;
+        else if (!strncmp(end, "rad", 3)) f *= 57.29578f;
+        else if (!strncmp(end, "grad", 4)) f *= 0.9f;
+        v[n++] = f;
+    }
+    (void)slash;
+    if (n < 3) return 0;
+    float alpha = n == 4 ? (pct[3] ? v[3] / 100.0f : v[3]) : 1.0f;
+    float rr = 0, gg = 0, bb = 0;
+    if (is_rgb) {
+        rr = pct[0] ? v[0] / 100.0f : v[0] / 255.0f;
+        gg = pct[1] ? v[1] / 100.0f : v[1] / 255.0f;
+        bb = pct[2] ? v[2] / 100.0f : v[2] / 255.0f;
+    } else if (is_hsl) {
+        color_hsl_to_rgb(v[0], v[1] / 100.0f, v[2] / 100.0f, &rr, &gg, &bb);
+    } else if (is_hwb) {
+        float w = v[1] / 100.0f, bk = v[2] / 100.0f;
+        if (w + bk >= 1.0f) { rr = gg = bb = w / (w + bk); }
+        else {
+            color_hsl_to_rgb(v[0], 1.0f, 0.5f, &rr, &gg, &bb);
+            rr = rr * (1 - w - bk) + w; gg = gg * (1 - w - bk) + w; bb = bb * (1 - w - bk) + w;
+        }
+    } else if (is_oklab || is_oklch) {
+        float L = pct[0] ? v[0] / 100.0f : v[0], A = v[1], B = v[2];
+        if (is_oklch) { float h = v[2] * 0.0174533f; A = v[1] * cosf(h); B = v[1] * sinf(h); }
+        color_oklab_to_rgb(L, A, B, &rr, &gg, &bb);
+    } else if (is_lab || is_lch) {
+        float A = v[1], B = v[2];
+        if (is_lch) { float h = v[2] * 0.0174533f; A = v[1] * cosf(h); B = v[1] * sinf(h); }
+        color_lab_to_rgb(v[0], A, B, &rr, &gg, &bb);
+    } else {                                            /* color(srgb ...) */
+        rr = pct[0] ? v[0] / 100.0f : v[0]; gg = pct[1] ? v[1] / 100.0f : v[1]; bb = pct[2] ? v[2] / 100.0f : v[2];
+    }
+    *r = color_clamp01(rr); *g = color_clamp01(gg); *b = color_clamp01(bb); *a = color_clamp01(alpha);
+    return 1;
+}
+
+/* Whether val is a color the parser understands; an invalid color makes the
+ * declaration void (it must not turn into black). */
+static int css_color_valid(const char* val) {
+    while (isspace((unsigned char)*val)) val++;
+    if (!*val) return 0;
+    if (val[0] == '#') {
+        size_t n = 1;
+        while (isxdigit((unsigned char)val[n])) n++;
+        return (n == 4 || n == 5 || n == 7 || n == 9) && (!val[n] || isspace((unsigned char)val[n]));
+    }
+    if (strchr(val, '(')) return 1;
+    char word[40];
+    size_t i = 0;
+    while (val[i] && !isspace((unsigned char)val[i]) && i < sizeof word - 1) { word[i] = (char)tolower((unsigned char)val[i]); i++; }
+    word[i] = '\0';
+    if (!strcmp(word, "transparent") || !strcmp(word, "none") || !strcmp(word, "initial") || !strcmp(word, "unset") ||
+        !strcmp(word, "revert") || !strcmp(word, "revert-layer") || !strcmp(word, "currentcolor")) return 1;
+    size_t nc = sizeof(named_colors) / sizeof(named_colors[0]);
+    for (size_t k = 0; k < nc; k++) if (!strcmp(word, named_colors[k].name)) return 1;
+    return 0;
+}
+
+/* Set by parse_color when the text is not a colour, so a declaration such as
+ * `background-color:f4f4f4` can be dropped as CSS does instead of painting black. */
+static int g_color_invalid = 0;
+
 void parse_color(const char* val, float* r, float* g, float* b, float* a) {
+    g_color_invalid = 0;
     if (!val) return;
     while (isspace((unsigned char)*val)) val++;
     *a = 1.0f;
+    if (parse_color_func(val, r, g, b, a)) return;
 
-    if (strcmp(val, "none") == 0) {
+    if (strcmp(val, "none") == 0 || strcmp(val, "initial") == 0 || strcmp(val, "unset") == 0 ||
+        strcmp(val, "revert") == 0 || strcmp(val, "revert-layer") == 0) {
         *r = *g = *b = 0.0f; *a = 0.0f;
         return;
     }
 
     if (val[0] == '#') {
         int len = (int)strlen(val);
-        if (len == 4) {
+        if (len != 4 && len != 5 && len != 7 && len < 9) g_color_invalid = 1;
+        for (int hi = 1; hi < len; hi++) if (!isxdigit((unsigned char)val[hi])) { g_color_invalid = 1; break; }
+        if (g_color_invalid) { /* leave the colour untouched */ }
+        else if (len == 4) {
             unsigned int rv, gv, bv;
             if (sscanf(val, "#%1x%1x%1x", &rv, &gv, &bv) == 3) {
                 *r = (rv * 17) / 255.0f; *g = (gv * 17) / 255.0f; *b = (bv * 17) / 255.0f;
@@ -3788,7 +4231,7 @@ void parse_color(const char* val, float* r, float* g, float* b, float* a) {
             if (idx >= 3) {
                 *r = vals[0] / 255.0f; *g = vals[1] / 255.0f; *b = vals[2] / 255.0f;
                 *a = (idx == 4) ? vals[3] : 1.0f;
-            }
+            } else g_color_invalid = 1;
         }
     } else if (strncmp(val, "hsla(", 5) == 0 || strncmp(val, "hsl(", 4) == 0) {
         const char* paren = strchr(val, '(');
@@ -3832,13 +4275,16 @@ void parse_color(const char* val, float* r, float* g, float* b, float* a) {
         }
     } else {
         size_t nc = sizeof(named_colors) / sizeof(named_colors[0]);
+        int found = 0;
         for (size_t i = 0; i < nc; i++) {
-            if (strcmp(val, named_colors[i].name) == 0) {
+            if (strcasecmp(val, named_colors[i].name) == 0) {
                 *r = named_colors[i].r; *g = named_colors[i].g;
                 *b = named_colors[i].b; *a = named_colors[i].a;
+                found = 1;
                 break;
             }
         }
+        if (!found) g_color_invalid = 1;
     }
 }
 
@@ -3849,10 +4295,12 @@ void parse_color(const char* val, float* r, float* g, float* b, float* a) {
 /* Convert a parsed number to px based on the unit that follows it.
    Root font-size is fixed at 16px (rem == em here: no font-relative cascade). */
 #define LUNA_REM_PX 16.0f
+/* 1rem in px: LUNA_REM_PX until a stylesheet sets html { font-size }. */
+static float g_rem_px = LUNA_REM_PX;
 static float apply_css_unit(float v, const char* unit) {
     if (!unit) return v;
     while (isspace((unsigned char)*unit)) unit++;
-    if (strncmp(unit, "rem", 3) == 0) return v * LUNA_REM_PX;
+    if (strncmp(unit, "rem", 3) == 0) return v * g_rem_px;
     if (strncmp(unit, "em", 2) == 0)  return v * LUNA_REM_PX;
     if (strncmp(unit, "pt", 2) == 0)  return v * (96.0f / 72.0f);
     if (strncmp(unit, "vw", 2) == 0)  return v * window_width * 0.01f;
@@ -4395,14 +4843,112 @@ static void parse_conic_gradient(const char* val, StyleRule* rule) {
 }
 
 // Parse url(...) helper: extracts the path into out_path (max len), returns 1 on success
+/* Long data: URLs (inline SVG icons run to a kilobyte) do not fit the 256-byte
+ * path fields; they are kept here and the field holds "\x02<index>". */
+static char** g_long_paths = NULL;
+static int g_long_path_n = 0;
+
+static const char* luna_expand_path(const char* p) {
+    if (p && p[0] == '\x02') {
+        int i = atoi(p + 1);
+        if (i >= 0 && i < g_long_path_n) return g_long_paths[i];
+    }
+    return p;
+}
+
+static int luna_intern_path(const char* s, size_t n, char* out, int max_len) {
+    for (int i = 0; i < g_long_path_n; i++)
+        if (strlen(g_long_paths[i]) == n && memcmp(g_long_paths[i], s, n) == 0) {
+            snprintf(out, (size_t)max_len, "\x02%d", i);
+            return 1;
+        }
+    char** g = (char**)realloc(g_long_paths, sizeof(char*) * (size_t)(g_long_path_n + 1));
+    if (!g) return 0;
+    g_long_paths = g;
+    char* copy = (char*)malloc(n + 1);
+    if (!copy) return 0;
+    memcpy(copy, s, n);
+    copy[n] = '\0';
+    g_long_paths[g_long_path_n] = copy;
+    snprintf(out, (size_t)max_len, "\x02%d", g_long_path_n++);
+    return 1;
+}
+
+/* Markup of inline <svg> elements, drawn as pictures. */
+static char** g_svg_src = NULL;
+static int g_svg_n = 0;
+
+/* The element's markup without width/height on the root tag (they may be in
+ * rem, which the rasteriser does not read; the box gives the size). */
+static int luna_svg_intern(const char* src, size_t n) {
+    char* copy = (char*)malloc(n + 1);
+    if (!copy) return 0;
+    memcpy(copy, src, n);
+    copy[n] = '\0';
+    char* gt = strchr(copy, '>');
+    for (const char* attr = " width"; ; attr = " height") {
+        char* a = copy;
+        while ((a = strstr(a, attr)) != NULL && a < gt) {
+            char* q = a + strlen(attr);
+            while (*q == ' ') q++;
+            if (*q != '=') { a = q; continue; }
+            q++;
+            while (*q == ' ') q++;
+            char quote = (*q == '"' || *q == '\'') ? *q++ : 0;
+            while (*q && (quote ? *q != quote : (*q != ' ' && *q != '>'))) q++;
+            if (quote && *q == quote) q++;
+            memmove(a, q, strlen(q) + 1);
+            gt = strchr(copy, '>');
+            break;
+        }
+        if (strcmp(attr, " height") == 0) break;
+    }
+    for (int i = 0; i < g_svg_n; i++)
+        if (strcmp(g_svg_src[i], copy) == 0) { free(copy); return i + 1; }
+    char** g = (char**)realloc(g_svg_src, sizeof(char*) * (size_t)(g_svg_n + 1));
+    if (!g) { free(copy); return 0; }
+    g_svg_src = g;
+    g_svg_src[g_svg_n++] = copy;
+    return g_svg_n;
+}
+
+/* The picture for an inline <svg>: its markup with currentColor made concrete. */
+static int luna_svg_picture_path(int idx, float r, float g, float b, char* out, int max_len) {
+    if (idx < 1 || idx > g_svg_n) return 0;
+    const char* src = g_svg_src[idx - 1];
+    char color[16];
+    snprintf(color, sizeof color, "#%02x%02x%02x",
+             (int)(fminf(fmaxf(r, 0.f), 1.f) * 255.f + 0.5f), (int)(fminf(fmaxf(g, 0.f), 1.f) * 255.f + 0.5f),
+             (int)(fminf(fmaxf(b, 0.f), 1.f) * 255.f + 0.5f));
+    const char* prefix = "data:image/svg+xml;utf8,";
+    size_t cap = strlen(prefix) + strlen(src) * 2 + 8;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return 0;
+    char* w = buf;
+    memcpy(w, prefix, strlen(prefix)); w += strlen(prefix);
+    for (const char* p = src; *p; ) {
+        if (luna_strncasecmp(p, "currentColor", 12) == 0) { memcpy(w, color, 7); w += 7; p += 12; }
+        else *w++ = *p++;
+    }
+    *w = '\0';
+    int ok = luna_intern_path(buf, (size_t)(w - buf), out, max_len);
+    free(buf);
+    return ok;
+}
+
 static int parse_url(const char* val, char* out_path, int max_len) {
     const char* up = strstr(val, "url(");
     if (!up) return 0;
     up += 4;
-    while (*up == ' ' || *up == '\'' || *up == '"') up++;
-    const char* ue = strpbrk(up, "'\") ");
+    while (*up == ' ') up++;
+    const char quote = (*up == '\'' || *up == '"') ? *up++ : 0;
+    /* A quoted URL runs to the closing quote (it may hold spaces and ")");
+     * an unquoted one to ")" or a space. */
+    const char* ue = quote ? strchr(up, quote) : strpbrk(up, ") ");
     if (!ue) ue = up + strlen(up);
     int ulen = (int)(ue - up);
+    if (ulen >= max_len && strncmp(up, "data:", 5) == 0 && max_len >= 16)
+        return luna_intern_path(up, (size_t)ulen, out_path, max_len);
     if (ulen <= 0 || ulen >= max_len) return 0;
     strncpy(out_path, up, (size_t)ulen);
     out_path[ulen] = '\0';
@@ -4462,6 +5008,61 @@ static int split_top_level_commas(const char* val, char* buf, int bufsz,
 
 // Parse background shorthand: color, gradient, or url(...)
 // Supports comma-separated multiple background layers.
+static void apply_one_declaration(const char* key, const char* val, StyleRule* rule);
+
+/* One background layer, "<color> url(..) linear-gradient(..) <position> / <size> no-repeat ...":
+ * every part is optional and they come in any order.  Image, gradient and color
+ * go into `out`; position and size are returned as text. */
+static void bg_layer_parse(const char* layer, StyleRule* out, char* pos, size_t pn, char* size, size_t sn) {
+    pos[0] = size[0] = '\0';
+    int after_slash = 0;
+    const char* p = layer;
+    while (*p) {
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        const char* st = p;
+        int depth = 0;
+        for (; *p && (depth || !isspace((unsigned char)*p)); p++) {
+            if (*p == '(') depth++;
+            else if (*p == ')') depth--;
+            else if (*p == '"' || *p == '\'') { char q = *p++; while (*p && *p != q) p++; if (!*p) break; }
+        }
+        char tok[1024];
+        size_t l = (size_t)(p - st);
+        if (l >= sizeof tok) l = sizeof tok - 1;
+        memcpy(tok, st, l); tok[l] = '\0';
+        if (!strcmp(tok, "/")) { after_slash = 1; continue; }
+        if (tok[0] == '/') { after_slash = 1; memmove(tok, tok + 1, strlen(tok)); if (!tok[0]) continue; }
+        if (!strncmp(tok, "url(", 4)) {
+            char path[256];
+            if (parse_url(tok, path, sizeof path)) {
+                out->has_bg_image = 1;
+                snprintf(out->bg_image_path, sizeof out->bg_image_path, "%s", path);
+            }
+        } else if (!strncmp(tok, "linear-gradient", 15) || !strncmp(tok, "repeating-linear-gradient", 25)) parse_linear_gradient(tok, out);
+        else if (!strncmp(tok, "radial-gradient", 15)) parse_radial_gradient(tok, out);
+        else if (!strncmp(tok, "conic-gradient", 14)) parse_conic_gradient(tok, out);
+        else if (!strcmp(tok, "no-repeat") || !strcmp(tok, "repeat") || !strcmp(tok, "repeat-x") || !strcmp(tok, "repeat-y") ||
+                 !strcmp(tok, "space") || !strcmp(tok, "round") || !strcmp(tok, "fixed") || !strcmp(tok, "scroll") ||
+                 !strcmp(tok, "local") || !strcmp(tok, "border-box") || !strcmp(tok, "padding-box") ||
+                 !strcmp(tok, "content-box") || !strcmp(tok, "text")) { /* not painted differently here */ }
+        else if (after_slash || !strcmp(tok, "left") || !strcmp(tok, "right") || !strcmp(tok, "top") ||
+                 !strcmp(tok, "bottom") || !strcmp(tok, "center") || isdigit((unsigned char)tok[0]) ||
+                 tok[0] == '-' || tok[0] == '.' || tok[0] == '+') {
+            char* dst = after_slash ? size : pos;
+            size_t cap = after_slash ? sn : pn;
+            size_t n = strlen(dst);
+            if (n + strlen(tok) + 2 < cap) snprintf(dst + n, cap - n, "%s%s", n ? " " : "", tok);
+        } else if (!strcmp(tok, "auto") || !strcmp(tok, "cover") || !strcmp(tok, "contain")) {
+            size_t n = strlen(size);
+            if (n + strlen(tok) + 2 < sn) snprintf(size + n, sn - n, "%s%s", n ? " " : "", tok);
+        } else if (css_color_valid(tok)) {
+            out->has_bg = 1;
+            parse_color(tok, &out->bg_r, &out->bg_g, &out->bg_b, &out->bg_a);
+        }
+    }
+}
+
 static void parse_background_shorthand(const char* val, StyleRule* rule) {
     char buf[1024];
     strncpy(buf, val, sizeof(buf) - 1);
@@ -4487,26 +5088,11 @@ static void parse_background_shorthand(const char* val, StyleRule* rule) {
     int n = split_top_level_commas(buf, layer_buf, sizeof(layer_buf), pieces, LUNA_MAX_BG_LAYERS + 1);
 
     if (n <= 1) {
-        /* Single layer — fast path, keep existing behaviour */
-        if (strncmp(buf, "url(", 4) == 0) {
-            char path[256];
-            if (parse_url(buf, path, sizeof(path))) {
-                rule->has_bg_image = 1;
-                strncpy(rule->bg_image_path, path, sizeof(rule->bg_image_path) - 1);
-                rule->bg_image_path[sizeof(rule->bg_image_path) - 1] = '\0';
-            }
-            return;
-        }
-        if (strncmp(buf, "linear-gradient", 15) == 0) {
-            parse_linear_gradient(buf, rule);
-        } else if (strncmp(buf, "radial-gradient", 15) == 0) {
-            parse_radial_gradient(buf, rule);
-        } else if (strncmp(buf, "conic-gradient", 14) == 0) {
-            parse_conic_gradient(buf, rule);
-        } else {
-            rule->has_bg = 1;
-            parse_color(buf, &rule->bg_r, &rule->bg_g, &rule->bg_b, &rule->bg_a);
-        }
+        /* Single layer */
+        char pos[160], size[160];
+        bg_layer_parse(buf, rule, pos, sizeof pos, size, sizeof size);
+        if (pos[0]) apply_one_declaration("background-position", pos, rule);
+        if (size[0]) apply_one_declaration("background-size", size, rule);
         return;
     }
 
@@ -4522,28 +5108,16 @@ static void parse_background_shorthand(const char* val, StyleRule* rule) {
 
         /* Parse into a temporary rule to capture gradient info */
         StyleRule tmp; memset(&tmp, 0, sizeof(tmp));
-        if (strncmp(piece, "linear-gradient", 15) == 0) {
-            parse_linear_gradient(piece, &tmp);
-        } else if (strncmp(piece, "radial-gradient", 15) == 0) {
-            parse_radial_gradient(piece, &tmp);
-        } else if (strncmp(piece, "conic-gradient", 14) == 0) {
-            parse_conic_gradient(piece, &tmp);
-        } else if (strncmp(piece, "url(", 4) == 0) {
-            char path[256];
-            if (parse_url(piece, path, sizeof(path))) {
-                tmp.has_bg_image = 1;
-                snprintf(tmp.bg_image_path, sizeof(tmp.bg_image_path), "%s", path);
-                /* Layers hold no images; the element's own image is painted
-                 * over them, which is where the topmost url() layer goes. */
-                if (!rule->has_bg_image) {
-                    rule->has_bg_image = 1;
-                    snprintf(rule->bg_image_path, sizeof(rule->bg_image_path), "%s", path);
-                }
+        char lpos[160], lsize[160];
+        bg_layer_parse(piece, &tmp, lpos, sizeof lpos, lsize, sizeof lsize);
+        if (tmp.has_bg_image) {
+            /* Layers hold no images; the element's own image is painted
+             * over them, which is where the topmost url() layer goes. */
+            if (!rule->has_bg_image) {
+                rule->has_bg_image = 1;
+                snprintf(rule->bg_image_path, sizeof(rule->bg_image_path), "%s", tmp.bg_image_path);
             }
-            continue;
-        } else {
-            tmp.has_bg = 1;
-            parse_color(piece, &tmp.bg_r, &tmp.bg_g, &tmp.bg_b, &tmp.bg_a);
+            if (!tmp.has_gradient && !tmp.has_bg) continue;
         }
         rule_to_bg_layer(&tmp, &rule->bg_layers[rule->bg_layer_count++]);
     }
@@ -4911,6 +5485,7 @@ static void parse_one_grid_track(const char* tok, float* size, int* type, float*
     }
 }
 
+static int g_grid_tracks_are_columns = 0;
 static void parse_grid_tracks(const char* val, float* sizes, int* types, float* mins, int* count) {
     const char* p = val;
     *count = 0;
@@ -4933,6 +5508,11 @@ static void parse_grid_tracks(const char* val, float* sizes, int* types, float* 
         tok[ti] = '\0';
         trim_whitespace(tok);
         parse_one_grid_track(tok, &sizes[*count], &types[*count], &mins[*count]);
+        /* A column of width `auto` takes what the fixed tracks leave (the grid's
+         * default justify-content: stretch), not an equal share of the whole. */
+        if (g_grid_tracks_are_columns && strcmp(tok, "auto") == 0) {
+            types[*count] = GRID_TRACK_MINMAX; sizes[*count] = 1.0f; mins[*count] = 0.0f;
+        }
         (*count)++;
     }
 }
@@ -4953,12 +5533,12 @@ static void parse_grid_template_areas(const char* val, StyleRule* rule) {
     while (*p && rule->grid_area_rows < MAX_GRID_AREA_ROWS) {
         while (*p && isspace((unsigned char)*p)) p++;
         if (!*p) break;
-        if (*p != '"') { p++; continue; }
-        p++;
+        if (*p != '"' && *p != '\'') { p++; continue; }
+        const char quote = *p++;
         char rowbuf[256] = {0};
         int ri = 0;
-        while (*p && *p != '"' && ri < 255) rowbuf[ri++] = *p++;
-        if (*p == '"') p++;
+        while (*p && *p != quote && ri < 255) rowbuf[ri++] = *p++;
+        if (*p == quote) p++;
         int col = 0;
         char* tok = strtok(rowbuf, " \t");
         while (tok && col < MAX_GRID_AREA_COLS) {
@@ -5048,8 +5628,8 @@ static int parse_cursor_type(const char* val) {
  * stats, sliders, dock, popovers), and each lookup used to strcmp its way down
  * the whole element array.  Element ids are only ever written when an element
  * is appended, so the table just needs extending as elem_count grows. */
-#define LUNA_ID_MAP_SIZE 4096   /* power of two, comfortably > MAX_ELEMENTS */
-static int g_id_map[LUNA_ID_MAP_SIZE];
+static int* g_id_map;
+static unsigned g_id_map_size;      /* power of two, at least twice the elements */
 static int g_id_map_ready = 0;
 static int g_id_map_built = 0;  /* elements already inserted */
 
@@ -5062,22 +5642,30 @@ static unsigned luna_id_hash(const char* s) {
 static void id_map_insert(int idx) {
     const char* id = elements[idx].id;
     if (!id[0]) return;
-    unsigned h = luna_id_hash(id) & (LUNA_ID_MAP_SIZE - 1);
+    unsigned h = luna_id_hash(id) & (g_id_map_size - 1);
     while (g_id_map[h] != -1) {
         /* Duplicate id: the first element wins, exactly as the old
          * front-to-back linear scan did. */
         if (strcmp(elements[g_id_map[h]].id, id) == 0) return;
-        h = (h + 1) & (LUNA_ID_MAP_SIZE - 1);
+        h = (h + 1) & (g_id_map_size - 1);
     }
     g_id_map[h] = idx;
 }
 
-/* Returns 0 when the table cannot stay sparse enough to probe cheaply, in
- * which case the caller falls back to the plain scan. */
+/* Returns 0 when the table cannot be had (out of memory), in which case the
+ * caller falls back to the plain scan. */
 static int id_map_sync(void) {
-    if (elem_count * 2 > LUNA_ID_MAP_SIZE) return 0;
+    if ((unsigned)elem_count * 2 > g_id_map_size) {
+        unsigned size = g_id_map_size ? g_id_map_size : 4096;
+        while ((unsigned)elem_count * 2 > size) size <<= 1;
+        int* t = (int*)realloc(g_id_map, sizeof(int) * size);
+        if (!t) return 0;
+        g_id_map = t;
+        g_id_map_size = size;
+        g_id_map_ready = 0;            /* rehash everything into the larger table */
+    }
     if (!g_id_map_ready || g_id_map_built > elem_count) {
-        for (int i = 0; i < LUNA_ID_MAP_SIZE; i++) g_id_map[i] = -1;
+        for (unsigned i = 0; i < g_id_map_size; i++) g_id_map[i] = -1;
         g_id_map_built = 0;
         g_id_map_ready = 1;
     }
@@ -5093,15 +5681,18 @@ int get_element_by_id(const char* id) {
             if (strcmp(elements[i].id, id) == 0) return i;
         return -1;
     }
-    unsigned h = luna_id_hash(id) & (LUNA_ID_MAP_SIZE - 1);
-    for (int probe = 0; probe < LUNA_ID_MAP_SIZE; probe++) {
+    unsigned h = luna_id_hash(id) & (g_id_map_size - 1);
+    for (unsigned probe = 0; probe < g_id_map_size; probe++) {
         int idx = g_id_map[h];
         if (idx == -1) return -1;
         if (strcmp(elements[idx].id, id) == 0) return idx;
-        h = (h + 1) & (LUNA_ID_MAP_SIZE - 1);
+        h = (h + 1) & (g_id_map_size - 1);
     }
     return -1;
 }
+
+static int g_hist_idx = -1;       /* the field whose undo history is kept */
+static void input_hist_reset(void);
 
 void set_text(int idx, const char* new_text) {
     if (idx >= 0 && idx < elem_count) {
@@ -5112,6 +5703,8 @@ void set_text(int idx, const char* new_text) {
         if (elements[idx].is_input) {
             int n = (int)strlen(elements[idx].text);
             if (elements[idx].caret > n) elements[idx].caret = n;
+            elements[idx].sel_has = 0;
+            if (idx == g_hist_idx) input_hist_reset();
         }
         elements[idx].has_custom_text = 1;
 
@@ -5119,8 +5712,8 @@ void set_text(int idx, const char* new_text) {
            invalidating layout here, a newly revealed display:none subtree can
            keep parser-default or previously cached flex dimensions until an
            unrelated class/resize event happens. */
-        memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
-        g_layout_dirty = 1;
+        LUNA_AUX_ZERO(g_intrinsic_width_valid);
+        LUNA_LAYOUT_DIRTY();
         g_render_order_dirty = 1;
         g_visual_scan_needed = 1;
 
@@ -5145,6 +5738,8 @@ static void set_text_paint_only(int idx, const char* new_text) {
     if (elements[idx].is_input) {
         int n = (int)strlen(elements[idx].text);
         if (elements[idx].caret > n) elements[idx].caret = n;
+        elements[idx].sel_has = 0;
+        if (idx == g_hist_idx) input_hist_reset();
     }
     elements[idx].has_custom_text = 1;
 
@@ -5203,43 +5798,54 @@ static void wire_element_onclick_handlers(void) {
     }
 }
 
-/* strstr for an attribute name: the match must start the tag buffer or follow
- * whitespace, so `id="` is not found inside `data-id="`. */
-static const char* find_html_attr(const char* tag_buf, const char* needle) {
+/* The value of attribute `attr` in a tag buffer ("div id=a class='b c'"):
+ * names are case-insensitive, values are double-quoted, single-quoted or
+ * bare.  Returns 1 with a value, 0 for an attribute without one, -1 if absent. */
+static void decode_html_entities(char* s);
+
+static int html_attr_get(const char* tag_buf, const char* attr, char* out, int out_len) {
+    if (!tag_buf || !attr || !out || out_len <= 0) return -1;
+    size_t al = strlen(attr);
     const char* p = tag_buf;
-    while ((p = strstr(p, needle)) != NULL) {
-        if (p == tag_buf || isspace((unsigned char)p[-1])) return p;
+    while (*p && !isspace((unsigned char)*p)) p++;                    /* the tag name */
+    for (;;) {
+        while (*p && (isspace((unsigned char)*p) || *p == '/')) p++;
+        if (!*p) return -1;
+        const char* name = p;
+        while (*p && !isspace((unsigned char)*p) && *p != '=' && *p != '/' && *p != '>') p++;
+        size_t nl = (size_t)(p - name);
+        if (nl == 0) { p++; continue; }
+        while (isspace((unsigned char)*p)) p++;
+        if (*p != '=') {
+            if (nl == al && !strncasecmp(name, attr, al)) { out[0] = '\0'; return 0; }   /* no value */
+            continue;
+        }
         p++;
+        while (isspace((unsigned char)*p)) p++;
+        const char* v = p;
+        const char* end;
+        if (*p == '"' || *p == '\'') {
+            v = ++p;
+            end = strchr(p, p[-1]);
+            if (!end) return -1;
+            p = end + 1;
+        } else {
+            while (*p && !isspace((unsigned char)*p) && *p != '>') p++;
+            end = p;
+        }
+        if (nl == al && !strncasecmp(name, attr, al)) {
+            int n = (int)(end - v);
+            if (n >= out_len) n = out_len - 1;
+            memcpy(out, v, (size_t)n);
+            out[n] = '\0';
+            decode_html_entities(out);
+            return 1;
+        }
     }
-    return NULL;
 }
 
 static int extract_html_attr(const char* tag_buf, const char* attr, char* out, int out_len) {
-    if (!tag_buf || !attr || !out || out_len <= 0) return 0;
-    char needle[64];
-    snprintf(needle, sizeof(needle), "%s=\"", attr);
-    const char* p = find_html_attr(tag_buf, needle);
-    if (!p) {
-        snprintf(needle, sizeof(needle), "%s='", attr);
-        p = find_html_attr(tag_buf, needle);
-        if (!p) return 0;
-        p += strlen(attr) + 2;
-        const char* end = strchr(p, '\'');
-        if (!end) return 0;
-        int n = (int)(end - p);
-        if (n >= out_len) n = out_len - 1;
-        strncpy(out, p, (size_t)n);
-        out[n] = '\0';
-        return 1;
-    }
-    p += strlen(attr) + 2;
-    const char* end = strchr(p, '"');
-    if (!end) return 0;
-    int n = (int)(end - p);
-    if (n >= out_len) n = out_len - 1;
-    strncpy(out, p, (size_t)n);
-    out[n] = '\0';
-    return 1;
+    return html_attr_get(tag_buf, attr, out, out_len) == 1;
 }
 
 void parse_declarations(char* declarations, StyleRule* rule);
@@ -5260,7 +5866,7 @@ static void apply_element_inline_style(LunaElement* e, int* am) {
     parse_declarations(buf, &rule);
     apply_style_rule(e, &rule, am);
     rule_bg_layers_release(rule.bg_layers);
-    g_layout_dirty = 1; g_render_order_dirty = 1;
+    LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
 }
 
 static const char* class_next_token(const char* p, char* out, size_t out_n) {
@@ -5300,6 +5906,35 @@ static void restyle_element_and_descendants(LunaElement* e) {
     if (root < 0 || root >= elem_count) return;
 
     (void)restyle_element_checked(e);
+
+    /* One forward pass.  A descendant is an element whose parent is already in
+     * the subtree, which is decided in O(1) per element when parents come before
+     * their children (the parser and appendChild keep it so in practice).  The
+     * old form walked every element's whole ancestor chain on every call, and a
+     * list that restyles hundreds of rows paid elem_count * depth for each. */
+    static unsigned char* in_subtree = NULL;
+    static int in_subtree_cap = 0;
+    if (elem_count > in_subtree_cap) {
+        unsigned char* grown = (unsigned char*)realloc(in_subtree, (size_t)elem_count);
+        if (grown) { in_subtree = grown; in_subtree_cap = elem_count; }
+    }
+    int ordered = in_subtree != NULL;
+    if (ordered) {
+        memset(in_subtree, 0, (size_t)elem_count);
+        in_subtree[root] = 1;
+        for (int i = root + 1; i < elem_count; i++) {
+            int par = elements[i].parent_idx;
+            if (par > i) { ordered = 0; break; }       /* parent after child: not forward-closed */
+            if (par >= root && in_subtree[par]) {
+                in_subtree[i] = 1;
+                (void)restyle_element_checked(&elements[i]);
+            }
+        }
+        /* Elements before `root` can still be its descendants only if reparented. */
+        for (int i = 0; ordered && i < root; i++)
+            if (elements[i].parent_idx > i) ordered = 0;
+        if (ordered) return;
+    }
     for (int i = 0; i < elem_count; i++) {
         if (i == root) continue;
         for (int p = elements[i].parent_idx; p != -1; p = elements[p].parent_idx) {
@@ -5322,7 +5957,7 @@ static int add_class_no_restyle(LunaElement* e, const char* cls) {
 
 static int remove_class_no_restyle(LunaElement* e, const char* cls) {
     if (!e || !cls || !*cls || !element_has_class(e, cls)) return 0;
-    char result[96] = {0}, tok[96];
+    char result[LUNA_CLASS_CAP] = {0}, tok[96];
     const char* p = e->class_name;
     while ((p = class_next_token(p, tok, sizeof(tok))) != NULL) {
         if (strcmp(tok, cls) != 0) {
@@ -5416,10 +6051,14 @@ static int element_overflow_visible(int idx) {
         LunaElement* par = &elements[p];
         if (overflow_clips(par->overflow_x) || overflow_clips(par->overflow_y)) {
             /* overflow clips at the padding box (inside the border) */
-            float cx = par->x + chain_tx + par->border_width;
-            float cy = par->y + chain_ty + par->border_width;
-            float cw = par->w - par->border_width * 2.0f;
-            float ch = par->h - par->border_width * 2.0f;
+            /* Root body overflow belongs to the viewport, just as in rc_build.
+             * An absolutely positioned document may leave the body with zero
+             * flow height while its controls are still painted and clickable. */
+            int viewport_body = par->parent_idx == -1 && !strcmp(par->type, "body");
+            float cx = viewport_body ? 0.0f : par->x + chain_tx + par->border_width;
+            float cy = viewport_body ? 0.0f : par->y + chain_ty + par->border_width;
+            float cw = viewport_body ? window_width : par->w - par->border_width * 2.0f;
+            float ch = viewport_body ? window_height : par->h - par->border_width * 2.0f;
             if (cw <= 0.0f || ch <= 0.0f) return 0;
             int clip_x = overflow_clips(par->overflow_x);
             int clip_y = overflow_clips(par->overflow_y);
@@ -5436,7 +6075,7 @@ static int element_overflow_visible(int idx) {
 
 static int is_paint_visible(int idx) {
     while (idx != -1) {
-        if (elements[idx].display_none || elements[idx].visibility_hidden) return 0;
+        if (elements[idx].display_none || elements[idx].visibility_hidden || elements[idx].dom_detached) return 0;
         idx = elements[idx].parent_idx;
     }
     return 1;
@@ -5499,8 +6138,44 @@ void parse_selector(const char* sel_in, StyleRule* rule) {
 }
 
 /* 1-based position of e among its non-internal siblings (same parent). */
+/* 1-based position among, and number of, the non-internal siblings.  One pass
+ * over the document fills the table for every element; it is reused until the
+ * tree changes, so restyling N elements costs O(N), not O(N^2). */
+static int* g_sib_pos;
+static int* g_sib_cnt;
+static int g_sib_cap, g_sib_n = -1;
+static unsigned g_sib_ver;
+
 static void element_sibling_info(const LunaElement* e, int* out_pos, int* out_count) {
     int self = (int)(e - elements);
+    if (g_sib_n != elem_count || g_sib_ver != g_dom_struct_ver) {
+        if (elem_count + 1 > g_sib_cap) {
+            int cap = (elem_count + 1) * 2;
+            int* a = (int*)realloc(g_sib_pos, sizeof(int) * (size_t)cap);
+            if (a) g_sib_pos = a;
+            int* b = (int*)realloc(g_sib_cnt, sizeof(int) * (size_t)cap);
+            if (b) g_sib_cnt = b;
+            if (!a || !b) { g_sib_n = -1; goto slow; }
+            g_sib_cap = cap;
+        }
+        /* g_sib_cnt[i] counts the children of element i (the last slot: roots). */
+        memset(g_sib_cnt, 0, sizeof(int) * (size_t)(elem_count + 1));
+        for (int i = 0; i < elem_count; i++) {
+            int p = elements[i].parent_idx;
+            if (p < 0 || p >= elem_count) p = elem_count;
+            g_sib_pos[i] = elements[i].luna_internal ? 0 : ++g_sib_cnt[p];
+        }
+        g_sib_n = elem_count;
+        g_sib_ver = g_dom_struct_ver;
+    }
+    if (self >= 0 && self < elem_count) {
+        int p = e->parent_idx;
+        if (p < 0 || p >= elem_count) p = elem_count;
+        *out_pos = g_sib_pos[self];
+        *out_count = g_sib_cnt[p];
+        return;
+    }
+slow:;
     int parent = e->parent_idx;
     int pos = 0, count = 0;
     for (int i = 0; i < elem_count; i++) {
@@ -5511,6 +6186,43 @@ static void element_sibling_info(const LunaElement* e, int* out_pos, int* out_co
     *out_pos = pos;
     *out_count = count;
 }
+
+/* First-child / next-sibling lists, rebuilt when the tree changes: container
+ * layout walks a node's children instead of scanning the whole document.
+ * Children keep document (ascending index) order. */
+static int* g_kid_first;
+static int* g_kid_next;
+static int g_kid_cap, g_kid_n = -1;
+static unsigned g_kid_ver;
+
+static void luna_kids_sync(void) {
+    if (g_kid_n == elem_count && g_kid_ver == g_dom_struct_ver) return;
+    if (elem_count + 1 > g_kid_cap) {
+        int cap = (elem_count + 1) * 2;
+        int* a = (int*)realloc(g_kid_first, sizeof(int) * (size_t)cap);
+        if (a) g_kid_first = a;
+        int* b = (int*)realloc(g_kid_next, sizeof(int) * (size_t)cap);
+        if (b) g_kid_next = b;
+        if (!a || !b) abort();
+        g_kid_cap = cap;
+    }
+    for (int i = 0; i < elem_count; i++) g_kid_first[i] = -1;
+    for (int i = elem_count - 1; i >= 0; i--) {
+        int p = elements[i].parent_idx;
+        g_kid_next[i] = -1;
+        if (p < 0 || p >= elem_count) continue;
+        g_kid_next[i] = g_kid_first[p];
+        g_kid_first[p] = i;
+    }
+    g_kid_n = elem_count;
+    g_kid_ver = g_dom_struct_ver;
+}
+
+static int luna_first_kid(int idx) {
+    luna_kids_sync();
+    return idx >= 0 && idx < elem_count ? g_kid_first[idx] : -1;
+}
+#define LUNA_FOR_KIDS(c, parent) for (int c = luna_first_kid(parent); c != -1; c = g_kid_next[c])
 
 /* Nearest preceding non-internal sibling of idx, or -1. */
 static int element_prev_sibling(int idx) {
@@ -5531,10 +6243,136 @@ static int is_document_root(const LunaElement* e) {
 
 static int html_compound(const SimpleSelector* s) {
     return strcmp(s->sel_type, "html") == 0 && !s->sel_id[0] && !s->sel_class_count &&
-           !s->is_first_child && !s->is_last_child && !s->has_nth && !s->has_not &&
-           !s->is_hover && !s->is_active && !s->is_focus && !s->is_focus_visible &&
-           !s->is_focus_within && !s->unsupported_pseudo;
+           !s->is_first_child && !s->is_last_child && !s->has_nth && !s->not_count &&
+           !s->nthx_count && !s->pflags && !s->has_count && !s->is_hover && !s->is_active && !s->is_focus && !s->is_focus_visible &&
+           !s->is_focus_within && !s->unsupported_pseudo && !s->attr_count;
 }
+
+/* [a~=w]: w is one of the whitespace-separated words of v. */
+static int attr_has_word(const char* v, const char* w, size_t wl) {
+    if (!wl) return 0;
+    for (const char* p = v; (p = strstr(p, w)) != NULL; p++)
+        if ((p == v || isspace((unsigned char)p[-1])) && (!p[wl] || isspace((unsigned char)p[wl]))) return 1;
+    return 0;
+}
+
+/* [name], [name=v] ... against an element's source attributes. */
+static int attr_selector_matches(const LunaElement* e, const char* name, char op, const char* want) {
+    char v[256];
+    int got = html_attr_get(e->dom_attrs, name, v, sizeof v);
+    if (got < 0) return 0;
+    if (!op) return 1;
+    size_t wl = strlen(want), vl = strlen(v);
+    switch (op) {
+    case '=': return strcmp(v, want) == 0;
+    case '^': return wl && strncmp(v, want, wl) == 0;
+    case '$': return wl && vl >= wl && strcmp(v + vl - wl, want) == 0;
+    case '*': return wl && strstr(v, want) != NULL;
+    case '|': return strncmp(v, want, wl) == 0 && (!v[wl] || v[wl] == '-');
+    default:  return attr_has_word(v, want, wl);
+    }
+}
+
+/* Position of e among its siblings: counted from the start and from the end,
+ * over all siblings or only those of its type. */
+static void element_type_pos(const LunaElement* e, int of_type, int* from_start, int* from_end) {
+    int self = (int)(e - elements), pos = 0, total = 0;
+    int parent = e->parent_idx;
+    if (parent >= 0 && parent < elem_count) {
+        LUNA_FOR_KIDS(c, parent) {
+            if (elements[c].luna_internal || (of_type && strcmp(elements[c].type, e->type))) continue;
+            total++;
+            if (c == self) pos = total;
+        }
+    } else {
+        for (int c = 0; c < elem_count; c++) {
+            if (elements[c].parent_idx >= 0 || elements[c].luna_internal || (of_type && strcmp(elements[c].type, e->type))) continue;
+            total++;
+            if (c == self) pos = total;
+        }
+    }
+    *from_start = pos;
+    *from_end = pos ? total - pos + 1 : 0;
+}
+
+static int nth_match_pos(int pos, int a, int b) {
+    if (pos <= 0) return 0;
+    if (a == 0) return pos == b;
+    int d = pos - b;
+    return d % a == 0 && d / a >= 0;
+}
+
+static int nthx_match(const SimpleSelector* s, const LunaElement* e) {
+    for (int i = 0; i < s->nthx_count; i++) {
+        int kind = s->nthx[i].kind, fs, fe;
+        element_type_pos(e, kind == 1 || kind == 3, &fs, &fe);
+        if (!nth_match_pos(kind <= 1 ? fs : fe, s->nthx[i].a, s->nthx[i].b)) return 0;
+    }
+    return 1;
+}
+
+static int pseudo_flags_match(unsigned f, const LunaElement* e) {
+    const char* t = e->type;
+    if (f & LUNA_PS_LINK)
+        if ((strcmp(t, "a") && strcmp(t, "area")) || html_attr_get(e->dom_attrs, "href", (char[2]){0}, 2) < 0) return 0;
+    if (f & LUNA_PS_CHECKED) {
+        int on = e->checked_state ? e->checked_state == 1
+                 : html_attr_get(e->dom_attrs, "checked", (char[2]){0}, 2) >= 0 ||
+                   html_attr_get(e->dom_attrs, "selected", (char[2]){0}, 2) >= 0;
+        if (!on) return 0;
+    }
+    int control = !strcmp(t, "input") || !strcmp(t, "button") || !strcmp(t, "select") || !strcmp(t, "textarea") ||
+                  !strcmp(t, "fieldset") || !strcmp(t, "option");
+    int disabled = html_attr_get(e->dom_attrs, "disabled", (char[2]){0}, 2) >= 0;
+    if ((f & LUNA_PS_DISABLED) && !(control && disabled)) return 0;
+    if ((f & LUNA_PS_ENABLED) && !(control && !disabled)) return 0;
+    if (f & LUNA_PS_EMPTY) {
+        if (e->text[0] || luna_first_kid((int)(e - elements)) != -1) return 0;
+    }
+    return 1;
+}
+
+static int has_compound_matches(const LunaElement* c, const HasSelT* h);
+
+/* :has(): does some element in the relation to idx match the simple selector? */
+static int has_compound_matches(const LunaElement* c, const HasSelT* h) {
+    if (c->luna_internal || c->generated_pseudo) return 0;
+    if (h->type[0] && strcmp(h->type, "*") && strcasecmp(h->type, c->type)) return 0;
+    if (h->id[0] && strcmp(h->id, c->id)) return 0;
+    for (int i = 0; i < h->ncls; i++) if (!element_has_class(c, h->cls[i])) return 0;
+    if (h->has_attr && !attr_selector_matches(c, h->aname, h->aop, h->aval)) return 0;
+    return 1;
+}
+
+static int has_descendant(int idx, const HasSelT* h, int depth) {
+    if (depth > 64) return 0;
+    LUNA_FOR_KIDS(c, idx) {
+        if (has_compound_matches(&elements[c], h)) return 1;
+        if (has_descendant(c, h, depth + 1)) return 1;
+    }
+    return 0;
+}
+
+static int has_selector_matches(int idx, const HasSelT* h) {
+    luna_kids_sync();
+    switch (h->rel) {
+    case LUNA_REL_CHILD:
+        LUNA_FOR_KIDS(c, idx) if (has_compound_matches(&elements[c], h)) return 1;
+        return 0;
+    case LUNA_REL_ADJ: {
+        for (int n = idx >= 0 && idx < elem_count ? g_kid_next[idx] : -1; n != -1; n = g_kid_next[n])
+            if (!elements[n].luna_internal) return has_compound_matches(&elements[n], h);
+        return 0;
+    }
+    case LUNA_REL_SIB:
+        for (int n = idx >= 0 && idx < elem_count ? g_kid_next[idx] : -1; n != -1; n = g_kid_next[n])
+            if (has_compound_matches(&elements[n], h)) return 1;
+        return 0;
+    default:
+        return has_descendant(idx, h, 0);
+    }
+}
+
 
 int simple_selector_matches(SimpleSelector* s, LunaElement* e) {
     if (s->sel_type[0] && strcmp(s->sel_type, e->type) != 0 &&
@@ -5559,11 +6397,20 @@ int simple_selector_matches(SimpleSelector* s, LunaElement* e) {
             }
         }
     }
-    if (s->has_not) {
-        if (s->not_type[0] && strcmp(s->not_type, e->type) == 0) return 0;
-        if (s->not_id[0] && strcmp(s->not_id, e->id) == 0) return 0;
-        if (s->not_class[0] && element_has_class(e, s->not_class)) return 0;
+    for (int i = 0; i < s->not_count; i++) {
+        const char* nm = s->nots[i].name;
+        switch (s->nots[i].kind) {
+        case 0: if (strcmp(nm, "*") == 0 || strcasecmp(nm, e->type) == 0) return 0; break;
+        case 1: if (strcmp(nm, e->id) == 0) return 0; break;
+        case 2: if (element_has_class(e, nm)) return 0; break;
+        default:
+            if (attr_selector_matches(e, nm, s->nots[i].op, s->nots[i].val)) return 0;
+        }
     }
+    if (s->nthx_count && !nthx_match(s, e)) return 0;
+    if (s->pflags && !pseudo_flags_match(s->pflags, e)) return 0;
+    for (int i = 0; i < s->has_count; i++)
+        if (!has_selector_matches((int)(e - elements), &s->has[i])) return 0;
     if (s->is_hover && !e->is_hovered) return 0;
     if (s->is_active && !e->is_active) return 0;
     if (s->is_focus && e->id_idx != g_focused_element_idx) return 0;
@@ -5572,9 +6419,11 @@ int simple_selector_matches(SimpleSelector* s, LunaElement* e) {
     if (s->is_focus_within && !element_contains_focus(e->id_idx)) return 0;
     if (s->is_root && e->parent_idx != -1) return 0;
     if (s->unsupported_pseudo) return 0;
-    if (!s->sel_type[0] && !s->sel_id[0] && s->sel_class_count == 0 &&
-        !s->is_first_child && !s->is_last_child && !s->has_nth && !s->has_not &&
-        !s->is_root)
+    for (int i = 0; i < s->attr_count; i++)
+        if (!attr_selector_matches(e, s->attrs[i].name, s->attrs[i].op, s->attrs[i].val)) return 0;
+    if (!s->sel_type[0] && !s->sel_id[0] && s->sel_class_count == 0 && !s->attr_count &&
+        !s->is_first_child && !s->is_last_child && !s->has_nth && !s->not_count &&
+        !s->nthx_count && !s->pflags && !s->has_count && !s->is_root)
         return s->is_universal ? 1 : 0;
     return 1;
 }
@@ -5670,9 +6519,66 @@ void parse_declarations(char* declarations, StyleRule* rule);
 
 /* Apply one pre-tokenised CSS key/value to a StyleRule.
    Wraps parse_declarations so all property logic stays in one place. */
+static void apply_one_declaration(const char* key, const char* val, StyleRule* rule);
+
+/* Logical properties, for horizontal-tb / ltr text: inline is x, block is y. */
+static int apply_logical_property(const char* key, const char* val, StyleRule* rule) {
+    static const struct { const char* logical; const char* physical; } one[] = {
+        { "inline-size", "width" }, { "block-size", "height" },
+        { "min-inline-size", "min-width" }, { "min-block-size", "min-height" },
+        { "max-inline-size", "max-width" }, { "max-block-size", "max-height" },
+        { "margin-inline-start", "margin-left" }, { "margin-inline-end", "margin-right" },
+        { "margin-block-start", "margin-top" }, { "margin-block-end", "margin-bottom" },
+        { "padding-inline-start", "padding-left" }, { "padding-inline-end", "padding-right" },
+        { "padding-block-start", "padding-top" }, { "padding-block-end", "padding-bottom" },
+        { "inset-inline-start", "left" }, { "inset-inline-end", "right" },
+        { "inset-block-start", "top" }, { "inset-block-end", "bottom" },
+        { "border-inline-start-width", "border-left-width" }, { "border-inline-end-width", "border-right-width" },
+        { "border-block-start-width", "border-top-width" }, { "border-block-end-width", "border-bottom-width" },
+        { "border-inline-start-color", "border-left-color" }, { "border-inline-end-color", "border-right-color" },
+        { "border-block-start-color", "border-top-color" }, { "border-block-end-color", "border-bottom-color" },
+        { "border-start-start-radius", "border-top-left-radius" }, { "border-start-end-radius", "border-top-right-radius" },
+        { "border-end-start-radius", "border-bottom-left-radius" }, { "border-end-end-radius", "border-bottom-right-radius" },
+        { NULL, NULL } };
+    static const struct { const char* logical; const char* a; const char* b; } pair[] = {
+        { "margin-inline", "margin-left", "margin-right" }, { "margin-block", "margin-top", "margin-bottom" },
+        { "padding-inline", "padding-left", "padding-right" }, { "padding-block", "padding-top", "padding-bottom" },
+        { "inset-inline", "left", "right" }, { "inset-block", "top", "bottom" },
+        { NULL, NULL, NULL } };
+    for (int i = 0; one[i].logical; i++)
+        if (!strcmp(key, one[i].logical)) { apply_one_declaration(one[i].physical, val, rule); return 1; }
+    for (int i = 0; pair[i].logical; i++) {
+        if (strcmp(key, pair[i].logical)) continue;
+        /* one or two values (start end), functions kept whole */
+        char v1[CSS_MAX_VALUE], v2[CSS_MAX_VALUE];
+        const char* p = val;
+        int depth = 0;
+        size_t n1 = 0;
+        while (isspace((unsigned char)*p)) p++;
+        const char* st = p;
+        for (; *p && (depth || !isspace((unsigned char)*p)); p++) { if (*p == '(') depth++; else if (*p == ')') depth--; }
+        n1 = (size_t)(p - st);
+        if (n1 >= sizeof v1) n1 = sizeof v1 - 1;
+        memcpy(v1, st, n1); v1[n1] = '\0';
+        while (isspace((unsigned char)*p)) p++;
+        snprintf(v2, sizeof v2, "%s", *p ? p : v1);
+        apply_one_declaration(pair[i].a, v1, rule);
+        apply_one_declaration(pair[i].b, v2, rule);
+        return 1;
+    }
+    return 0;
+}
+
 static void apply_one_declaration(const char* key, const char* val, StyleRule* rule) {
     /* Skip CSS custom properties (--name: value) — resolved by cssparser.h */
     if (!key || !val || strncmp(key, "--", 2) == 0) return;
+    if (apply_logical_property(key, val, rule)) return;
+    /* CSS-wide keywords: inherited properties already inherit; `inherit` and
+     * `currentcolor` on the rest cannot be resolved here, so they leave the value alone. */
+    if ((!strcmp(key, "background-color") || !strcmp(key, "color") || !strcmp(key, "border-color") ||
+         !strcmp(key, "outline-color") || !strcmp(key, "caret-color")) &&
+        strcmp(val, "inherit") && !css_color_valid(val)) return;
+    if (!strcmp(val, "inherit") || !strcmp(val, "currentcolor") || !strcmp(val, "currentColor")) return;
 
     size_t key_len = strlen(key);
     size_t val_len = strlen(val);
@@ -5837,7 +6743,7 @@ static void parse_font_shorthand(const char* val, StyleRule* rule) {
             rule->has_font_italic = 1; rule->font_italic = 0;
             rule->has_font_weight = 1; rule->font_bold = 0;
             rule->has_line_height = 1; rule->line_height = 0.0f;
-            rule->has_font_size = 1;
+            rule->has_font_size = 1; rule->font_size_rel = 0;
             rule->font_size = (luna_strcasecmp(buf, "small-caption") == 0 ||
                                luna_strcasecmp(buf, "status-bar") == 0) ? 12.0f : 13.0f;
             apply_font_family_value(rule, "sans-serif");
@@ -6007,7 +6913,7 @@ static void parse_font_shorthand(const char* val, StyleRule* rule) {
     /* Commit: CSS requires resetting omitted longhands to initial values. */
     rule->has_font_italic = 1; rule->font_italic = italic;
     rule->has_font_weight = 1; rule->font_bold = bold;
-    rule->has_font_size = 1;   rule->font_size = size_px;
+    rule->has_font_size = 1;   rule->font_size = size_px; rule->font_size_rel = 0;
     rule->has_line_height = 1; rule->line_height = have_lh ? line_h : 0.0f;
     apply_font_family_value(rule, family);
 }
@@ -6123,6 +7029,26 @@ static char* css_decl_end(char* p) {
     return NULL;
 }
 
+/* font-size: a keyword, a length, or an em / % of the parent's size. */
+static void parse_font_size_decl(const char* val, StyleRule* rule) {
+    while (isspace((unsigned char)*val)) val++;
+    float px;
+    rule->has_font_size = 1;
+    rule->font_size_rel = 0;
+    if (!val[0] || luna_strcasecmp(val, "inherit") == 0) { rule->has_font_size = 0; return; }
+    if (luna_strcasecmp(val, "smaller") == 0) { rule->font_size = 0.8333f; rule->font_size_rel = 1; return; }
+    if (luna_strcasecmp(val, "larger") == 0)  { rule->font_size = 1.2f;    rule->font_size_rel = 1; return; }
+    if (font_size_keyword_px(val, &px)) { rule->font_size = px; return; }
+    char* endp = NULL;
+    float f = strtof(val, &endp);
+    if (endp && endp != val) {
+        while (isspace((unsigned char)*endp)) endp++;
+        if (*endp == '%')                      { rule->font_size = f / 100.0f; rule->font_size_rel = 1; return; }
+        if (strncmp(endp, "em", 2) == 0)       { rule->font_size = f;          rule->font_size_rel = 1; return; }
+    }
+    rule->font_size = parse_float_val(val);
+}
+
 void parse_declarations(char* declarations, StyleRule* rule) {
     char* prop = declarations;
     while (prop && *prop) {
@@ -6134,8 +7060,25 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             char* key = prop; char* val = colon + 1;
             trim_whitespace(key); trim_whitespace(val);
 
-            if      (strcmp(key, "background-color") == 0) { rule->has_bg = 1; parse_color(val, &rule->bg_r, &rule->bg_g, &rule->bg_b, &rule->bg_a); }
+            if      (strcmp(key, "background-color") == 0) {
+                float cr = rule->bg_r, cg = rule->bg_g, cb = rule->bg_b, ca = rule->bg_a;
+                parse_color(val, &cr, &cg, &cb, &ca);
+                if (!g_color_invalid) { rule->has_bg = 1; rule->bg_r = cr; rule->bg_g = cg; rule->bg_b = cb; rule->bg_a = ca; }
+            }
             else if (strcmp(key, "background") == 0)       { parse_background_shorthand(val, rule); }
+            else if (strcmp(key, "mask-image") == 0 || strcmp(key, "-webkit-mask-image") == 0 ||
+                     strcmp(key, "mask") == 0 || strcmp(key, "-webkit-mask") == 0) {
+                char path[256];
+                if (luna_strcasecmp(val, "none") == 0) {
+                    if (rule->has_mask_image) { rule->has_mask_image = 0; rule->has_bg_image = 0; rule->bg_image_path[0] = '\0'; }
+                } else if (parse_url(val, path, sizeof(path))) {
+                    /* Drawn as the picture's shape in the background colour. */
+                    rule->has_bg_image = 1;
+                    rule->has_mask_image = 1;
+                    rule->has_bg_image_reset = 0;
+                    snprintf(rule->bg_image_path, sizeof(rule->bg_image_path), "%s", path);
+                }
+            }
             else if (strcmp(key, "background-image") == 0) {
                 char path[256];
                 char layer_probe[1024];
@@ -6277,6 +7220,8 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             else if (strcmp(key, "margin-right") == 0)     { rule->has_margin = 1; rule->has_margin_right = 1; if (strcmp(val,"auto")==0) rule->margin_right_auto=1; else rule->margin_right = parse_float_val(val); }
             else if (strcmp(key, "margin-bottom") == 0)    { rule->has_margin = 1; rule->has_margin_bottom = 1; if (strcmp(val,"auto")==0) rule->margin_bottom_auto=1; else rule->margin_bottom = parse_float_val(val); }
             else if (strcmp(key, "margin-left") == 0)      { rule->has_margin = 1; rule->has_margin_left = 1; if (strcmp(val,"auto")==0) rule->margin_left_auto=1; else rule->margin_left = parse_float_val(val); }
+            else if (strcmp(key, "float") == 0) { rule->has_float = 1; rule->css_float = !strcmp(val,"left") ? 1 : !strcmp(val,"right") ? 2 : 0; }
+            else if (strcmp(key, "clear") == 0) { rule->has_clear = 1; rule->css_clear = !strcmp(val,"left") ? 1 : !strcmp(val,"right") ? 2 : !strcmp(val,"both") ? 3 : 0; }
             else if (strcmp(key, "inset") == 0)            { parse_inset_shorthand(val, rule); }
             else if (strcmp(key, "left") == 0) {
                 if (strcmp(val, "auto") == 0) { rule->clear_left = 1; rule->has_left = 0; }
@@ -6336,6 +7281,19 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 } else if (strcmp(val, "grid") == 0 || strcmp(val, "inline-grid") == 0) {
                     rule->display_none = 0;
                     rule->display_mode = DISPLAY_GRID;
+                } else if (strncmp(val, "table", 5) == 0 || strcmp(val, "inline-table") == 0) {
+                    /* The inner display type is what the table layout needs; col and
+                     * colgroup have no boxes of their own here. */
+                    rule->display_none = 0;
+                    if (strcmp(val, "table") == 0 || strcmp(val, "inline-table") == 0) rule->display_mode = DISPLAY_TABLE;
+                    else if (strcmp(val, "table-row") == 0) rule->display_mode = DISPLAY_TABLE_ROW;
+                    else if (strcmp(val, "table-cell") == 0) rule->display_mode = DISPLAY_TABLE_CELL;
+                    else if (strcmp(val, "table-caption") == 0) rule->display_mode = DISPLAY_TABLE_CAPTION;
+                    else if (strstr(val, "group")) {
+                        if (strstr(val, "column")) { rule->display_none = 1; rule->display_mode = DISPLAY_NONE; }
+                        else rule->display_mode = DISPLAY_TABLE_GROUP;
+                    } else if (strstr(val, "column")) { rule->display_none = 1; rule->display_mode = DISPLAY_NONE; }
+                    else rule->display_mode = DISPLAY_BLOCK;
                 } else if (strcmp(val, "-webkit-box") == 0) {
                     /* Legacy WebKit box is used by the line-clamp idiom.
                        Luna lays it out as a block and applies the clamp in the
@@ -6350,11 +7308,13 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             else if (strcmp(key, "flex-direction") == 0) {
                 rule->has_flex_direction = 1;
                 rule->flex_direction = parse_flex_direction(val);
+                rule->flex_reverse = strstr(val, "reverse") != NULL;
             }
             else if (strcmp(key, "flex-flow") == 0) {   /* <direction> || <wrap> */
                 if (strstr(val, "row") || strstr(val, "column")) {
                     rule->has_flex_direction = 1;
                     rule->flex_direction = parse_flex_direction(val);
+                    rule->flex_reverse = strstr(val, "reverse") != NULL;
                 }
                 if (strstr(val, "wrap")) {
                     rule->has_flex_wrap = 1;
@@ -6440,8 +7400,10 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             }
             else if (strcmp(key, "grid-template-columns") == 0) {
                 rule->has_grid_template_columns = 1;
+                g_grid_tracks_are_columns = 1;
                 parse_grid_tracks(val, rule->grid_col_track, rule->grid_col_type,
                                   rule->grid_col_min, &rule->grid_col_count);
+                g_grid_tracks_are_columns = 0;
             }
             else if (strcmp(key, "grid-template-rows") == 0) {
                 rule->has_grid_template_rows = 1;
@@ -6575,7 +7537,9 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             }
             else if (strcmp(key, "min-width") == 0) {
                 rule->has_min_width = 1;
-                rule->min_width = parse_float_val(val);
+                const char* pc = strchr(val, '%');
+                rule->min_width_pct = pc != NULL;
+                rule->min_width = pc ? strtof(val, NULL) / 100.0f : parse_float_val(val);
             }
             else if (strcmp(key, "min-height") == 0) {
                 rule->has_min_height = 1;
@@ -6721,12 +7685,24 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                     char abuf[128];
                     strncpy(abuf, val, sizeof(abuf) - 1);
                     abuf[sizeof(abuf) - 1] = '\0';
+                    /* The shorthand's parts come in any order: `55s flakes linear
+                     * infinite` and `flakes 55s linear infinite` are the same
+                     * animation.  A part is a time (digits and a unit), a
+                     * keyword, or -- anything else, once -- the name. */
                     char* tok = strtok(abuf, " \t,");
-                    int part = 0;
+                    int times = 0;
                     while (tok) {
                         trim_whitespace(tok);
-                        if (part == 0 && strcmp(tok, "none") != 0)
-                            strncpy(rule->anim_name, tok, sizeof(rule->anim_name) - 1);
+                        const size_t tl = strlen(tok);
+                        const int is_time = tl > 1 && (isdigit((unsigned char)tok[0]) || tok[0] == '.' ||
+                                                      tok[0] == '+' || tok[0] == '-') &&
+                                            tok[tl - 1] == 's';
+                        if (is_time) {
+                            const float sec = tl > 2 && tok[tl - 2] == 'm' ? (float)atof(tok) / 1000.0f
+                                                                           : (float)atof(tok);
+                            if (!times++) rule->anim_duration = sec;   /* first time: duration */
+                            else rule->anim_delay = sec;               /* second: delay */
+                        }
                         else if (strcmp(tok, "ease-in-out") == 0 || strcmp(tok, "ease") == 0)
                             rule->anim_easing = 1;
                         else if (strcmp(tok, "ease-in") == 0) rule->anim_easing = 2;
@@ -6734,16 +7710,13 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                         else if (strcmp(tok, "linear") == 0) rule->anim_easing = 0;
                         else if (strcmp(tok, "infinite") == 0) rule->anim_infinite = 1;
                         else if (strcmp(tok, "alternate") == 0) rule->anim_alternate = 1;
-                        else if (isdigit((unsigned char)tok[0]) || tok[0] == '.' ||
-                                 tok[0] == '+' || tok[0] == '-') {
-                            float sec = 0.0f;
-                            if (strstr(tok, "ms")) sec = (float)atof(tok) / 1000.0f;
-                            else sec = (float)atof(tok);
-                            if (part == 0 && rule->anim_duration <= 0.0f) rule->anim_duration = sec;
-                            else if (rule->anim_duration <= 0.0f) rule->anim_duration = sec;
-                            else rule->anim_delay = sec;
-                        }
-                        part++;
+                        else if (isdigit((unsigned char)tok[0]) || tok[0] == '.') { /* iteration count */ }
+                        else if (!strcmp(tok, "forwards") || !strcmp(tok, "backwards") ||
+                                 !strcmp(tok, "both") || !strcmp(tok, "normal") ||
+                                 !strcmp(tok, "reverse") || !strcmp(tok, "running") ||
+                                 !strcmp(tok, "paused")) { }
+                        else if (strcmp(tok, "none") != 0 && !rule->anim_name[0])
+                            strncpy(rule->anim_name, tok, sizeof(rule->anim_name) - 1);
                         tok = strtok(NULL, " \t,");
                     }
                 }
@@ -6770,6 +7743,19 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 rule->has_animation = 1;
                 rule->anim_easing = (strstr(val, "ease-in-out") != NULL) ? 1 : 0;
             }
+            else if (strcmp(key, "vertical-align") == 0) {
+                rule->has_valign = 1;
+                rule->valign = strcmp(val, "top") == 0 || strcmp(val, "text-top") == 0 || strcmp(val, "baseline") == 0 ? TBL_VALIGN_TOP :
+                               strcmp(val, "middle") == 0 ? TBL_VALIGN_MIDDLE :
+                               strcmp(val, "bottom") == 0 || strcmp(val, "text-bottom") == 0 ? TBL_VALIGN_BOTTOM : 0;
+            }
+            else if (strcmp(key, "border-spacing") == 0) {
+                rule->has_tbl_spacing = 1;
+                rule->tbl_spacing = parse_float_val(val);
+            }
+            else if (strcmp(key, "border-collapse") == 0) {
+                if (strcmp(val, "collapse") == 0) { rule->has_tbl_spacing = 1; rule->tbl_spacing = 0.0f; }
+            }
             else if (strcmp(key, "text-align") == 0) {
                 rule->has_text_align = 1;
                 if      (strcmp(val, "center") == 0) rule->text_align = 1;
@@ -6777,7 +7763,7 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 else                                 rule->text_align = 0;
             }
             else if (strcmp(key, "font") == 0)            { parse_font_shorthand(val, rule); }
-            else if (strcmp(key, "font-size") == 0)   { rule->has_font_size = 1; rule->font_size = parse_float_val(val); }
+            else if (strcmp(key, "font-size") == 0)   { parse_font_size_decl(val, rule); }
             else if (strcmp(key, "font-weight") == 0) { rule->has_font_weight = 1; rule->font_bold = (strstr(val, "bold") != NULL || atoi(val) >= 600); }
             else if (strcmp(key, "line-height") == 0) {
                 rule->has_line_height = 1;
@@ -6942,7 +7928,10 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                         }
                         rule->content[wi] = '\0';
                     }
-                } else if (strcmp(val, "none") != 0 && strcmp(val, "normal") != 0) {
+                } else if (strcmp(val, "none") != 0 && strcmp(val, "normal") != 0 &&
+                           strncmp(val, "url(", 4) != 0 && strncmp(val, "image-set(", 10) != 0 &&
+                           strstr(val, "gradient(") == NULL) {
+                    /* a picture as generated content is not text: it must not print as "url(...)" */
                     strncpy(rule->content, val, sizeof(rule->content) - 1);
                 }
             }
@@ -7006,7 +7995,32 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 float h = sl ? strtof(sl + 1, NULL) : 1.0f;
                 rule->aspect_ratio = (h > 0.0f) ? w / h : w;
             }
-            else if (strcmp(key, "background-size") == 0) {
+            else if (strcmp(key, "transform-origin") == 0) {
+                /* <x> [<y>]: keywords, percentages or lengths (px) */
+                char ob[96];
+                snprintf(ob, sizeof ob, "%s", val);
+                char* t1 = strtok(ob, " \t");
+                char* t2 = t1 ? strtok(NULL, " \t") : NULL;
+                float fx = 0.5f, fy = 0.5f, px = 0.0f, py = 0.0f;
+                int vert_first = 0;
+                if (t1 && (!strcmp(t1, "top") || !strcmp(t1, "bottom"))) vert_first = 1;
+                if (vert_first && t2) { char* t = t1; t1 = t2; t2 = t; }
+                for (int k = 0; k < 2; k++) {
+                    const char* t = k == 0 ? t1 : t2;
+                    if (!t) continue;
+                    float* f = k == 0 ? &fx : &fy;
+                    float* pp = k == 0 ? &px : &py;
+                    if (!strcmp(t, "left") || !strcmp(t, "top")) *f = 0.0f;
+                    else if (!strcmp(t, "right") || !strcmp(t, "bottom")) *f = 1.0f;
+                    else if (!strcmp(t, "center")) *f = 0.5f;
+                    else if (strchr(t, '%')) *f = strtof(t, NULL) / 100.0f;
+                    else { *f = 0.0f; *pp = parse_float_val(t); }
+                }
+                rule->has_tf_origin = 1;
+                rule->tf_ox = fx; rule->tf_oy = fy; rule->tf_oxpx = px; rule->tf_oypx = py;
+            }
+            else if (strcmp(key, "background-size") == 0 || strcmp(key, "mask-size") == 0 ||
+                     strcmp(key, "-webkit-mask-size") == 0) {
                 rule->has_bg_size = 1;
                 if (strcmp(val, "cover") == 0)   { rule->bg_size_mode = 1; }
                 else if (strcmp(val, "contain") == 0) { rule->bg_size_mode = 2; }
@@ -7022,7 +8036,8 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                                                    : LUNA_BG_SIZE_AUTO;
                 }
             }
-            else if (strcmp(key, "background-position") == 0) {
+            else if (strcmp(key, "background-position") == 0 || strcmp(key, "mask-position") == 0 ||
+                     strcmp(key, "-webkit-mask-position") == 0) {
                 rule->has_bg_pos = 1;
                 char posbuf[128];
                 snprintf(posbuf, sizeof(posbuf), "%s", val);
@@ -7102,8 +8117,11 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                    select their matching dynamic atlas face, as browsers do. */
                 apply_font_family_value(rule, val);
             }
-            else if (strcmp(key, "user-select") == 0 ||
-                     strcmp(key, "-webkit-font-smoothing") == 0) {
+            else if (strcmp(key, "user-select") == 0 || strcmp(key, "-webkit-user-select") == 0) {
+                rule->has_user_select = 1;
+                rule->user_select_none = strcmp(val, "none") == 0;
+            }
+            else if (strcmp(key, "-webkit-font-smoothing") == 0) {
                 /* Accepted for CSS parity; drawing stays CSS-box based. */
             }
             else if (strcmp(key, "inset") == 0) { parse_inset_shorthand(val, rule); }
@@ -7164,19 +8182,124 @@ static int apply_structural_pseudo(SimpleSelector* ss, const CSSSelectorPart* p)
         parse_nth_arg(p->pseudo_arg, &ss->nth_a, &ss->nth_b);
     }
     else if (strcmp(p->name, "not") == 0) {
+        /* one simple selector: type, #id, .class or [attribute] */
+        if (ss->not_count >= 3) return 0;
+        Lexer lx;
+        CSSSelector sel;
+        lex_init(&lx, p->pseudo_arg, strlen(p->pseudo_arg));
+        lex_skip_ws(&lx);
+        if (!parse_one_selector(&lx, &sel) || sel.compound_count != 1 || sel.compounds[0].part_count != 1) return 0;
+        const CSSSelectorPart* np = &sel.compounds[0].parts[0];
+        int i = ss->not_count;
+        ss->nots[i].op = 0; ss->nots[i].val[0] = '\0';
+        snprintf(ss->nots[i].name, sizeof ss->nots[i].name, "%s", np->name);
+        switch (np->type) {
+        case CSS_SEL_TYPE: case CSS_SEL_UNIVERSAL: ss->nots[i].kind = 0; break;
+        case CSS_SEL_ID: ss->nots[i].kind = 1; break;
+        case CSS_SEL_CLASS: ss->nots[i].kind = 2; break;
+        case CSS_SEL_ATTR: ss->nots[i].kind = 3; break;
+        case CSS_SEL_ATTR_EQ: case CSS_SEL_ATTR_INCLUDES: case CSS_SEL_ATTR_DASH:
+        case CSS_SEL_ATTR_PREFIX: case CSS_SEL_ATTR_SUFFIX: case CSS_SEL_ATTR_SUBSTR:
+            ss->nots[i].kind = 3;
+            snprintf(ss->nots[i].val, sizeof ss->nots[i].val, "%s", np->attr_val);
+            ss->nots[i].op = np->type == CSS_SEL_ATTR_EQ ? '=' : np->type == CSS_SEL_ATTR_INCLUDES ? '~' :
+                             np->type == CSS_SEL_ATTR_DASH ? '|' : np->type == CSS_SEL_ATTR_PREFIX ? '^' :
+                             np->type == CSS_SEL_ATTR_SUFFIX ? '$' : '*';
+            break;
+        default: return 0;
+        }
+        ss->not_count++;
+    }
+    else if (strcmp(p->name, "link") == 0 || strcmp(p->name, "any-link") == 0) ss->pflags |= LUNA_PS_LINK;
+    else if (strcmp(p->name, "checked") == 0)  ss->pflags |= LUNA_PS_CHECKED;
+    else if (strcmp(p->name, "disabled") == 0) ss->pflags |= LUNA_PS_DISABLED;
+    else if (strcmp(p->name, "enabled") == 0)  ss->pflags |= LUNA_PS_ENABLED;
+    else if (strcmp(p->name, "empty") == 0)    ss->pflags |= LUNA_PS_EMPTY;
+    else if (strcmp(p->name, "only-child") == 0) { ss->is_first_child = 1; ss->is_last_child = 1; }
+    else if (!strcmp(p->name, "first-of-type") || !strcmp(p->name, "last-of-type") || !strcmp(p->name, "only-of-type") ||
+             !strcmp(p->name, "nth-of-type") || !strcmp(p->name, "nth-last-child") || !strcmp(p->name, "nth-last-of-type")) {
+        int want = !strcmp(p->name, "only-of-type") ? 2 : 1;
+        if (ss->nthx_count + want > 3) return 0;
+        int kind = 1, a = 0, b = 1;
+        if (!strcmp(p->name, "last-of-type")) kind = 3;
+        else if (!strcmp(p->name, "nth-of-type")) parse_nth_arg(p->pseudo_arg, &a, &b);
+        else if (!strcmp(p->name, "nth-last-child")) { kind = 2; parse_nth_arg(p->pseudo_arg, &a, &b); }
+        else if (!strcmp(p->name, "nth-last-of-type")) { kind = 3; parse_nth_arg(p->pseudo_arg, &a, &b); }
+        ss->nthx[ss->nthx_count].kind = kind; ss->nthx[ss->nthx_count].a = a; ss->nthx[ss->nthx_count].b = b; ss->nthx_count++;
+        if (want == 2) { ss->nthx[ss->nthx_count].kind = 3; ss->nthx[ss->nthx_count].a = 0; ss->nthx[ss->nthx_count].b = 1; ss->nthx_count++; }
+    }
+    else if (strcmp(p->name, "has") == 0) {
+        if (ss->has_count >= 2) return 0;
+        const char* a = p->pseudo_arg;
+        while (isspace((unsigned char)*a)) a++;
+        int rel = LUNA_REL_DESC;
+        if (*a == '>') { rel = LUNA_REL_CHILD; a++; }
+        else if (*a == '+') { rel = LUNA_REL_ADJ; a++; }
+        else if (*a == '~') { rel = LUNA_REL_SIB; a++; }
+        Lexer lx;
+        CSSSelector sel;
+        lex_init(&lx, a, strlen(a));
+        lex_skip_ws(&lx);
+        if (!parse_one_selector(&lx, &sel) || sel.compound_count != 1) return 0;
+        HasSelT* h = &ss->has[ss->has_count];
+        memset(h, 0, sizeof *h);
+        h->rel = rel;
+        const CSSCompound* cmp = &sel.compounds[0];
+        for (int k = 0; k < cmp->part_count; k++) {
+            const CSSSelectorPart* np = &cmp->parts[k];
+            switch (np->type) {
+            case CSS_SEL_TYPE: case CSS_SEL_UNIVERSAL: snprintf(h->type, sizeof h->type, "%s", np->name); break;
+            case CSS_SEL_ID: snprintf(h->id, sizeof h->id, "%s", np->name); break;
+            case CSS_SEL_CLASS:
+                if (h->ncls >= 2) return 0;
+                snprintf(h->cls[h->ncls++], sizeof h->cls[0], "%s", np->name); break;
+            case CSS_SEL_ATTR: case CSS_SEL_ATTR_EQ: case CSS_SEL_ATTR_INCLUDES: case CSS_SEL_ATTR_DASH:
+            case CSS_SEL_ATTR_PREFIX: case CSS_SEL_ATTR_SUFFIX: case CSS_SEL_ATTR_SUBSTR:
+                if (h->has_attr) return 0;
+                h->has_attr = 1;
+                snprintf(h->aname, sizeof h->aname, "%s", np->name);
+                snprintf(h->aval, sizeof h->aval, "%s", np->attr_val);
+                h->aop = np->type == CSS_SEL_ATTR ? 0 : np->type == CSS_SEL_ATTR_EQ ? '=' :
+                         np->type == CSS_SEL_ATTR_INCLUDES ? '~' : np->type == CSS_SEL_ATTR_DASH ? '|' :
+                         np->type == CSS_SEL_ATTR_PREFIX ? '^' : np->type == CSS_SEL_ATTR_SUFFIX ? '$' : '*';
+                break;
+            default: return 0;
+            }
+        }
+        ss->has_count++;
+    }
+    else if (strcmp(p->name, "is") == 0 || strcmp(p->name, "where") == 0) {
+        /* A one-item list is just that simple selector (.a, #a, tag). */
         char buf[96] = {0};
         snprintf(buf, sizeof(buf), "%.*s", (int)(sizeof(buf) - 1), p->pseudo_arg);
         trim_whitespace(buf);
-        if (buf[0] == '.')      snprintf(ss->not_class, sizeof(ss->not_class), "%.*s", (int)(sizeof(ss->not_class) - 1), buf + 1);
-        else if (buf[0] == '#') snprintf(ss->not_id, sizeof(ss->not_id), "%.*s", (int)(sizeof(ss->not_id) - 1), buf + 1);
-        else if (buf[0])        snprintf(ss->not_type, sizeof(ss->not_type), "%.*s", (int)(sizeof(ss->not_type) - 1), buf);
-        if (buf[0]) ss->has_not = 1;
+        if (!buf[0] || strpbrk(buf, ", >+~[:*()")) return 0;
+        if (buf[0] == '.') {
+            if (ss->sel_class_count >= MAX_SEL_CLASSES) return 0;
+            snprintf(ss->sel_classes[ss->sel_class_count++], sizeof(ss->sel_classes[0]), "%s", buf + 1);
+        } else if (buf[0] == '#') {
+            if (ss->sel_id[0]) return 0;
+            snprintf(ss->sel_id, sizeof(ss->sel_id), "%s", buf + 1);
+        } else {
+            if (ss->sel_type[0]) return 0;
+            snprintf(ss->sel_type, sizeof(ss->sel_type), "%s", buf);
+        }
     }
     else if (strcmp(p->name, "root") == 0) ss->is_root = 1;
     else if (strcmp(p->name, "before") == 0 || strcmp(p->name, "after") == 0)
         return 1; /* converted to generated pseudo-elements by the caller */
     else return 0;
     return 1;
+}
+
+static void selector_add_attr(SimpleSelector* ss, const CSSSelectorPart* p) {
+    if (ss->attr_count >= 3) { ss->unsupported_pseudo = 1; return; }
+    int i = ss->attr_count++;
+    snprintf(ss->attrs[i].name, sizeof ss->attrs[i].name, "%s", p->name);
+    snprintf(ss->attrs[i].val, sizeof ss->attrs[i].val, "%s", p->attr_val);
+    ss->attrs[i].op = p->type == CSS_SEL_ATTR ? 0 : p->type == CSS_SEL_ATTR_EQ ? '=' :
+                      p->type == CSS_SEL_ATTR_INCLUDES ? '~' : p->type == CSS_SEL_ATTR_DASH ? '|' :
+                      p->type == CSS_SEL_ATTR_PREFIX ? '^' : p->type == CSS_SEL_ATTR_SUFFIX ? '$' : '*';
 }
 
 /* Convert one cssparser.h CSSCompound's type/id/class/structural parts. */
@@ -7204,6 +8327,10 @@ static void convert_compound_parts(const CSSCompound* cmp, SimpleSelector* ss) {
             else if (strcmp(p->name, "focus-visible") == 0) ss->is_focus_visible = 1;
             else if (strcmp(p->name, "focus-within")  == 0) ss->is_focus_within = 1;
             else if (!apply_structural_pseudo(ss, p)) ss->unsupported_pseudo = 1;
+            break;
+        case CSS_SEL_ATTR: case CSS_SEL_ATTR_EQ: case CSS_SEL_ATTR_INCLUDES: case CSS_SEL_ATTR_DASH:
+        case CSS_SEL_ATTR_PREFIX: case CSS_SEL_ATTR_SUFFIX: case CSS_SEL_ATTR_SUBSTR:
+            selector_add_attr(ss, p);
             break;
         default: break;
         }
@@ -7241,9 +8368,20 @@ static void convert_selector(const CSSSelector *cs, SimpleSelector *ss,
             else if (strcmp(p->name, "focus")        == 0) *is_focus = 1;
             else if (!apply_structural_pseudo(ss, p)) ss->unsupported_pseudo = 1;
             break;
+        case CSS_SEL_ATTR: case CSS_SEL_ATTR_EQ: case CSS_SEL_ATTR_INCLUDES: case CSS_SEL_ATTR_DASH:
+        case CSS_SEL_ATTR_PREFIX: case CSS_SEL_ATTR_SUFFIX: case CSS_SEL_ATTR_SUBSTR:
+            selector_add_attr(ss, p);
+            break;
         default: break;
         }
     }
+}
+
+/* Whether the selector's result depends on the tree's shape (so a DOM change
+ * has to restyle more than the changed subtree). */
+static int selector_is_structural(const SimpleSelector* s) {
+    return s->is_first_child || s->is_last_child || s->has_nth || s->nthx_count || s->has_count ||
+           (s->pflags & (LUNA_PS_EMPTY | LUNA_PS_CHECKED));
 }
 
 /* Compute specificity for our internal format (100·id + 10·cls + 1·type).
@@ -7254,13 +8392,13 @@ static int simple_selector_spec(const SimpleSelector *ss) {
              + (ss->sel_type[0] ? 1 : 0);
     if (ss->is_first_child) spec += 10;
     if (ss->is_last_child)  spec += 10;
+    spec += ss->attr_count * 10;
     if (ss->has_nth)        spec += 10;
     /* :not() contributes the specificity of its argument. */
-    if (ss->has_not) {
-        if (ss->not_id[0])         spec += 100;
-        else if (ss->not_class[0]) spec += 10;
-        else if (ss->not_type[0])  spec += 1;
-    }
+    for (int i = 0; i < ss->not_count; i++)
+        spec += ss->nots[i].kind == 1 ? 100 : ss->nots[i].kind == 0 ? 1 : 10;
+    spec += ss->nthx_count * 10 + ss->has_count * 10;
+    for (unsigned f = ss->pflags; f; f &= f - 1) spec += 10;
     return spec;
 }
 
@@ -7385,12 +8523,16 @@ static void ingest_parsed_rule(const CSSRule *pr) {
         snprintf(rule.selector, sizeof(rule.selector) - 1,
                  "[sel%d]", si);
 
-        if (rule.target.is_first_child || rule.target.is_last_child || rule.target.has_nth)
-            g_has_structural_selectors = 1;
+        /* html { font-size } sets the size every element inherits, and 1rem */
+        if (rule.has_font_size && rule.ancestor_count == 0 &&
+            (rule.target.is_root || (strcmp(rule.target.sel_type, "html") == 0 && !rule.target.sel_id[0] &&
+                                     !rule.target.sel_class_count))) {
+            float root = rule.font_size_rel ? LUNA_REM_PX * rule.font_size : rule.font_size;
+            if (root >= 1.0f && root <= 200.0f) g_rem_px = root;
+        }
+        if (selector_is_structural(&rule.target)) g_has_structural_selectors = 1;
         for (int a = 0; a < rule.ancestor_count; a++)
-            if (rule.ancestors[a].is_first_child || rule.ancestors[a].is_last_child ||
-                rule.ancestors[a].has_nth)
-                g_has_structural_selectors = 1;
+            if (selector_is_structural(&rule.ancestors[a])) g_has_structural_selectors = 1;
 
         rule.source_order = rule_count;
         if (!luna_ensure_rule_capacity(rule_count + 1)) return;
@@ -7426,14 +8568,17 @@ static void keyframe_stop_from_rule(const CSSRule* kr, KeyframeStop* stop) {
             stop->left_pct = tmp.pct_left;
         }
         if (tmp.has_opacity) { stop->has_opacity = 1; stop->opacity = tmp.opacity; }
-        if (tmp.has_transform) {
-            if (tmp.transform_scale != 1.0f) {
-                stop->has_transform_scale = 1;
-                stop->transform_scale = tmp.transform_scale;
-            }
-            if (tmp.has_transform_tx) { stop->has_transform_tx = 1; stop->transform_tx = tmp.transform_tx; }
-            if (tmp.has_transform_ty) { stop->has_transform_ty = 1; stop->transform_ty = tmp.transform_ty; }
+        /* translate()/translateX()/translateY() set has_transform_tx/ty and not
+         * has_transform (which parse_transform raises for scale and `none`), so
+         * a keyframe whose transform is only a translation -- falling snow,
+         * every slide-in -- was read as having no transform at all and never
+         * moved. */
+        if (tmp.has_transform && tmp.transform_scale != 1.0f) {
+            stop->has_transform_scale = 1;
+            stop->transform_scale = tmp.transform_scale;
         }
+        if (tmp.has_transform_tx) { stop->has_transform_tx = 1; stop->transform_tx = tmp.transform_tx; }
+        if (tmp.has_transform_ty) { stop->has_transform_ty = 1; stop->transform_ty = tmp.transform_ty; }
         if (tmp.has_shadow) {
             /* orb-pulse style animations use box-shadow blur */
             (void)tmp;
@@ -7444,7 +8589,7 @@ static void keyframe_stop_from_rule(const CSSRule* kr, KeyframeStop* stop) {
 
 static void ingest_keyframes_from_sheet(const CSSStyleSheet* sheet) {
     if (!sheet) return;
-    for (int ai = 0; ai < sheet->at_rule_count && g_keyframe_count < MAX_KF_ANIMS; ai++) {
+    for (int ai = 0; ai < sheet->at_rule_count; ai++) {
         const CSSAtRule* at = &sheet->at_rules[ai];
         if (at->type != CSS_AT_KEYFRAMES) continue;
         CssKeyframe kf;
@@ -7483,6 +8628,12 @@ static void ingest_keyframes_from_sheet(const CSSStyleSheet* sheet) {
                 memset(&kf.stops[0], 0, sizeof(KeyframeStop));
                 kf.stops[0].position = 0.0f;
                 kf.stop_count++;
+            }
+            if (g_keyframe_count == g_keyframe_cap) {
+                int cap = g_keyframe_cap ? g_keyframe_cap * 2 : 64;
+                CssKeyframe* g = (CssKeyframe*)realloc(g_keyframes, sizeof(*g) * (size_t)cap);
+                if (!g) return;
+                g_keyframes = g; g_keyframe_cap = cap;
             }
             g_keyframes[g_keyframe_count++] = kf;
         }
@@ -7626,7 +8777,38 @@ static void luna_css_resolve_sheet_variables(CSSStyleSheet* sheet) {
                 }
 }
 
+/* `html { font-size: 62.5% }` makes 1rem 10px for the whole sheet, wherever the
+ * rule sits; rem values are converted as rules are read, so look for it first. */
+static void luna_prescan_root_font(const char* css) {
+    for (const char* p = css; p && (p = strstr(p, "html")) != NULL; p += 4) {
+        if (p > css && !(p[-1] == '}' || p[-1] == ',' || p[-1] == '{' || isspace((unsigned char)p[-1]) || p[-1] == '/')) continue;
+        const char* q = p + 4;
+        while (isspace((unsigned char)*q)) q++;
+        if (*q != '{') continue;
+        const char* end = strchr(q, '}');
+        if (!end) break;
+        for (const char* f = q; (f = strstr(f, "font-size")) != NULL && f < end; f += 9) {
+            if (f[-1] == '-') continue;
+            const char* v = f + 9;
+            while (isspace((unsigned char)*v)) v++;
+            if (*v != ':') continue;
+            v++;
+            char* ue = NULL;
+            float n = strtof(v, &ue);
+            if (!ue || ue == v) continue;
+            while (isspace((unsigned char)*ue)) ue++;
+            float px = 0.0f;
+            if (*ue == '%') px = LUNA_REM_PX * n / 100.0f;
+            else if (!strncmp(ue, "px", 2)) px = n;
+            else if (!strncmp(ue, "rem", 3) || !strncmp(ue, "em", 2)) px = LUNA_REM_PX * n;
+            if (px >= 1.0f && px <= 200.0f) g_rem_px = px;
+            break;
+        }
+    }
+}
+
 void parse_css(const char* css_text) {
+    luna_prescan_root_font(css_text);
     /* Stylesheets participate in one document-wide cascade.  Keep rules and
        keyframes loaded by earlier <link>, <style>, or luna_parse_css() calls;
        resetting here made the last stylesheet silently replace all previous
@@ -7697,7 +8879,7 @@ static void update_focus_within_styles(int idx) {
  * An element's own declarations live in e->css_vars ("--name:value\n", the
  * last one wins); lookups walk up the parents, which is inheritance, and end
  * at the application's luna_css_set_variables() values. */
-static const char* css_var_find(const char* s, const char* name, size_t n, size_t* vlen) {
+static const char* css_var_scan(const char* s, const char* name, size_t n, size_t* vlen) {
     const char* hit = NULL;
     while (s && *s) {
         const char* nl = strchr(s, '\n');
@@ -7712,9 +8894,73 @@ static const char* css_var_find(const char* s, const char* name, size_t n, size_
     return hit;
 }
 
+static uint32_t css_var_hash(const char* s, size_t n) {
+    uint32_t h = 2166136261u;
+    while (n--) h = (h ^ (unsigned char)*s++) * 16777619u;
+    return h;
+}
+
+static void css_vars_reset(LunaElement* e) {
+    free(e->css_idx);
+    e->css_idx = NULL;
+    e->css_idx_cap = 0;
+    e->css_idx_state = 0;
+}
+
+static void css_vars_index(LunaElement* e) {
+    e->css_idx_state = 1;
+    const char* list = e->css_vars;
+    if (!list || strlen(list) < 1024) return;
+    size_t lines = 0;
+    for (const char* p = list; (p = strchr(p, '\n')) != NULL; p++) lines++;
+    uint32_t cap = 64;
+    while (cap < lines * 2 + 2) cap <<= 1;
+    uint32_t* tab = (uint32_t*)calloc(cap, sizeof(uint32_t));
+    if (!tab) return;
+    for (const char* s = list; *s; ) {
+        const char* nl = strchr(s, '\n');
+        if (!nl) nl = s + strlen(s);
+        const char* colon = (const char*)memchr(s, ':', (size_t)(nl - s));
+        if (colon) {
+            size_t n = (size_t)(colon - s);
+            uint32_t i = css_var_hash(s, n) & (cap - 1);
+            while (tab[i]) {                       /* same name: the later line wins */
+                const char* o = list + tab[i] - 1;
+                const char* oc = strchr(o, ':');
+                if ((size_t)(oc - o) == n && memcmp(o, s, n) == 0) break;
+                i = (i + 1) & (cap - 1);
+            }
+            tab[i] = (uint32_t)(s - list) + 1;
+        }
+        s = *nl ? nl + 1 : nl;
+    }
+    e->css_idx = tab;
+    e->css_idx_cap = cap;
+    e->css_idx_state = 2;
+}
+
+static const char* css_var_find(const LunaElement* ce, const char* name, size_t n, uint32_t h, size_t* vlen) {
+    LunaElement* e = (LunaElement*)ce;
+    if (!e->css_vars) return NULL;
+    if (!e->css_idx_state) css_vars_index(e);
+    if (e->css_idx_state == 1) return css_var_scan(e->css_vars, name, n, vlen);
+    uint32_t mask = e->css_idx_cap - 1;
+    for (uint32_t i = h & mask; e->css_idx[i]; i = (i + 1) & mask) {
+        const char* line = e->css_vars + e->css_idx[i] - 1;
+        const char* colon = strchr(line, ':');
+        if ((size_t)(colon - line) != n || memcmp(line, name, n)) continue;
+        const char* nl = strchr(colon, '\n');
+        if (!nl) nl = colon + strlen(colon);
+        *vlen = (size_t)(nl - colon - 1);
+        return colon + 1;
+    }
+    return NULL;
+}
+
 static const char* css_var_lookup(const LunaElement* e, const char* name, size_t n, size_t* vlen) {
+    uint32_t h = css_var_hash(name, n);
     for (int guard = 0; e && guard < 256; guard++) {
-        const char* v = css_var_find(e->css_vars, name, n, vlen);
+        const char* v = css_var_find(e, name, n, h, vlen);
         if (v) return *v == CSS_VAR_INVALID ? NULL : v;
         e = e->parent_idx >= 0 && e->parent_idx < elem_count ? &elements[e->parent_idx] : NULL;
     }
@@ -7838,6 +9084,7 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
     }
     if (r->has_bg_image && !e->has_custom_bg) {
         e->has_bg_image = 1;
+        e->mask_tint = r->has_mask_image;
         strncpy(e->bg_image_path, r->bg_image_path, sizeof(e->bg_image_path) - 1);
         e->bg_image_path[sizeof(e->bg_image_path) - 1] = '\0';
         e->bg_image_tex = 0;
@@ -7965,6 +9212,8 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
         e->position_sticky = r->position_sticky;
         if (r->position_mode != POS_UNSET) e->position_mode = r->position_mode;
     }
+    if (r->has_float) e->css_float = r->css_float;
+    if (r->has_clear) e->css_clear = r->css_clear;
     /* Sticky and relative elements stay in normal/flex flow.  Their offsets
        are applied after normal-flow layout; only absolute/fixed elements
        are removed from the flow via css_positioned. */
@@ -8055,7 +9304,7 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
         e->display_mode = r->display_mode;
         e->inline_level = r->inline_level;
     }
-    if (r->has_flex_direction) e->flex_direction = r->flex_direction;
+    if (r->has_flex_direction) { e->flex_direction = r->flex_direction; e->flex_reverse = r->flex_reverse; }
     if (r->has_justify_content) e->justify_content = r->justify_content;
     if (r->has_align_items) e->align_items = r->align_items;
     if (r->has_justify_items) e->justify_items = r->justify_items;
@@ -8071,7 +9320,12 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
         e->flex_basis = r->flex_basis;
         e->flex_basis_auto = r->flex_basis_auto;
     }
-    if (r->has_min_width) { e->has_min_width = 1; e->css_min_width = r->min_width; }
+    if (r->has_min_width) {
+        e->has_min_width = 1;
+        e->min_width_pct = r->min_width_pct;
+        if (r->min_width_pct) { e->raw_min_width = r->min_width; e->css_min_width = 0.0f; }
+        else e->css_min_width = r->min_width;
+    }
     if (r->has_min_height) { e->has_min_height = 1; e->css_min_height = r->min_height; }
     if (r->has_max_width) {
         e->has_max_width = 1;
@@ -8182,7 +9436,16 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
     if (r->has_visibility) e->visibility_hidden = r->visibility_hidden;
     if (r->has_pointer_events) e->pointer_events_none = r->pointer_events_none;
     if (r->has_text_align)  { e->has_text_align = 1; e->text_align = r->text_align; }
-    if (r->has_font_size)   e->font_size = r->font_size;
+    if (r->has_valign) e->tbl_valign = r->valign;
+    if (r->has_user_select) e->no_select = r->user_select_none;
+    if (r->has_tbl_spacing) { e->tbl_spacing = r->tbl_spacing; e->tbl_spacing_set = 1; }
+    if (r->has_font_size) {
+        if (r->font_size_rel) {
+            float base = (e->parent_idx >= 0 && e->parent_idx < elem_count)
+                         ? elements[e->parent_idx].font_size : g_rem_px;
+            e->font_size = (base > 0 ? base : g_rem_px) * r->font_size;
+        } else e->font_size = r->font_size;
+    }
     if (r->has_font_weight) e->font_bold = r->font_bold;
     if (r->has_font_face)   e->font_face = r->font_face;
     if (r->has_line_height) e->line_height = r->line_height;
@@ -8208,6 +9471,7 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
     }
     if (r->has_z_index) e->z_index = r->z_index;
     if (r->has_transform) e->transform_scale = r->transform_scale;
+    if (r->has_tf_origin) { e->tf_ox = r->tf_ox; e->tf_oy = r->tf_oy; e->tf_oxpx = r->tf_oxpx; e->tf_oypx = r->tf_oypx; }
     if (r->has_transform_tx) {
         e->transform_tx = r->transform_tx;
         e->transform_tx_pct = r->transform_tx_pct;
@@ -8313,6 +9577,7 @@ static void anon_text_fixup(LunaElement* e) {
     e->border_radius = 0.0f;
     e->rad_c[0] = e->rad_c[1] = e->rad_c[2] = e->rad_c[3] = 0.0f;
     e->transform_scale = 1.0f; e->transform_tx = e->transform_ty = 0.0f; e->transform_rotate = 0.0f;
+    e->tf_ox = e->tf_oy = 0.5f; e->tf_oxpx = e->tf_oypx = 0.0f;
     e->has_css_animation = 0; e->anim_name[0] = '\0';
     e->overflow_x = e->overflow_y = OVERFLOW_VISIBLE;
     e->z_index = 0;
@@ -8338,6 +9603,125 @@ static int style_rule_applies(const StyleRule* r, LunaElement* e) {
     return 1;
 }
 
+
+/* Browser UA defaults for the table elements (web documents only). */
+static void luna_ua_table_defaults(LunaElement* e) {
+    const char* t = e->type;
+    if (!strcmp(t, "table")) { e->display_mode = DISPLAY_TABLE; e->tbl_spacing = 2.0f; e->tbl_spacing_set = 1; }
+    else if (!strcmp(t, "thead") || !strcmp(t, "tbody") || !strcmp(t, "tfoot")) e->display_mode = DISPLAY_TABLE_GROUP;
+    else if (!strcmp(t, "tr")) e->display_mode = DISPLAY_TABLE_ROW;
+    else if (!strcmp(t, "td") || !strcmp(t, "th")) {
+        e->display_mode = DISPLAY_TABLE_CELL;
+        e->pad_t = e->pad_r = e->pad_b = e->pad_l = 1.0f;
+        if (t[1] == 'h') { e->font_bold = 1; e->text_align = 1; e->has_text_align = 1; }
+    }
+    else if (!strcmp(t, "caption")) { e->display_mode = DISPLAY_TABLE_CAPTION; e->text_align = 1; e->has_text_align = 1; }
+    else if (!strcmp(t, "col") || !strcmp(t, "colgroup")) { e->display_none = 1; e->display_mode = DISPLAY_NONE; }
+    else if (!strcmp(t, "center")) { e->text_align = 1; e->has_text_align = 1; }
+}
+
+/* HTML presentational attributes (width, bgcolor, align, valign, cellpadding,
+ * border, <font color size> ...) as the lowest-priority style: author CSS and
+ * style="" override them, as in browsers. */
+static void hint_length(char* out, size_t cap, const char* prop, const char* v) {
+    char* end;
+    double d = strtod(v, &end);
+    if (end == v || d < 0) return;
+    size_t n = strlen(out);
+    snprintf(out + n, cap - n, "%s:%g%s;", prop, d, *end == '%' ? "%" : "px");
+}
+
+static void hint_color(char* out, size_t cap, const char* prop, const char* v) {
+    size_t n = strlen(out), l = strlen(v);
+    int hex6 = l == 6;
+    for (size_t i = 0; hex6 && i < l; i++) hex6 = isxdigit((unsigned char)v[i]);
+    snprintf(out + n, cap - n, "%s:%s%s;", prop, hex6 ? "#" : "", v);
+}
+
+static void luna_apply_hints(LunaElement* e, int* am) {
+    if (!e->dom_attrs) return;
+    const char* t = e->type;
+    int is_table = !strcmp(t, "table");
+    int is_cell = !strcmp(t, "td") || !strcmp(t, "th");
+    int is_row = !strcmp(t, "tr") || !strcmp(t, "thead") || !strcmp(t, "tbody") || !strcmp(t, "tfoot");
+    int sized = is_table || is_cell || !strcmp(t, "tr") || !strcmp(t, "img") || !strcmp(t, "canvas") ||
+                !strcmp(t, "iframe") || !strcmp(t, "video") || !strcmp(t, "svg");
+    int aligned = is_cell || is_row || !strcmp(t, "div") || !strcmp(t, "p") || !strcmp(t, "caption") ||
+                  !strcmp(t, "center") || (t[0] == 'h' && t[1] >= '1' && t[1] <= '6' && !t[2]);
+    char css[512] = "", v[128];
+    if (sized) {
+        if (html_attr_get(e->dom_attrs, "width", v, sizeof v) == 1) hint_length(css, sizeof css, "width", v);
+        if (html_attr_get(e->dom_attrs, "height", v, sizeof v) == 1) hint_length(css, sizeof css, "height", v);
+    }
+    if ((is_table || is_cell || is_row || !strcmp(t, "body")) &&
+        html_attr_get(e->dom_attrs, "bgcolor", v, sizeof v) == 1 && v[0])
+        hint_color(css, sizeof css, "background-color", v);
+    if (html_attr_get(e->dom_attrs, "align", v, sizeof v) == 1) {
+        if (is_table) {
+            if (!strcasecmp(v, "center")) strcat(css, "margin-left:auto;margin-right:auto;");
+            else if (!strcasecmp(v, "right")) strcat(css, "margin-left:auto;");
+        } else if (aligned) {
+            if (!strcasecmp(v, "center")) strcat(css, "text-align:center;");
+            else if (!strcasecmp(v, "right")) strcat(css, "text-align:right;");
+            else if (!strcasecmp(v, "left")) strcat(css, "text-align:left;");
+        }
+    }
+    if ((is_cell || is_row) && html_attr_get(e->dom_attrs, "valign", v, sizeof v) == 1 && v[0])
+        snprintf(css + strlen(css), sizeof css - strlen(css), "vertical-align:%s;", v);
+    if (is_cell && html_attr_get(e->dom_attrs, "nowrap", v, sizeof v) >= 0) strcat(css, "white-space:nowrap;");
+    if (is_table && html_attr_get(e->dom_attrs, "cellspacing", v, sizeof v) == 1) {
+        size_t n = strlen(css);
+        snprintf(css + n, sizeof css - n, "border-spacing:%dpx;", atoi(v));
+    }
+    if (is_table && html_attr_get(e->dom_attrs, "border", v, sizeof v) >= 0 && atoi(v[0] ? v : "1") > 0) {
+        size_t n = strlen(css);
+        snprintf(css + n, sizeof css - n, "border:%dpx solid #808080;", atoi(v[0] ? v : "1"));
+    }
+    if (is_cell) {
+        /* cellpadding / table border apply to the cells of the nearest table */
+        int p = e->parent_idx;
+        for (int up = 0; p >= 0 && p < elem_count && up < 3 && elements[p].display_mode != DISPLAY_TABLE; up++)
+            p = elements[p].parent_idx;
+        if (p >= 0 && p < elem_count && elements[p].display_mode == DISPLAY_TABLE && elements[p].dom_attrs) {
+            if (html_attr_get(elements[p].dom_attrs, "cellpadding", v, sizeof v) == 1 && v[0]) {
+                size_t n = strlen(css);
+                snprintf(css + n, sizeof css - n, "padding:%dpx;", atoi(v));
+            }
+            if (html_attr_get(elements[p].dom_attrs, "border", v, sizeof v) >= 0 && atoi(v[0] ? v : "1") > 0)
+                strcat(css, "border:1px solid #808080;");
+        }
+    }
+    if (!strcmp(t, "font")) {
+        if (html_attr_get(e->dom_attrs, "color", v, sizeof v) == 1 && v[0]) hint_color(css, sizeof css, "color", v);
+        if (html_attr_get(e->dom_attrs, "size", v, sizeof v) == 1 && v[0]) {
+            static const int px[8] = { 16, 10, 13, 16, 18, 24, 32, 48 };
+            int sz = atoi(v);
+            if (v[0] == '+' || v[0] == '-') sz += 3;
+            if (sz < 1) sz = 1;
+            if (sz > 7) sz = 7;
+            snprintf(css + strlen(css), sizeof css - strlen(css), "font-size:%dpx;", px[sz]);
+        }
+    }
+    if (!strcmp(t, "body") && html_attr_get(e->dom_attrs, "text", v, sizeof v) == 1 && v[0])
+        hint_color(css, sizeof css, "color", v);
+    if (!css[0]) return;
+    StyleRule tmp;
+    memset(&tmp, 0, sizeof tmp);
+    parse_declarations(css, &tmp);
+    apply_style_rule(e, &tmp, am);
+    rule_bg_layers_release(tmp.bg_layers);
+}
+
+static GLuint load_or_get_texture(const char* path);
+static int tex_cache_dims(GLuint tex, int* out_w, int* out_h);
+
+/* <button>, and <input type=submit|button|reset>, which carry their label in
+ * `text`: the label is centred in the box. */
+static int el_is_button_like(const LunaElement* e) {
+    return strcmp(e->type, "button") == 0 ||
+           (strcmp(e->type, "input") == 0 && !e->is_input && e->text[0]);
+}
+
 void update_element_style(LunaElement* e) {
     /* Preserve an unchanged animation timeline across unrelated hover/focus
      * style resolutions; restart only when its definition changes. */
@@ -8354,6 +9738,7 @@ void update_element_style(LunaElement* e) {
     double prev_anim_start_time = e->anim_start_time;
 
     g_probe_prepared = 0;
+    e->mask_tint = 0;
     if (!e->has_custom_bg)     { e->r = 0.0f; e->g = 0.0f; e->b = 0.0f; e->a = 0.0f; e->has_gradient = 0; e->grad_stop_px_mask = 0; e->has_bg_image = 0; e->bg_image_path[0] = '\0'; e->bg_image_tex = 0; }
     /* border-image comes from the sheet alone; start each cascade without one. */
     {
@@ -8383,9 +9768,13 @@ void update_element_style(LunaElement* e) {
     e->margin_top = e->margin_right = e->margin_bottom = e->margin_left = 0.0f;
     e->margin_top_auto = e->margin_right_auto = e->margin_bottom_auto = e->margin_left_auto = 0;
     e->opacity = 1; e->display_none = 0; e->display_mode = DISPLAY_BLOCK;
+    e->tbl_valign = 0; e->tbl_spacing = 0.0f; e->tbl_spacing_set = 0;
+    e->tbl_pad_t0 = e->tbl_pad_b0 = 0.0f;
+    e->no_select = (e->parent_idx >= 0 && e->parent_idx < elem_count) ? elements[e->parent_idx].no_select : 0;
+    e->css_float = e->css_clear = 0;
     e->inline_level = 0;
     e->visibility_hidden = 0; e->cursor_pointer = 0;
-    e->flex_direction = FLEX_DIR_ROW;
+    e->flex_direction = FLEX_DIR_ROW; e->flex_reverse = 0;
     e->justify_content = FLEX_JUSTIFY_START;
     e->align_items = FLEX_ALIGN_STRETCH;
     e->justify_items = FLEX_ALIGN_STRETCH;
@@ -8416,6 +9805,7 @@ void update_element_style(LunaElement* e) {
     e->css_width = e->css_height = 0.0f;
     e->has_css_width = e->has_css_height = 0;
     e->has_min_width = e->has_min_height = 0;
+    e->min_width_pct = 0; e->raw_min_width = 0.0f;
     e->has_max_width = e->has_max_height = 0;
     e->max_width_pct = 0;
     e->raw_max_width = e->raw_max_width_off = 0.0f;
@@ -8475,9 +9865,9 @@ void update_element_style(LunaElement* e) {
      * allocation-free and is only done when a style is (re)resolved. */
     /* Native browser buttons center their label even without an explicit
        text-align declaration.  Author CSS applied below can still override. */
-    e->text_align = strcmp(e->type, "button") == 0 ? 1 : 0;
-    e->has_text_align = strcmp(e->type, "button") == 0;
-    e->font_size = 16; e->font_bold = 0; e->font_face = 0;
+    e->text_align = el_is_button_like(e) ? 1 : 0;
+    e->has_text_align = el_is_button_like(e);
+    e->font_size = g_rem_px; e->font_bold = 0; e->font_face = 0;
     /* CSS initial value is overflow-wrap:normal.  break-word here split short
      * unbreakable labels such as "Mon" across two lines in narrow flex cells. */
     e->line_height = 0.0f; e->white_space = 0; e->text_overflow = 0; e->overflow_wrap = 0;
@@ -8508,7 +9898,7 @@ void update_element_style(LunaElement* e) {
        inner path gives nested spans the same one-line measurement/order while
        staying allocation-free.  Author display/font/alignment rules below
        remain able to override every one of these UA defaults. */
-    if (strcmp(e->type, "button") == 0) {
+    if (el_is_button_like(e)) {
         e->display_mode = DISPLAY_FLEX;
         e->flex_direction = FLEX_DIR_ROW;
         e->justify_content = FLEX_JUSTIFY_CENTER;
@@ -8537,13 +9927,14 @@ void update_element_style(LunaElement* e) {
     /* Web documents (luna_set_web_compat): the HTML UA stylesheet's outer
      * display types.  Luna's own UIs predate inline layout and keep every
      * element block-level unless their CSS says otherwise. */
-    if (g_luna_web_compat) luna_ua_inline_defaults(e);
+    if (g_luna_web_compat) { luna_ua_inline_defaults(e); luna_ua_table_defaults(e); }
     e->has_text_shadow = 0;
     e->tsh_dx = e->tsh_dy = e->tsh_blur = 0.0f;
     e->tsh_r = e->tsh_g = e->tsh_b = 0.0f; e->tsh_a = 0.0f;
     e->has_shadow = 0; e->z_index = 0;
     e->transform_scale = 1.0f; e->transform_tx = 0.0f; e->transform_ty = 0.0f;
     e->transform_rotate = 0.0f;
+    e->tf_ox = e->tf_oy = 0.5f; e->tf_oxpx = e->tf_oypx = 0.0f;
     e->transform_tx_pct = 0; e->transform_ty_pct = 0;
     e->raw_transform_tx = 0.0f; e->raw_transform_ty = 0.0f;
     /* CSS changes are immediate unless the cascade supplies a transition.
@@ -8593,13 +9984,15 @@ void update_element_style(LunaElement* e) {
     e->grad_rad_ry = 0.0f;
 
     int am[4] = { 0, 0, 0, 0 };   /* author margins: top right bottom left */
-    uint64_t rule_candidates[LUNA_RULE_WORDS];
+    if (!g_rule_index_ready) rebuild_rule_index();
+    LUNA_SCRATCH(uint64_t, rule_candidates, g_rule_words);
     build_rule_candidates(e, rule_candidates);
 
     /* Custom properties first: every var() below sees the element's final
      * values, whichever rule declared them. */
     free(e->css_vars);
     e->css_vars = NULL;
+    css_vars_reset(e);
     {
         char* raw = NULL;
         size_t rn = 0;
@@ -8623,6 +10016,7 @@ void update_element_style(LunaElement* e) {
         if (e->has_inline_style && strstr(e->inline_style, "--"))
             css_vars_from_inline(&raw, &rn, e->inline_style);
         e->css_vars = raw;
+        css_vars_reset(e);
         if (raw && strstr(raw, "var(")) {
             /* Resolve references once, here, so descendants inherit values.
              * One that resolves to nothing leaves the property invalid
@@ -8651,7 +10045,18 @@ void update_element_style(LunaElement* e) {
                 p = *nl ? nl + 1 : nl;
             }
             e->css_vars = done;
+            css_vars_reset(e);
             free(raw);
+        }
+    }
+
+    if (g_luna_web_compat) luna_apply_hints(e, am);
+    if (g_luna_web_compat && e->dom_attrs && !strcmp(e->type, "img")) {   /* <img src> is the box's image */
+        char src[sizeof e->bg_image_path];
+        if (extract_html_attr(e->dom_attrs, "src", src, sizeof src) && src[0]) {
+            if (strcmp(e->bg_image_path, src)) e->bg_image_tex = 0;
+            e->has_bg_image = 1;
+            snprintf(e->bg_image_path, sizeof e->bg_image_path, "%s", src);
         }
     }
 
@@ -8666,6 +10071,47 @@ void update_element_style(LunaElement* e) {
 
     /* style="" is the last and strongest declaration block. */
     apply_element_inline_style(e, am);
+
+    /* An inline <svg> is a picture of its markup, scaled to its box. */
+    if (e->svg_src > 0) {
+        char token[256];
+        if (luna_svg_picture_path(e->svg_src, e->t_r, e->t_g, e->t_b, token, sizeof token)) {
+            if (strcmp(e->bg_image_path, token)) e->bg_image_tex = 0;
+            e->has_bg_image = 1;
+            e->mask_tint = 0;
+            snprintf(e->bg_image_path, sizeof e->bg_image_path, "%s", token);
+            e->bg_size_mode = 3;
+            e->bg_size_wu = e->bg_size_hu = LUNA_BG_SIZE_PCT;
+            e->bg_size_w = e->bg_size_h = 100.0f;
+        }
+    }
+
+    /* An image with no size of its own is as big as the picture; with one
+     * dimension it keeps the picture's proportions.  A decoded picture
+     * replaces the alt text. */
+    if (g_luna_web_compat && !strcmp(e->type, "img") && e->has_bg_image && e->bg_image_path[0]) {
+        int nw = 0, nh = 0;
+        GLuint tex = load_or_get_texture(e->bg_image_path);
+        if (tex && tex_cache_dims(tex, &nw, &nh) && nw > 0 && nh > 0) {
+            e->text[0] = '\0';
+            if (e->pct_w && !e->has_css_height && !e->pct_h) {
+                /* width: 50% / 100% with auto height keeps the picture's proportions */
+                if (!e->has_aspect_ratio) { e->has_aspect_ratio = 1; e->aspect_ratio = (float)nw / (float)nh; }
+            } else if (!e->has_css_width && !e->has_css_height) {
+                e->css_width = (float)nw; e->css_height = (float)nh;
+                e->has_css_width = e->has_css_height = 1;
+            } else if (e->has_css_width && !e->pct_w && !e->has_css_height) {
+                e->css_height = e->css_width * (float)nh / (float)nw; e->has_css_height = 1;
+            } else if (e->has_css_height && !e->pct_h && !e->has_css_width) {
+                e->css_width = e->css_height * (float)nw / (float)nh; e->has_css_width = 1;
+            }
+            if (e->has_css_width && !e->pct_w && e->has_max_width && !e->max_width_pct &&
+                e->css_width > e->css_max_width && e->css_max_width > 0 && e->has_css_height && !e->pct_h) {
+                e->css_height *= e->css_max_width / e->css_width;
+                e->css_width = e->css_max_width;
+            }
+        }
+    }
 
     /* UA em margins compute from the final font size after the author cascade,
      * not the inherited size that was present when defaults were seeded. */
@@ -8770,6 +10216,7 @@ static int layout_style_changed(const LunaElement* a, const LunaElement* b) {
     LUNA_LAYOUT_DIFF(margin_bottom); LUNA_LAYOUT_DIFF(margin_left);
     LUNA_LAYOUT_DIFF(margin_top_auto); LUNA_LAYOUT_DIFF(margin_right_auto);
     LUNA_LAYOUT_DIFF(margin_bottom_auto); LUNA_LAYOUT_DIFF(margin_left_auto);
+    LUNA_LAYOUT_DIFF(css_float); LUNA_LAYOUT_DIFF(css_clear);
 
     LUNA_LAYOUT_DIFF(flex_direction); LUNA_LAYOUT_DIFF(justify_content);
     LUNA_LAYOUT_DIFF(align_items); LUNA_LAYOUT_DIFF(justify_items);
@@ -8817,8 +10264,8 @@ static int restyle_element_checked(LunaElement* e) {
     update_element_style(e);
     int layout_changed = layout_style_changed(&before, e);
     if (layout_changed) {
-        memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
-        g_layout_dirty = 1;
+        LUNA_AUX_ZERO(g_intrinsic_width_valid);
+        LUNA_LAYOUT_DIRTY();
     }
     if (before.z_index != e->z_index)
         g_render_order_dirty = 1;
@@ -8840,7 +10287,8 @@ static void generate_pseudo_elements(void) {
         if (host->generated_pseudo) continue;
 
         /* Check only rules whose target key can match this host. */
-        uint64_t rule_candidates[LUNA_RULE_WORDS];
+        if (!g_rule_index_ready) rebuild_rule_index();
+        LUNA_SCRATCH(uint64_t, rule_candidates, g_rule_words);
         build_rule_candidates(host, rule_candidates);
         for (int order = rule_candidate_next(rule_candidates, -1);
              order >= 0 && elem_count < MAX_ELEMENTS;
@@ -8887,7 +10335,7 @@ static void generate_pseudo_elements(void) {
             /* Set position to absolute so it doesn't affect host flow */
             pe->position_mode = POS_ABSOLUTE;
             pe->opacity = 1.0f;
-            pe->transform_scale = 1.0f;
+            pe->transform_scale = 1.0f; pe->tf_ox = pe->tf_oy = 0.5f;
             pe->cur_scale = 1.0f;
             pe->anim_speed = 14.0f;
             pe->font_size = host->font_size > 0 ? host->font_size : 16;
@@ -8931,9 +10379,13 @@ static void set_html_base_dir(const char* layout_path) {
     if (strstr(g_html_base_dir, "://"))
         g_html_base_dir[strcspn(g_html_base_dir, "?#")] = '\0';
     char* slash = strrchr(g_html_base_dir, '/');
+    {   /* https://host has no path: the slash found is the one in "://", not a directory's */
+        const char* au = strstr(g_html_base_dir, "://");
+        if (au && slash < au + 3) slash = NULL;
+    }
     if (slash) {
         *slash = '\0';
-    } else if (strchr(g_html_base_dir, '.')) {
+    } else if (!strstr(g_html_base_dir, "://") && strchr(g_html_base_dir, '.')) {
         /* Bare filename like "demo.html" — resolve relative to cwd */
         g_html_base_dir[0] = '\0';
     }
@@ -9173,6 +10625,7 @@ static void parse_html_into(const char* html, int root_parent) {
 }
 
 static void parse_html_markup(const char* html, int root_parent) {
+    g_dom_struct_ver++;
     int parent_stack[64];
     int stack_ptr = 0;
     int current_parent = root_parent;
@@ -9200,7 +10653,22 @@ static void parse_html_markup(const char* html, int root_parent) {
 
         // Closing tag
         if (tag_start[1] == '/') {
-            if (stack_ptr > 0) stack_ptr--;
+            if (g_luna_web_compat) {
+                char close_type[32] = {0};
+                int n = 0;
+                const char* q = tag_start + 2;
+                while (*q && *q != '>' && *q != '/' && !isspace((unsigned char)*q) && n < 31)
+                    close_type[n++] = (char)tolower((unsigned char)*q++);
+                /* A close tag closes its matching element and descendants;
+                   an unmatched close tag does not remove an unrelated frame. */
+                for (int i = stack_ptr - 1; i >= 0; --i) {
+                    int idx = parent_stack[i];
+                    if (idx >= 0 && luna_strcasecmp(elements[idx].type, close_type) == 0) {
+                        stack_ptr = i;
+                        break;
+                    }
+                }
+            } else if (stack_ptr > 0) stack_ptr--;
             current_parent = (stack_ptr > 0) ? parent_stack[stack_ptr - 1] : root_parent;
             const char* gt = strchr(tag_start, '>');
             /* Text between this close tag and the next tag belongs to the
@@ -9216,13 +10684,18 @@ static void parse_html_markup(const char* html, int root_parent) {
             continue;
         }
 
-        const char* tag_end = strchr(tag_start, '>');
-        if (!tag_end) break;
+        /* The tag ends at the first '>' outside a quoted attribute value. */
+        const char* tag_end = tag_start + 1;
+        for (char q = 0; *tag_end && (q || *tag_end != '>'); ++tag_end) {
+            if (q) { if (*tag_end == q) q = 0; }
+            else if ((*tag_end == '"' || *tag_end == '\'') && tag_end[-1] == '=') q = *tag_end;
+        }
+        if (!*tag_end) break;
 
-        char tag_buf[512] = {0};
+        char tag_buf[4096] = {0};
         int tblen = (int)(tag_end - tag_start - 1);
-        if (tblen > 511) tblen = 511;
-        strncpy(tag_buf, tag_start + 1, tblen);
+        if (tblen > 4095) tblen = 4095;
+        memcpy(tag_buf, tag_start + 1, (size_t)tblen);
 
         // Detect self-closing />
         int is_self_closing = (tblen > 0 && tag_buf[tblen - 1] == '/');
@@ -9232,6 +10705,50 @@ static void parse_html_markup(const char* html, int root_parent) {
         // Strip trailing '/' from type
         int tl = (int)strlen(type);
         while (tl > 0 && (type[tl-1] == '/' || isspace((unsigned char)type[tl-1]))) type[--tl] = '\0';
+        for (int i = 0; type[i]; ++i) type[i] = (char)tolower((unsigned char)type[i]);
+
+        if (g_luna_web_compat) {
+            /* HTML permits these end tags to be omitted.  Keeping every <li>
+               or <td> open made ordinary documents deeply nested and left
+               later sections inside whichever hidden ancestor remained. */
+            const char* implicit = NULL;
+            const char* boundary = NULL;
+            if (!strcmp(type, "li")) { implicit = "li"; boundary = "list"; }
+            else if (!strcmp(type, "dt") || !strcmp(type, "dd")) { implicit = "definition"; boundary = "dl"; }
+            else if (!strcmp(type, "td") || !strcmp(type, "th")) { implicit = "cell"; boundary = "tr"; }
+            else if (!strcmp(type, "tr")) { implicit = "tr"; boundary = "table"; }
+            else if (!strcmp(type, "option")) { implicit = "option"; boundary = "select"; }
+            if (implicit) {
+                for (int i = stack_ptr - 1; i >= 0; --i) {
+                    int idx = parent_stack[i];
+                    if (idx < 0) continue;
+                    const char* open = elements[idx].type;
+                    int match = !strcmp(open, implicit) ||
+                        (!strcmp(implicit, "definition") && (!strcmp(open, "dt") || !strcmp(open, "dd"))) ||
+                        (!strcmp(implicit, "cell") && (!strcmp(open, "td") || !strcmp(open, "th")));
+                    if (match) { stack_ptr = i; break; }
+                    if (!strcmp(open, boundary) ||
+                        (!strcmp(boundary, "list") && (!strcmp(open, "ul") || !strcmp(open, "ol")))) break;
+                }
+            }
+            static const char* close_p[] = {"address","article","aside","blockquote","details","div","dl",
+                "fieldset","figcaption","figure","footer","form","h1","h2","h3","h4","h5","h6",
+                "header","hgroup","hr","li","dt","dd","main","menu","nav","ol","p","pre",
+                "section","table","ul",NULL};
+            int ends_p = 0;
+            for (int i = 0; close_p[i]; ++i) if (!strcmp(type, close_p[i])) { ends_p = 1; break; }
+            if (ends_p) {
+                for (int i = stack_ptr - 1; i >= 0; --i) {
+                    int idx = parent_stack[i];
+                    if (idx < 0) continue;
+                    const char* open = elements[idx].type;
+                    if (!strcmp(open, "p")) { stack_ptr = i; break; }
+                    if (!strcmp(open, "button") || !strcmp(open, "td") || !strcmp(open, "th") ||
+                        !strcmp(open, "table") || !strcmp(open, "body")) break;
+                }
+            }
+            current_parent = stack_ptr > 0 ? parent_stack[stack_ptr - 1] : root_parent;
+        }
 
         if (luna_strcasecmp(type, "link") == 0) {
             if (tag_is_stylesheet_link(tag_buf)) {
@@ -9257,22 +10774,28 @@ static void parse_html_markup(const char* html, int root_parent) {
                 strncpy(g_doc_title, text_start, (size_t)tlen);
                 g_doc_title[tlen] = '\0';
                 trim_whitespace(g_doc_title);
+                decode_html_entities(g_doc_title);
             }
-            p = close_title ? strchr(close_title, '>') + 1 : tag_end + 1;
-            continue;
+            if (!g_luna_web_compat) {
+                p = close_title ? strchr(close_title, '>') + 1 : tag_end + 1;
+                continue;
+            }
         }
 
-        // Skip style/script content (style ingests CSS; script is ignored)
+        /* Native UI skips nonvisual content.  Web documents retain it in the
+           DOM below; style still supplies the stylesheet. */
         if (luna_strcasecmp(type, "style") == 0) {
             const char* css_start = tag_end + 1;
             const char* close_pos = luna_strcasestr_local(css_start, "</style>");
             if (close_pos && close_pos > css_start)
                 ingest_inline_style(css_start, (int)(close_pos - css_start));
             const char* gt2 = close_pos ? strchr(close_pos, '>') : NULL;
-            p = gt2 ? gt2 + 1 : tag_end + 1;
-            continue;
+            if (!g_luna_web_compat) {
+                p = gt2 ? gt2 + 1 : tag_end + 1;
+                continue;
+            }
         }
-        if (luna_strcasecmp(type, "script") == 0) {
+        if (!g_luna_web_compat && luna_strcasecmp(type, "script") == 0) {
             char close_tag[40]; snprintf(close_tag, sizeof(close_tag), "</%s", type);
             const char* close_pos = luna_strcasestr_local(tag_end + 1, close_tag);
             const char* gt2 = close_pos ? strchr(close_pos, '>') : NULL;
@@ -9298,7 +10821,7 @@ static void parse_html_markup(const char* html, int root_parent) {
                 strncpy(elements[bi].type, "body", sizeof(elements[bi].type) - 1);
                 elements[bi].dom_uid = ++g_dom_uid_seq;
                 elements[bi].dom_attrs = dom_attrs_from_tag(tag_buf);
-                char bcls[96] = {0};
+                char bcls[LUNA_CLASS_CAP] = {0};
                 extract_html_attr(tag_buf, "class", bcls, sizeof(bcls));
                 snprintf(elements[bi].class_name, sizeof(elements[bi].class_name), "%s", bcls);
                 extract_html_attr(tag_buf, "id", elements[bi].id, sizeof(elements[bi].id));
@@ -9306,9 +10829,9 @@ static void parse_html_markup(const char* html, int root_parent) {
                                       sizeof(elements[bi].inline_style)))
                     elements[bi].has_inline_style = elements[bi].inline_style[0] != '\0';
                 elements[bi].id_idx = bi;
-                elements[bi].parent_idx = -1;
+                elements[bi].parent_idx = -1; g_dom_struct_ver++;
                 elements[bi].opacity = 1.0f;
-                elements[bi].transform_scale = 1.0f;
+                elements[bi].transform_scale = 1.0f; elements[bi].tf_ox = elements[bi].tf_oy = 0.5f;
                 elements[bi].cur_scale = 1.0f;
                 elements[bi].anim_speed = 14.0f;
                 update_element_style(&elements[bi]);
@@ -9329,12 +10852,33 @@ static void parse_html_markup(const char* html, int root_parent) {
             continue;
         }
 
-        if (is_semantic_shell_element(type)) {
+        const int dom_head = g_luna_web_compat && luna_strcasecmp(type, "head") == 0;
+        const int dom_raw = g_luna_web_compat &&
+            (luna_strcasecmp(type, "script") == 0 ||
+             luna_strcasecmp(type, "style") == 0 ||
+             luna_strcasecmp(type, "title") == 0 ||
+             luna_strcasecmp(type, "iframe") == 0 ||
+             luna_strcasecmp(type, "noscript") == 0);
+        const char* raw_end = NULL;
+        const char* raw_after = NULL;
+        if (dom_raw) {
+            char close_tag[40];
+            snprintf(close_tag, sizeof(close_tag), "</%s", type);
+            raw_end = luna_strcasestr_local(tag_end + 1, close_tag);
+            while (raw_end && raw_end[strlen(close_tag)] != '>' &&
+                   !isspace((unsigned char)raw_end[strlen(close_tag)]))
+                raw_end = luna_strcasestr_local(raw_end + 2, close_tag);
+            if (!raw_end) raw_end = tag_end + 1 + strlen(tag_end + 1);
+            const char* gt = *raw_end ? strchr(raw_end, '>') : NULL;
+            raw_after = gt ? gt + 1 : raw_end;
+        }
+
+        if (is_semantic_shell_element(type) && !dom_head && !dom_raw) {
             p = tag_end + 1;
             continue;
         }
 
-        if (is_ignored_element(type)) {
+        if (is_ignored_element(type) && !dom_head && !dom_raw) {
             if (!is_void_element(type) && !is_self_closing &&
                 luna_strcasecmp(type, "html") != 0 && luna_strcasecmp(type, "head") != 0 &&
                 luna_strcasecmp(type, "body") != 0) {
@@ -9345,7 +10889,7 @@ static void parse_html_markup(const char* html, int root_parent) {
             continue;
         }
 
-        char id[64] = {0}, class_name[96] = {0};
+        char id[64] = {0}, class_name[LUNA_CLASS_CAP] = {0};
         int draggable = 0;
         char onclick_expr[96] = {0};
         char style_attr[256] = {0};
@@ -9358,6 +10902,28 @@ static void parse_html_markup(const char* html, int root_parent) {
         if (!extract_html_attr(tag_buf, "onclick", onclick_expr, sizeof(onclick_expr)))
             extract_html_attr(tag_buf, "onClick", onclick_expr, sizeof(onclick_expr));
         extract_html_attr(tag_buf, "style", style_attr, sizeof(style_attr));
+        int svg_src_idx = 0;
+        if (g_luna_web_compat && luna_strcasecmp(type, "svg") == 0) {
+            const char* svg_close = luna_strcasestr_local(tag_end + 1, "</svg");
+            const char* svg_gt = svg_close ? strchr(svg_close, '>') : NULL;
+            if (svg_gt && !is_self_closing) svg_src_idx = luna_svg_intern(tag_start, (size_t)(svg_gt + 1 - tag_start));
+            char sw[32] = {0}, sh[32] = {0}, sized[200] = {0};
+            extract_html_attr(tag_buf, "width", sw, sizeof sw);
+            extract_html_attr(tag_buf, "height", sh, sizeof sh);
+            if (sw[0] && !strchr(sw, ';') && !strchr(sw, '"')) {
+                const char* unit = (strpbrk(sw, "%") || strstr(sw, "em") || strstr(sw, "px")) ? "" : "px";
+                snprintf(sized + strlen(sized), sizeof sized - strlen(sized), "width:%s%s;", sw, unit);
+            }
+            if (sh[0] && !strchr(sh, ';') && !strchr(sh, '"')) {
+                const char* unit = (strpbrk(sh, "%") || strstr(sh, "em") || strstr(sh, "px")) ? "" : "px";
+                snprintf(sized + strlen(sized), sizeof sized - strlen(sized), "height:%s%s;", sh, unit);
+            }
+            if (sized[0]) {
+                char merged[256];
+                snprintf(merged, sizeof merged, "%s%s", sized, style_attr);
+                snprintf(style_attr, sizeof style_attr, "%s", merged);
+            }
+        }
         extract_html_attr(tag_buf, "data-tab", data_tab, sizeof(data_tab));
         int tabindex = -2;
         if (extract_html_attr(tag_buf, "tabindex", attr_value, sizeof(attr_value)))
@@ -9398,14 +10964,14 @@ static void parse_html_markup(const char* html, int root_parent) {
            whole content; otherwise it is a run among its children (or, after
            a void element, among its siblings). */
         int web_run = 0;
-        if (g_luna_web_compat && next_tag) {
+        if (g_luna_web_compat && next_tag && !dom_raw) {
             size_t tl = strlen(type);
             int own_close = next_tag[1] == '/' && strncasecmp(next_tag + 2, type, tl) == 0 &&
                             (next_tag[2 + tl] == '>' || isspace((unsigned char)next_tag[2 + tl]));
             web_run = is_void_element(type) || is_self_closing || !own_close ||
                       (int)(next_tag - tag_end - 1) >= (int)sizeof(text) - 1;
         }
-        if (next_tag && !web_run) {
+        if (next_tag && !web_run && !dom_raw) {
             int text_len = (int)(next_tag - tag_end - 1);
             if (text_len > 0 && text_len < (int)sizeof(text) - 1) {
                 strncpy(text, tag_end + 1, text_len);
@@ -9430,6 +10996,7 @@ static void parse_html_markup(const char* html, int root_parent) {
         snprintf(e.aria_label, sizeof(e.aria_label), "%s", aria_label);
         snprintf(e.role, sizeof(e.role), "%s", role);
         snprintf(e.type, sizeof(e.type), "%s", type);
+        e.svg_src = svg_src_idx;
         snprintf(e.class_name, sizeof(e.class_name), "%s", class_name);
         snprintf(e.id, sizeof(e.id), "%s", id);
         snprintf(e.text, sizeof(e.text), "%s", text);
@@ -9487,6 +11054,16 @@ static void parse_html_markup(const char* html, int root_parent) {
 
         if (!luna_ensure_element_capacity(elem_count + 1)) break;
         e.dom_attrs = dom_attrs_from_tag(tag_buf);
+        if (dom_raw) {
+            size_t n = (size_t)(raw_end - tag_end - 1);
+            e.dom_raw_text = (char*)malloc(n + 1);
+            if (e.dom_raw_text) {
+                memcpy(e.dom_raw_text, tag_end + 1, n);
+                e.dom_raw_text[n] = '\0';
+                if (luna_strcasecmp(type, "title") == 0)
+                    decode_html_entities(e.dom_raw_text);
+            }
+        }
         elements[elem_count] = e;
         update_element_style(&elements[elem_count]);
 
@@ -9495,18 +11072,25 @@ static void parse_html_markup(const char* html, int root_parent) {
         ne->cur_bd_r = ne->bd_r; ne->cur_bd_g = ne->bd_g;
         ne->cur_bd_b = ne->bd_b; ne->cur_bd_a = ne->bd_a;
 
-        if (!is_void_element(type) && !is_self_closing && stack_ptr < 63) {
+        if (!dom_raw && !is_void_element(type) && !is_self_closing && stack_ptr < 63) {
             parent_stack[stack_ptr++] = elem_count;
             current_parent = elem_count;
         }
         elem_count++;
-        p = tag_end + 1;
+        p = dom_raw ? raw_after : tag_end + 1;
         if (web_run && next_tag) web_text_run(current_parent, tag_end + 1, next_tag, &pending_ws);
     }
 
     /* Structural pseudo-classes depend on the FINAL sibling set.  Skip this
        O(elements) second restyle for the common case where the stylesheet has
        none; parent-before-child parsing already produced final computed style. */
+    if (g_restyle_deferred) {
+        /* the host flushes once, before it reads style or layout */
+        if (g_has_structural_selectors) g_restyle_pending = 2;   /* 2: also settle cur_* */
+        g_pseudo_pending = 1;
+        LUNA_LAYOUT_DIRTY();
+        return;
+    }
     if (g_has_structural_selectors) {
         for (int i = 0; i < elem_count; i++) {
             LunaElement* e = &elements[i];
@@ -9519,7 +11103,7 @@ static void parse_html_markup(const char* html, int root_parent) {
     }
     /* Generate ::before / ::after pseudo-element nodes */
     generate_pseudo_elements();
-    g_layout_dirty = 1;
+    LUNA_LAYOUT_DIRTY();
 }
 
 void parse_html(const char* html) { parse_html_into(html, -1); }
@@ -9744,6 +11328,25 @@ static float css_normal_line_height(float font_size) {
 
 float luna_line_height(float css_px) { return css_normal_line_height(css_px); }
 
+int luna_get_font_metrics(float css_px, int bold, LunaFontMetrics* metrics) {
+    if (!metrics) return 0;
+    memset(metrics, 0, sizeof *metrics);
+    if (!g_font_info_ok || !isfinite(css_px) || css_px < 0.0f) return 0;
+    stbtt_fontinfo* font = bold && g_bold_font_info_ok ? &g_bold_font_info : &g_font_info;
+    int ascent, descent, gap, x0, y0, x1, y1;
+    stbtt_GetFontVMetrics(font, &ascent, &descent, &gap);
+    stbtt_GetFontBoundingBox(font, &x0, &y0, &x1, &y1);
+    float scale = stbtt_ScaleForMappingEmToPixels(font, css_px);
+    /* Font coordinates point up; Android baselines use downward-positive Y.
+     * These are face metrics, independent of text, atlas and GL context. */
+    metrics->top = -(float)y1 * scale;
+    metrics->ascent = -(float)ascent * scale;
+    metrics->descent = -(float)descent * scale;
+    metrics->bottom = -(float)y0 * scale;
+    metrics->leading = (float)gap * scale;
+    return 1;
+}
+
 float luna_measure_text(const char* text, float css_px, int bold) {
     if (!text || css_px <= 0.0f) return 0.0f;
     const int saved_bold = g_font_bold_hint;
@@ -9887,12 +11490,78 @@ static float flow_leaf_text_height(LunaElement* e) {
 static float intrinsic_content_width(LunaElement* e);
 static float flow_content_height(LunaElement* e);
 
+/* Does the box containing `idx`'s children have a definite height, so that
+ * `height: 100%` on a child means something?  CSS computes a percentage height
+ * to auto when it does not.  Inline parents are skipped (they are not
+ * containing blocks); the root and positioned/flex/grid/table boxes are
+ * trusted as the engine sized them. */
+static int containing_height_definite(int idx) {
+    for (int guard = 0; guard < 64 && idx >= 0 && idx < elem_count; guard++) {
+        const LunaElement* p = &elements[idx];
+        if (p->inline_level == 1) { idx = p->parent_idx; continue; }
+        if (p->has_css_height && !p->pct_h) return 1;
+        if (p->pct_h) { idx = p->parent_idx; continue; }
+        if (p->parent_idx < 0) return 1;
+        if (!strcmp(p->type, "body") || !strcmp(p->type, "html")) return 1;
+        if (p->position_mode == POS_ABSOLUTE || p->position_fixed) return 1;
+        if (p->flex_child || p->display_mode == DISPLAY_FLEX || p->display_mode == DISPLAY_GRID ||
+            p->display_mode >= DISPLAY_TABLE) return 1;
+        return 0;
+    }
+    return 1;
+}
+static float min_content_width(LunaElement* e);
+static float table_run(int tidx, int mode, float W, float* out_h);
+
+typedef struct {
+    float x, y, w, bottom;
+    int side;
+} FlowFloat;
+
+static float flow_float_width(LunaElement* e, float available) {
+    float w;
+    if (e->pct_w) w = css_outer_width(e, available * e->raw_w + e->raw_w_off);
+    else if (e->has_css_width) w = css_outer_width(e, e->css_width);
+    else {
+        w = intrinsic_content_width(e);
+        float fit = available - e->margin_left - e->margin_right;
+        if (fit < 0.0f) fit = 0.0f;
+        if (w > fit) w = fit;
+    }
+    return w;
+}
+
+static float flow_clearance(const FlowFloat* floats, int n, int sides) {
+    float bottom = 0.0f;
+    for (int i = 0; i < n; ++i)
+        if ((floats[i].side & sides) && floats[i].bottom > bottom) bottom = floats[i].bottom;
+    return bottom;
+}
+
+static FlowFloat flow_place_float(const FlowFloat* floats, int n, float available,
+                                 float y, float w, float h, int side) {
+    if (n && y < floats[n - 1].y) y = floats[n - 1].y;
+    for (;;) {
+        float left = 0.0f, right = available, next = INFINITY;
+        for (int i = 0; i < n; ++i) {
+            const FlowFloat* f = &floats[i];
+            if (y < f->y || y >= f->bottom) continue;
+            if (f->side == 1 && f->x + f->w > left) left = f->x + f->w;
+            if (f->side == 2 && f->x < right) right = f->x;
+            if (f->bottom < next) next = f->bottom;
+        }
+        if (w <= right - left + 0.01f || !isfinite(next))
+            return (FlowFloat){side == 2 ? right - w : left, y, w, y + h, side};
+        y = next;
+    }
+}
+
 static int has_inline_children(int idx) {
     const LunaElement* cont = &elements[idx];
     if (cont->display_mode == DISPLAY_FLEX || cont->display_mode == DISPLAY_GRID) return 0;
-    for (int c = idx + 1; c < elem_count; c++) {
+    LUNA_FOR_KIDS(c, idx) {
         const LunaElement* ch = &elements[c];
-        if (ch->parent_idx != idx || !ch->inline_level || ch->display_none) continue;
+        if (!ch->inline_level || ch->display_none) continue;
         if (ch->position_mode == POS_ABSOLUTE || ch->position_fixed) continue;
         return 1;
     }
@@ -9920,10 +11589,20 @@ static int inline_leading_ws(int idx) {
     return 0;
 }
 
+/* Height of a box whose width is known and whose aspect ratio is (an <img> with
+ * width:100% and auto height); -1 when the box has no such shape. */
+static float aspect_height(const LunaElement* ch) {
+    if (!ch->has_aspect_ratio || ch->aspect_ratio <= 0.0f || ch->w <= 0.0f) return -1.0f;
+    if (ch->has_css_height || ch->pct_h) return -1.0f;
+    return ch->w / ch->aspect_ratio;
+}
+
 static float inline_item_height(LunaElement* ch) {
     float h;
     if (ch->has_css_height && !ch->pct_h && ch->inline_level == 2)
         h = css_outer_height(ch, ch->css_height);
+    else if (aspect_height(ch) >= 0.0f)
+        h = aspect_height(ch);                       /* <img width:100%> keeps the picture's shape */
     else h = flow_content_height(ch);
     if (ch->is_input && !ch->has_css_height && !ch->pct_h) {
         float lines = ch->input_multiline ? 2.0f : 1.0f;
@@ -9940,19 +11619,23 @@ static float inline_flow(int idx, float inner_w, int place) {
     const float x0 = cont->border_width + cont->pad_l;
     const float y0 = cont->border_width + cont->pad_t;
     const float space_w = (cont->font_size > 0 ? cont->font_size : 16.0f) * 0.28f;
-    int line[MAX_ELEMENTS];
+    LUNA_SCRATCH(int, line, elem_count + 1);
     int n = 0;
     float line_x = 0.0f, line_h = 0.0f, y = 0.0f;
-    for (int c = idx + 1; c <= elem_count; c++) {
-        LunaElement* ch = c < elem_count ? &elements[c] : NULL;
+    LUNA_SCRATCH(FlowFloat, floats, elem_count + 1);
+    int float_count = 0;
+    int flow_last = 0;
+    for (int c = luna_first_kid(idx); !flow_last; c = c >= 0 ? g_kid_next[c] : -1) {
+        LunaElement* ch = c >= 0 ? &elements[c] : NULL;
         int end = !ch;
+        if (end) flow_last = 1;
         int is_block = 0, is_br = 0;
         if (ch) {
             if (ch->parent_idx != idx || !is_visible(c) || ch->position_fixed) continue;
             if (ch->position_mode == POS_ABSOLUTE || (ch->css_positioned & 3)) continue;
             ch->flow_child = 1;
             is_br = strcmp(ch->type, "br") == 0;
-            is_block = !ch->inline_level;
+            is_block = !ch->inline_level || ch->css_float;
         }
         float w = 0.0f, h = 0.0f, sp = 0.0f;
         if (ch && !is_block && !is_br) {
@@ -10014,12 +11697,31 @@ static float inline_flow(int idx, float inner_w, int place) {
             continue;
         }
         if (is_block) {
+            if (ch->css_float) {
+                ch->w = flow_float_width(ch, inner_w);
+                if (!ch->has_css_height && !ch->pct_h) ch->h = flow_content_height(ch);
+                float start_y = y;
+                float clear = flow_clearance(floats, float_count, ch->css_clear);
+                if (start_y < clear) start_y = clear;
+                FlowFloat placed = flow_place_float(floats, float_count, inner_w, start_y,
+                    ch->w + ch->margin_left + ch->margin_right,
+                    ch->h + ch->margin_top + ch->margin_bottom, ch->css_float);
+                floats[float_count++] = placed;
+                if (place) { ch->rel_x = x0 + placed.x; ch->rel_y = y0 + placed.y; }
+                continue;
+            }
+            float clear = flow_clearance(floats, float_count, ch->css_clear);
+            if (y < clear) y = clear;
             /* A block among inline content: its own line, full width. */
             if (ch->pct_w) ch->w = inner_w * ch->raw_w;
             else if (!ch->has_css_width) ch->w = inner_w - ch->margin_left - ch->margin_right;
             if (ch->w < 0.0f) ch->w = 0.0f;
-            if (!ch->has_css_height && !ch->pct_h) ch->h = flow_content_height(ch);
-            if (place) { ch->rel_x = x0; ch->rel_y = y0 + y; }
+            if (!ch->has_css_height && !ch->pct_h)
+                ch->h = aspect_height(ch) >= 0.0f ? aspect_height(ch) : flow_content_height(ch);
+            float free_w = inner_w - ch->w - ch->margin_left - ch->margin_right;
+            if (free_w < 0.0f) free_w = 0.0f;
+            float auto_left = ch->margin_left_auto ? (ch->margin_right_auto ? free_w * 0.5f : free_w) : 0.0f;
+            if (place) { ch->rel_x = x0 + auto_left; ch->rel_y = y0 + y; }
             y += ch->margin_top + ch->h + ch->margin_bottom;
             continue;
         }
@@ -10035,6 +11737,11 @@ static float inline_flow(int idx, float inner_w, int place) {
 
 static float flow_content_height(LunaElement* e) {
     int idx = (int)(e - elements);
+    if (e->display_mode == DISPLAY_TABLE && idx >= 0 && idx < elem_count) {
+        float th = 0.0f;
+        table_run(idx, 2, e->w, &th);
+        return th;
+    }
     if (idx >= 0 && idx < elem_count && has_inline_children(idx)) {
         float inner_w = e->w - e->pad_l - e->pad_r - e->border_width * 2.0f;
         if (inner_w < 0.0f) inner_w = 0.0f;
@@ -10046,13 +11753,12 @@ static float flow_content_height(LunaElement* e) {
        wrap row); otherwise fall back to a single text line. Without this, an
        auto-height container collapses to one line-height and then flex-shrink
        crushes its children (e.g. #sidebar_nav squashing its 34px nav items). */
-    int kids[MAX_ELEMENTS];
-    float kid_h[MAX_ELEMENTS];
+    LUNA_SCRATCH(int, kids, elem_count + 1);
+    LUNA_SCRATCH(float, kid_h, elem_count + 1);
     int n = 0;
     float total = 0.0f, maxh = 0.0f;
-    for (int c = 0; c < elem_count; c++) {
+    LUNA_FOR_KIDS(c, idx) {
         LunaElement* ch = &elements[c];
-        if (ch->parent_idx != idx) continue;
         if (!is_visible(c)) continue;
         if (ch->position_mode == POS_ABSOLUTE || ch->position_fixed) continue;
         float chh;
@@ -10061,7 +11767,12 @@ static float flow_content_height(LunaElement* e) {
                 ? ch->css_height + ch->pad_t + ch->pad_b + ch->border_width * 2.0f
                 : ch->css_height;
         } else if (ch->pct_h) {
-            chh = 0.0f;              /* percentage height is not a definite size here */
+            /* This box is being measured because its own height is auto, so a
+             * child's `height: 100%` cannot refer to it: CSS computes it to auto. */
+            chh = flow_content_height(ch);
+        } else if (ch->has_aspect_ratio && ch->aspect_ratio > 0.0f && ch->pct_w) {
+            float iw = e->w - e->pad_l - e->pad_r - e->border_width * 2.0f;
+            chh = (iw > 0.0f ? iw * ch->raw_w + ch->raw_w_off : 0.0f) / ch->aspect_ratio;
         } else {
             chh = flow_content_height(ch);   /* recurse for auto-height children */
         }
@@ -10164,17 +11875,42 @@ static float flow_content_height(LunaElement* e) {
                with CSS margin collapsing. */
             inner = 0.0f;
             float previous_bottom = 0.0f;
+            int have_previous = 0, float_count = 0, has_floats = 0;
+            for (int k = 0; k < n; ++k) if (elements[kids[k]].css_float) { has_floats = 1; break; }
+            FlowFloat* floats = has_floats ? (FlowFloat*)malloc((size_t)n * sizeof(*floats)) : NULL;
+            float available = e->w - e->pad_l - e->pad_r - e->border_width * 2.0f;
+            if (available < 0.0f) available = 0.0f;
             for (int k = 0; k < n; k++) {
                 LunaElement* ch = &elements[kids[k]];
                 float border_h = kid_h[k] - ch->margin_top - ch->margin_bottom;
                 if (border_h < 0.0f) border_h = 0.0f;
-                inner += (k == 0)
-                    ? ch->margin_top
-                    : collapse_vertical_margins(previous_bottom, ch->margin_top);
+                if (floats && ch->css_float) {
+                    float y = inner + previous_bottom;
+                    float clear = flow_clearance(floats, float_count, ch->css_clear);
+                    if (y < clear) y = clear;
+                    floats[float_count] = flow_place_float(floats, float_count, available, y,
+                        flow_float_width(ch, available) + ch->margin_left + ch->margin_right,
+                        kid_h[k], ch->css_float);
+                    float_count++;
+                    continue;
+                }
+                inner += have_previous
+                    ? collapse_vertical_margins(previous_bottom, ch->margin_top) : ch->margin_top;
+                float clear = flow_clearance(floats, float_count, ch->css_clear);
+                if (inner < clear) inner = clear;
                 inner += border_h;
                 previous_bottom = ch->margin_bottom;
+                have_previous = 1;
             }
             inner += previous_bottom;
+            /* Floats participate in the auto height of a formatting context,
+               but not of an ordinary block without a clearing child. */
+            if (e->css_float || e->parent_idx < 0 ||
+                e->overflow_x != OVERFLOW_VISIBLE || e->overflow_y != OVERFLOW_VISIBLE) {
+                float bottom = flow_clearance(floats, float_count, 3);
+                if (inner < bottom) inner = bottom;
+            }
+            free(floats);
         }
         return inner + e->pad_t + e->pad_b + e->border_width * 2.0f;
     }
@@ -10195,9 +11931,14 @@ static float intrinsic_content_width(LunaElement* e) {
         goto done;
     }
 
-    for (int c = 0; c < elem_count; c++) {
+    if (e->display_mode == DISPLAY_TABLE && idx >= 0 && idx < elem_count) {
+        result = table_run(idx, 0, 0.0f, NULL);
+        goto done;
+    }
+
+    LUNA_FOR_KIDS(c, idx) {
         LunaElement* ch = &elements[c];
-        if (ch->parent_idx != idx || !is_visible(c)) continue;
+        if (!is_visible(c)) continue;
         if (ch->position_mode == POS_ABSOLUTE || ch->position_fixed) continue;
         float cw = ch->pct_w ? 0.0f : intrinsic_content_width(ch);
         if (ch->has_min_width && cw < ch->css_min_width) cw = ch->css_min_width;
@@ -10290,9 +12031,15 @@ static float min_content_width(LunaElement* e) {
 
     float result = 0.0f, total = 0.0f, maxw = 0.0f;
     int n = 0;
-    for (int c = 0; c < elem_count; c++) {
+    if (e->display_mode == DISPLAY_TABLE && idx >= 0 && idx < elem_count) {
+        result = table_run(idx, 1, 0.0f, NULL);
+        g_min_content_width_cache[idx] = result;
+        g_min_content_width_valid[idx] = 1;
+        return result;
+    }
+    LUNA_FOR_KIDS(c, idx) {
         LunaElement* ch = &elements[c];
-        if (ch->parent_idx != idx || !is_visible(c) ||
+        if (!is_visible(c) ||
             ch->position_mode == POS_ABSOLUTE || ch->position_fixed) continue;
         float cw = min_content_width(ch) + ch->margin_left + ch->margin_right;
         if (ch->has_min_width) {
@@ -10378,6 +12125,8 @@ static void layout_block_container(int container_idx) {
     float y = cont->border_width + cont->pad_t;
     float previous_bottom = 0.0f;
     int have_previous = 0;
+    LUNA_SCRATCH(FlowFloat, floats, elem_count + 1);
+    int float_count = 0;
 
     if (has_inline_children(container_idx)) {
         y += inline_flow(container_idx, inner_w, 1);
@@ -10386,15 +12135,16 @@ static void layout_block_container(int container_idx) {
         goto flowed;
     }
 
-    for (int c = 0; c < elem_count; c++) {
-        if (elements[c].parent_idx != container_idx) continue;
+    LUNA_FOR_KIDS(c, container_idx) {
         if (!is_visible(c) || elements[c].position_fixed) continue;
         if (is_out_of_flow(c)) continue;
 
         LunaElement* ch = &elements[c];
         ch->flow_child = 1;
 
-        if (ch->pct_w) {
+        if (ch->css_float) {
+            ch->w = flow_float_width(ch, inner_w);
+        } else if (ch->pct_w) {
             ch->w = inner_w * ch->raw_w;
         } else if (!ch->has_css_width) {
             /* The browser UA stylesheet makes form controls inline-block.
@@ -10406,6 +12156,12 @@ static void layout_block_container(int container_idx) {
                                   strcmp(ch->type, "textarea") == 0;
             if (inline_control) {
                 ch->w = intrinsic_content_width(ch);
+            } else if (ch->display_mode == DISPLAY_TABLE) {
+                /* An auto-width table shrinks to its content, no wider than
+                 * the containing block unless its columns cannot be narrower. */
+                float avail = inner_w - ch->margin_left - ch->margin_right;
+                float mx = intrinsic_content_width(ch), mn = min_content_width(ch);
+                ch->w = mx <= avail ? mx : (avail > mn ? avail : mn);
             } else {
                 /* width:auto fills the containing block after ordinary
                  * margins. Auto margins resolve to zero when width itself is
@@ -10416,7 +12172,7 @@ static void layout_block_container(int container_idx) {
         }
 
         if (!ch->has_css_height && !ch->pct_h) {
-            ch->h = flow_content_height(ch);
+            ch->h = aspect_height(ch) >= 0.0f ? aspect_height(ch) : flow_content_height(ch);
         }
         if (ch->has_min_height) {
             float min_h = css_outer_height(ch, ch->css_min_height);
@@ -10425,6 +12181,19 @@ static void layout_block_container(int container_idx) {
         if (ch->has_max_height) {
             float max_h = resolved_max_height(ch, inner_h);
             if (ch->h > max_h) ch->h = max_h;
+        }
+
+        if (ch->css_float) {
+            float start_y = y + previous_bottom;
+            float clear = flow_clearance(floats, float_count, ch->css_clear);
+            if (start_y < clear) start_y = clear;
+            FlowFloat placed = flow_place_float(floats, float_count, inner_w, start_y,
+                ch->w + ch->margin_left + ch->margin_right,
+                ch->h + ch->margin_top + ch->margin_bottom, ch->css_float);
+            floats[float_count++] = placed;
+            ch->rel_x = cont->border_width + cont->pad_l + placed.x;
+            ch->rel_y = placed.y;
+            continue;
         }
 
         /* Horizontal auto margins center/final-align fixed-width block boxes.
@@ -10439,12 +12208,16 @@ static void layout_block_container(int container_idx) {
             auto_left = auto_space * 0.5f;
         else if (ch->margin_left_auto)
             auto_left = auto_space;
+        else if (ch->display_mode == DISPLAY_TABLE && cont->text_align == 1)
+            auto_left = auto_space * 0.5f;      /* <center><table> */
 
         ch->rel_x = cont->border_width + cont->pad_l + auto_left;
         float collapsed_before = have_previous
             ? collapse_vertical_margins(previous_bottom, ch->margin_top)
             : ch->margin_top;
         float border_y = y + collapsed_before;
+        float clear = flow_clearance(floats, float_count, ch->css_clear);
+        if (border_y < clear) border_y = clear;
         /* Global position resolution adds margin_top once.  Store the
            pre-margin coordinate so the final border edge lands at border_y. */
         ch->rel_y = border_y - ch->margin_top;
@@ -10459,7 +12232,10 @@ flowed:
     /* height:auto on absolute/fixed → shrink-wrap in-flow children (browser parity).
        Without this, menus/panels keep a collapsed height and only paint a short
        background while children draw outside the panel. */
-    if (!cont->has_css_height && !cont->pct_h &&
+    if (aspect_height(cont) >= 0.0f && (cont->position_mode == POS_ABSOLUTE || cont->position_fixed) &&
+        !(cont->has_top && cont->has_bottom)) {
+        cont->h = aspect_height(cont);               /* an <img> keeps its picture's shape */
+    } else if (!cont->has_css_height && !cont->pct_h &&
         !(cont->has_top && cont->has_bottom) &&
         (cont->position_mode == POS_ABSOLUTE || cont->position_fixed)) {
         float auto_h = y + cont->pad_b;
@@ -10592,7 +12368,10 @@ void update_layout() {
         }
 
         if (e->pct_w) e->w = parent_w * e->raw_w + e->raw_w_off;
-        if (e->pct_h) e->h = parent_h * e->raw_h + e->raw_h_off;
+        if (e->pct_h) {
+            if (par >= 0 && !use_cb && !containing_height_definite(par)) e->h = flow_content_height(e);
+            else e->h = parent_h * e->raw_h + e->raw_h_off;
+        }
 
         if (e->has_css_width && !e->pct_w) {
             if (e->box_sizing == BOX_CONTENT)
@@ -10651,7 +12430,7 @@ void update_layout() {
         if (e->has_max_height && e->h > max_h) e->h = max_h;
         /* aspect-ratio: if one dimension known, compute the other */
         if (e->has_aspect_ratio && e->aspect_ratio > 0.0f) {
-            if (e->has_css_width && !e->has_css_height)
+            if ((e->has_css_width || e->pct_w) && !e->has_css_height && !e->pct_h)
                 e->h = e->w / e->aspect_ratio;
             else if (e->has_css_height && !e->has_css_width)
                 e->w = e->h * e->aspect_ratio;
@@ -10867,8 +12646,8 @@ static float resolve_flex_cross_len(LunaElement* ch, int row_mode, int align,
 static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
                              float pad_main, float pad_cross,
                              float inner_main, float inner_cross, float pct_cross, float gap) {
-    float main_sz[MAX_ELEMENTS];
-    float shrink_base[MAX_ELEMENTS];
+    LUNA_SCRATCH(float, main_sz, elem_count + 1);
+    LUNA_SCRATCH(float, shrink_base, elem_count + 1);
     float fixed_main = 0.0f;
     int grow_n = 0;
     float grow_sum = 0.0f;
@@ -10923,7 +12702,7 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
          * A one-pass clamp leaves unresolved overflow in the line and makes
          * centered toolbars spill beyond their container at narrow widths. */
         float overflow = -free_main;
-        unsigned char frozen[MAX_ELEMENTS] = {0};
+        LUNA_SCRATCH_ZERO(unsigned char, frozen, elem_count + 1);
 
         for (int pass = 0; pass < n && overflow > 0.01f; pass++) {
             float shrink_sum = 0.0f;
@@ -11090,10 +12869,9 @@ static void layout_inline_text_after_flex(LunaElement* cont, const int* kids, in
 
 static void layout_flex_container(int container_idx) {
     LunaElement* cont = &elements[container_idx];
-    int kids[MAX_ELEMENTS];
+    LUNA_SCRATCH(int, kids, elem_count + 1);
     int n = 0;
-    for (int c = 0; c < elem_count; c++) {
-        if (elements[c].parent_idx != container_idx) continue;
+    LUNA_FOR_KIDS(c, container_idx) {
         if (!is_visible(c) || elements[c].position_fixed) continue;
         // Absolutely positioned children are out of flow — don't include in flex layout.
         if (elements[c].position_mode == POS_ABSOLUTE) continue;
@@ -11109,6 +12887,19 @@ static void layout_flex_container(int container_idx) {
     float inner_h = cont->h - cont->pad_t - cont->pad_b - cont->border_width * 2.0f;
     if (inner_w < 0.0f) inner_w = 0.0f;
     if (inner_h < 0.0f) inner_h = 0.0f;
+    /* min-width: <n>% is a share of this container. */
+    for (int k = 0; k < n; k++) {
+        LunaElement* ch = &elements[kids[k]];
+        if (ch->min_width_pct) ch->css_min_width = ch->raw_min_width * inner_w;
+    }
+    /* row-reverse / column-reverse: the items run from the far end. */
+    int reversed = cont->flex_reverse;
+    int saved_justify = cont->justify_content;
+    if (reversed) {
+        for (int a = 0, b = n - 1; a < b; a++, b--) { int t = kids[a]; kids[a] = kids[b]; kids[b] = t; }
+        if (saved_justify == FLEX_JUSTIFY_START) cont->justify_content = FLEX_JUSTIFY_END;
+        else if (saved_justify == FLEX_JUSTIFY_END) cont->justify_content = FLEX_JUSTIFY_START;
+    }
     float inner_main = row_mode ? inner_w : inner_h;
     float inner_cross = row_mode ? inner_h : inner_w;
     /* Main axis runs along flex-direction; cross axis is perpendicular. */
@@ -11123,6 +12914,7 @@ static void layout_flex_container(int container_idx) {
         layout_flex_line(cont, kids, n, row_mode, pad_main, pad_cross, inner_main, inner_cross,
                          inner_cross, gap);
         layout_inline_text_after_flex(cont, kids, n);
+        cont->justify_content = saved_justify;
         return;
     }
 
@@ -11220,7 +13012,7 @@ static void layout_flex_container(int container_idx) {
 
     float cross_cursor = cross_start;
     for (int i = 0; i < num_lines; i++) {
-        int line_kids[MAX_ELEMENTS];
+        LUNA_SCRATCH(int, line_kids, elem_count + 1);
         for (int li = 0; li < lines[i].count; li++)
             line_kids[li] = kids[lines[i].start + li];
         /* Stretch / align against THIS line's cross size, not the container. */
@@ -11245,7 +13037,19 @@ static void layout_flex_container(int container_idx) {
         if (i < num_lines - 1) cross_cursor += cross_gap;
     }
 
-    if (cont->flex_wrap == FLEX_WRAP_WRAP && row_mode && !cont->has_css_height && !cont->pct_h) {
+    /* A wrapping row container with auto height is as tall as its lines — unless its
+     * parent already gave it a height: a flex item that grows or has a flex-basis in a
+     * column parent is sized by that parent (`flex: 1 1 0; overflow: auto` is how a
+     * scrolling icon grid is written), and growing it to its content again would push
+     * everything below it out of the window and leave nothing to scroll. */
+    int sized_by_parent = 0;
+    if (cont->parent_idx >= 0 && cont->flex_child &&
+        (cont->flex_grow > 0.0f || cont->has_flex_basis)) {
+        const LunaElement* par = &elements[cont->parent_idx];
+        sized_by_parent = par->display_mode == DISPLAY_FLEX && par->flex_direction == FLEX_DIR_COLUMN;
+    }
+    if (cont->flex_wrap == FLEX_WRAP_WRAP && row_mode && !cont->has_css_height && !cont->pct_h &&
+        !sized_by_parent) {
         float needed_h = cross_cursor + pad_cross_end;
         if (cont->has_min_height && needed_h < cont->css_min_height)
             needed_h = cont->css_min_height;
@@ -11255,6 +13059,7 @@ static void layout_flex_container(int container_idx) {
         cont->h = needed_h;
     }
     layout_inline_text_after_flex(cont, kids, n);
+    cont->justify_content = saved_justify;
 }
 
 static void resolve_grid_tracks(float inner, int count, const float* track, const int* types,
@@ -11409,14 +13214,13 @@ static void layout_grid_container(int container_idx) {
     int occupied[MAX_GRID_AREA_ROWS][MAX_GRID_AREA_COLS];
     memset(occupied, 0, sizeof(occupied));
 
-    GridPlace places[MAX_ELEMENTS];
+    LUNA_SCRATCH(GridPlace, places, elem_count + 1);
     int place_n = 0;
     int auto_col = 0, auto_row = 0;
     int max_col_end = tmpl_cols > 0 ? tmpl_cols : 1;
     int max_row_end = tmpl_rows > 0 ? tmpl_rows : 1;
 
-    for (int c = 0; c < elem_count; c++) {
-        if (elements[c].parent_idx != container_idx) continue;
+    LUNA_FOR_KIDS(c, container_idx) {
         if (!is_visible(c) || elements[c].position_fixed) continue;
         if (elements[c].position_mode == POS_ABSOLUTE) continue;
         LunaElement* ch = &elements[c];
@@ -11580,6 +13384,234 @@ static void layout_grid_container(int container_idx) {
     }
 }
 
+
+/* ── Tables ───────────────────────────────────────────────────────────────
+ * Rows and cells are laid out by the table, in one place: columns from the
+ * cells' min/max-content widths (colspan/rowspan honoured, percentage widths
+ * fixed first, the rest shared out between the minimum and maximum), row
+ * heights from the cells, cell content aligned by growing its padding.
+ *   mode 0: max-content width   1: min-content width
+ *   mode 2: height at width W   3: place everything at width W */
+#define TBL_MAX_COLS 512
+
+typedef struct { int el, row, col, cs, rs; float nat; } TblCell;
+
+static int tbl_span(const LunaElement* e, const char* name) {
+    char v[16];
+    if (!e->dom_attrs || html_attr_get(e->dom_attrs, name, v, sizeof v) != 1) return 1;
+    int n = atoi(v);
+    return n < 1 ? 1 : n > 64 ? 64 : n;
+}
+
+static float table_run(int tidx, int mode, float W, float* out_h) {
+    LunaElement* tbl = &elements[tidx];
+    const float sp = tbl->tbl_spacing_set ? tbl->tbl_spacing : 2.0f;
+    const float bp_x = tbl->border_width * 2.0f + tbl->pad_l + tbl->pad_r;
+    int nrows = 0, ncells = 0, caption = -1;
+    LUNA_FOR_KIDS(k, tidx) {
+        const LunaElement* ke = &elements[k];
+        if (!is_visible(k)) continue;
+        if (ke->display_mode == DISPLAY_TABLE_ROW) { nrows++; LUNA_FOR_KIDS(c, k) if (is_visible(c)) ncells++; }
+        else if (ke->display_mode == DISPLAY_TABLE_GROUP) {
+            LUNA_FOR_KIDS(r, k) if (is_visible(r) && elements[r].display_mode == DISPLAY_TABLE_ROW) {
+                nrows++;
+                LUNA_FOR_KIDS(c, r) if (is_visible(c)) ncells++;
+            }
+        } else if (ke->display_mode == DISPLAY_TABLE_CAPTION && caption < 0) caption = k;
+    }
+    LUNA_SCRATCH(int, rows, nrows + 1);
+    LUNA_SCRATCH(TblCell, cells, ncells + 1);
+    LUNA_SCRATCH(float, rowh, nrows + 1);
+    LUNA_SCRATCH(float, rowy, nrows + 1);
+    float colmin[TBL_MAX_COLS + 1] = {0}, colmax[TBL_MAX_COLS + 1] = {0};
+    float colpct[TBL_MAX_COLS + 1] = {0}, colw[TBL_MAX_COLS + 1] = {0};
+    int busy[TBL_MAX_COLS + 1] = {0}, colspec[TBL_MAX_COLS + 1] = {0};
+    int nr = 0, nc = 0, ncols = 0;
+    LUNA_FOR_KIDS(k, tidx) {
+        if (!is_visible(k)) continue;
+        if (elements[k].display_mode == DISPLAY_TABLE_ROW) rows[nr++] = k;
+        else if (elements[k].display_mode == DISPLAY_TABLE_GROUP)
+            LUNA_FOR_KIDS(r, k) if (is_visible(r) && elements[r].display_mode == DISPLAY_TABLE_ROW) rows[nr++] = r;
+    }
+    for (int r = 0; r < nr; r++) {
+        int col = 0;
+        LUNA_FOR_KIDS(c, rows[r]) {
+            if (!is_visible(c)) continue;
+            int cs = tbl_span(&elements[c], "colspan"), rs = tbl_span(&elements[c], "rowspan");
+            if (rs > nr - r) rs = nr - r;
+            while (col < TBL_MAX_COLS && busy[col] > 0) col++;
+            if (col + cs > TBL_MAX_COLS) cs = TBL_MAX_COLS - col;
+            if (cs < 1) { cells[nc++] = (TblCell){ c, r, -1, 1, 1, 0.0f }; continue; }
+            cells[nc++] = (TblCell){ c, r, col, cs, rs, 0.0f };
+            for (int j = 0; j < cs; j++) busy[col + j] = rs;
+            col += cs;
+            if (col > ncols) ncols = col;
+        }
+        for (int j = 0; j < TBL_MAX_COLS; j++) if (busy[j] > 0) busy[j]--;
+    }
+
+    /* Column minimum / maximum from the cells (single-column cells first). */
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < nc; i++) {
+            TblCell* tc = &cells[i];
+            if (tc->col < 0 || (pass == 0) != (tc->cs == 1)) continue;
+            LunaElement* ch = &elements[tc->el];
+            float mn = min_content_width(ch), mx;
+            if (ch->has_css_width && !ch->pct_w)
+                mx = ch->css_width + (ch->box_sizing == BOX_CONTENT ? ch->pad_l + ch->pad_r + ch->border_width * 2.0f : 0.0f);
+            else mx = intrinsic_content_width(ch);
+            if (mx < mn) mx = mn;
+            if (pass == 0) {
+                if (mn > colmin[tc->col]) colmin[tc->col] = mn;
+                if (mx > colmax[tc->col]) colmax[tc->col] = mx;
+                if (ch->pct_w && ch->raw_w > colpct[tc->col]) colpct[tc->col] = ch->raw_w;
+                if (ch->has_css_width && !ch->pct_w) colspec[tc->col] = 1;   /* an authored width: not stretched */
+            } else {
+                float cm = (tc->cs - 1) * sp, cx = cm;
+                for (int j = 0; j < tc->cs; j++) { cm += colmin[tc->col + j]; cx += colmax[tc->col + j]; }
+                if (mn > cm) for (int j = 0; j < tc->cs; j++) colmin[tc->col + j] += (mn - cm) / tc->cs;
+                if (mx > cx) for (int j = 0; j < tc->cs; j++) colmax[tc->col + j] += (mx - cx) / tc->cs;
+            }
+        }
+    float sum_min = 0.0f, sum_max = 0.0f;
+    for (int j = 0; j < ncols; j++) {
+        if (colmax[j] < colmin[j]) colmax[j] = colmin[j];
+        sum_min += colmin[j]; sum_max += colmax[j];
+    }
+    const float extras = (float)(ncols + 1) * sp + bp_x;
+    if (mode < 2) {
+        float w = (mode == 0 ? sum_max : sum_min) + extras;
+        if (caption >= 0) {
+            float cw = mode == 0 ? intrinsic_content_width(&elements[caption]) : min_content_width(&elements[caption]);
+            if (cw > w) w = cw;
+        }
+        return w;
+    }
+
+    /* Column widths for the available content width. */
+    float wc = W - extras;
+    if (wc < 0.0f) wc = 0.0f;
+    float fixed_sum = 0.0f, nf_min = 0.0f, nf_max = 0.0f;
+    int fixed[TBL_MAX_COLS + 1] = {0};
+    for (int j = 0; j < ncols; j++) {
+        if (colpct[j] > 0.0f) {
+            colw[j] = colpct[j] * wc;
+            if (colw[j] < colmin[j]) colw[j] = colmin[j];
+            fixed[j] = 1; fixed_sum += colw[j];
+        } else { nf_min += colmin[j]; nf_max += colmax[j]; }
+    }
+    float rest = wc - fixed_sum;
+    /* Spare width goes to the columns without an authored width, in proportion
+     * to their content; with none of those, to all of them. */
+    float st_max = 0.0f;
+    int st_n = 0;
+    for (int j = 0; j < ncols; j++) if (!fixed[j] && !colspec[j]) { st_max += colmax[j]; st_n++; }
+    for (int j = 0; j < ncols; j++) {
+        if (fixed[j]) continue;
+        if (rest >= nf_max) {
+            float extra = rest - nf_max;
+            if (st_n == 0) colw[j] = nf_max > 0.0f ? colmax[j] + extra * colmax[j] / nf_max : colmax[j];
+            else if (colspec[j]) colw[j] = colmax[j];
+            else colw[j] = st_max > 0.0f ? colmax[j] + extra * colmax[j] / st_max : colmax[j] + extra / (float)st_n;
+        } else if (rest <= nf_min || nf_max <= nf_min) colw[j] = colmin[j];
+        else colw[j] = colmin[j] + (colmax[j] - colmin[j]) * ((rest - nf_min) / (nf_max - nf_min));
+    }
+
+    /* Cell heights, then row heights (spanning cells last). */
+    for (int i = 0; i < nc; i++) {
+        TblCell* tc = &cells[i];
+        LunaElement* ch = &elements[tc->el];
+        ch->pad_t -= ch->tbl_pad_t0; ch->pad_b -= ch->tbl_pad_b0;
+        ch->tbl_pad_t0 = ch->tbl_pad_b0 = 0.0f;
+        if (tc->col < 0) continue;
+        float cw = (float)(tc->cs - 1) * sp;
+        for (int j = 0; j < tc->cs; j++) cw += colw[tc->col + j];
+        ch->w = cw;
+        float h = ch->has_css_height && !ch->pct_h ? css_outer_height(ch, ch->css_height) : flow_content_height(ch);
+        if (ch->has_min_height) { float m = css_outer_height(ch, ch->css_min_height); if (h < m) h = m; }
+        tc->nat = h;
+    }
+    for (int r = 0; r < nr; r++) {
+        rowh[r] = 0.0f;
+        const LunaElement* re = &elements[rows[r]];
+        if (re->has_css_height && !re->pct_h) rowh[r] = re->css_height;
+    }
+    for (int i = 0; i < nc; i++)
+        if (cells[i].col >= 0 && cells[i].rs == 1 && cells[i].nat > rowh[cells[i].row]) rowh[cells[i].row] = cells[i].nat;
+    for (int i = 0; i < nc; i++) {
+        const TblCell* tc = &cells[i];
+        if (tc->col < 0 || tc->rs == 1) continue;
+        float cur = (float)(tc->rs - 1) * sp;
+        for (int j = 0; j < tc->rs; j++) cur += rowh[tc->row + j];
+        if (tc->nat > cur) rowh[tc->row + tc->rs - 1] += tc->nat - cur;
+    }
+    float cap_h = 0.0f;
+    if (caption >= 0) {
+        elements[caption].w = W - bp_x > 0.0f ? W - bp_x : 0.0f;
+        cap_h = flow_content_height(&elements[caption]);
+    }
+    float y = tbl->border_width + tbl->pad_t + cap_h;
+    for (int r = 0; r < nr; r++) { rowy[r] = y + sp; y += sp + rowh[r]; }
+    float total = y + sp + tbl->pad_b + tbl->border_width;
+    if (out_h) *out_h = total;
+    if (mode == 2) return total;
+
+    /* Place. */
+    if (!tbl->has_css_height && !tbl->pct_h) tbl->h = total;
+    const float x0 = tbl->border_width + tbl->pad_l;
+    float inner_w = (float)(ncols + 1) * sp;
+    for (int j = 0; j < ncols; j++) inner_w += colw[j];
+    if (caption >= 0) {
+        LunaElement* ce = &elements[caption];
+        ce->h = cap_h; ce->rel_x = x0; ce->rel_y = tbl->border_width + tbl->pad_t; ce->flow_child = 1;
+    }
+    LUNA_FOR_KIDS(k, tidx) {
+        LunaElement* ke = &elements[k];
+        if (!is_visible(k) || ke->display_mode != DISPLAY_TABLE_GROUP) continue;
+        float gy = 0.0f, gb = 0.0f;
+        int first = 1;
+        for (int r = 0; r < nr; r++) {
+            if (elements[rows[r]].parent_idx != k) continue;
+            if (first) { gy = rowy[r]; first = 0; }
+            gb = rowy[r] + rowh[r];
+        }
+        ke->w = inner_w; ke->h = gb - gy; ke->rel_x = x0; ke->rel_y = gy; ke->flow_child = 1;
+    }
+    for (int r = 0; r < nr; r++) {
+        LunaElement* re = &elements[rows[r]];
+        int in_group = re->parent_idx != tidx;
+        float gy = 0.0f;
+        if (in_group) gy = elements[re->parent_idx].rel_y;
+        re->w = inner_w; re->h = rowh[r];
+        re->rel_x = in_group ? 0.0f : x0; re->rel_y = rowy[r] - gy; re->flow_child = 1;
+    }
+    for (int i = 0; i < nc; i++) {
+        TblCell* tc = &cells[i];
+        LunaElement* ch = &elements[tc->el];
+        ch->flow_child = 1;
+        if (tc->col < 0) { ch->rel_x = ch->rel_y = 0.0f; continue; }
+        float hh = (float)(tc->rs - 1) * sp;
+        for (int j = 0; j < tc->rs; j++) hh += rowh[tc->row + j];
+        float cx = sp;
+        for (int j = 0; j < tc->col; j++) cx += colw[j] + sp;
+        ch->h = hh; ch->rel_x = cx; ch->rel_y = 0.0f;
+        const LunaElement* re = &elements[rows[tc->row]];
+        int va = ch->tbl_valign ? ch->tbl_valign : re->tbl_valign;
+        if (!va && re->parent_idx != tidx) va = elements[re->parent_idx].tbl_valign;
+        float extra = hh - tc->nat;
+        if (extra > 0.0f) {
+            float top = va == TBL_VALIGN_TOP ? 0.0f : va == TBL_VALIGN_BOTTOM ? extra : (float)(int)(extra * 0.5f);
+            ch->pad_t += top; ch->pad_b += extra - top;
+            ch->tbl_pad_t0 = top; ch->tbl_pad_b0 = extra - top;
+        }
+    }
+    return total;
+}
+
+static void layout_table_container(int idx) {
+    table_run(idx, 3, elements[idx].w, NULL);
+}
+
 static void layout_flex_containers(void) {
     for (int i = 0; i < elem_count; i++) {
         elements[i].flex_child = 0;
@@ -11597,6 +13629,12 @@ static void layout_flex_containers(void) {
             layout_flex_container(i);
         else if (elements[i].display_mode == DISPLAY_GRID)
             layout_grid_container(i);
+        else if (elements[i].display_mode == DISPLAY_TABLE)
+            layout_table_container(i);
+        else if ((elements[i].display_mode == DISPLAY_TABLE_ROW || elements[i].display_mode == DISPLAY_TABLE_GROUP) &&
+                 elements[i].parent_idx >= 0 && (elements[elements[i].parent_idx].display_mode == DISPLAY_TABLE ||
+                                                  elements[elements[i].parent_idx].display_mode == DISPLAY_TABLE_GROUP))
+            ;   /* positioned by its table */
         else
             layout_block_container(i);
     }
@@ -11713,7 +13751,7 @@ static int size_auto_positioned_containers(void) {
         if (!is_visible(i) || e->has_css_height || e->pct_h) continue;
         if (e->position_mode != POS_ABSOLUTE && !e->position_fixed) continue;
         if (e->has_top && e->has_bottom) continue; /* inset stretches these */
-        float h = flow_content_height(e);
+        float h = aspect_height(e) >= 0.0f ? aspect_height(e) : flow_content_height(e);
         if (e->has_min_height && h < e->css_min_height) h = e->css_min_height;
         if (e->has_max_height) {
             float basis = window_height;
@@ -11735,12 +13773,28 @@ static int size_auto_positioned_containers(void) {
 
 static void apply_scroll_offsets(void);
 static void apply_scroll_metrics(void);
+static void apply_document_metrics(void);
 static void apply_sticky_positions(void);
 static void sync_css_overlay_elements(void);
 
 void update_layout_pass(void) {
-    memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
-    memset(g_min_content_width_valid, 0, sizeof(g_min_content_width_valid));
+    /* An inline element (<a>, <span>) holding a block-level child, as in
+     * <a><article>..</article></a>, is laid out as a block: the engine has no
+     * anonymous block boxes to split the inline around it. */
+    if (g_luna_web_compat && !g_layout_scroll_only) {
+        for (int i = 0; i < elem_count; i++) {
+            const LunaElement* c = &elements[i];
+            if (c->inline_level || c->display_none || c->parent_idx < 0 || c->parent_idx >= elem_count) continue;
+            if (c->position_mode == POS_ABSOLUTE || c->position_fixed || c->css_float) continue;
+            LunaElement* par = &elements[c->parent_idx];
+            if (par->inline_level == 1 && !par->is_input) par->inline_level = 0;
+        }
+    }
+    const int scroll_only = g_layout_scroll_only;
+    g_layout_scroll_only = 0;
+    if (!scroll_only) {
+    LUNA_AUX_ZERO(g_intrinsic_width_valid);
+    LUNA_AUX_ZERO(g_min_content_width_valid);
     update_layout();
     layout_flex_containers();
     /* Wrapping flex rows finalize their height after a definite width is known.
@@ -11748,14 +13802,16 @@ void update_layout_pass(void) {
      * against that height instead of leaving wallpaper/cursor sections overlapped. */
     layout_flex_containers();
     if (size_auto_positioned_containers() | absolute_containing_blocks_changed()) {
-        memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
+        LUNA_AUX_ZERO(g_intrinsic_width_valid);
         update_layout();
         layout_flex_containers();
         layout_flex_containers();
     }
+    }   /* !scroll_only */
     resolve_global_layout_positions();
     apply_relative_offsets();
     apply_scroll_metrics();
+    apply_document_metrics();
     apply_scroll_offsets();
     apply_sticky_positions();
     /* Resolve percentage-based transforms after element sizes are known */
@@ -11818,10 +13874,16 @@ static void apply_sticky_positions(void) {
 }
 
 static void apply_scroll_offsets(void) {
-    float sx[MAX_ELEMENTS], sy[MAX_ELEMENTS];
+    LUNA_SCRATCH(float, sx, elem_count + 1);
+    LUNA_SCRATCH(float, sy, elem_count + 1);
+    LUNA_SCRATCH(unsigned char, fixed, elem_count + 1);
     for (int i = 0; i < elem_count; i++) {
         LunaElement* e = &elements[i];
         int p = e->parent_idx;
+        fixed[i] = e->position_fixed;
+        if (p >= 0 && p < i) fixed[i] |= fixed[p];
+        else for (int a = p; a >= 0 && !fixed[i]; a = elements[a].parent_idx)
+            if (elements[a].position_fixed) fixed[i] = 1;
         if (p < 0) {
             sx[i] = sy[i] = 0.0f;
         } else if (p < i) {
@@ -11839,18 +13901,50 @@ static void apply_scroll_offsets(void) {
             e->x -= sx[i];
             e->y -= sy[i];
         }
+        if (g_luna_web_compat && !fixed[i]) {
+            e->x -= g_document_scroll_x;
+            e->y -= g_document_scroll_y;
+        }
     }
 }
 
+static void apply_document_metrics(void) {
+    g_document_width = window_width;
+    g_document_height = window_height;
+    if (!g_luna_web_compat) return;
+    for (int i = 0; i < elem_count; ++i) {
+        LunaElement* e = &elements[i];
+        if (!is_visible(i) || e->luna_internal || e->position_fixed) continue;
+        float right = e->x + e->w + e->margin_right;
+        float bottom = e->y + e->h + e->margin_bottom;
+        int fixed = 0;
+        for (int p = e->parent_idx; p >= 0; p = elements[p].parent_idx) {
+            LunaElement* parent = &elements[p];
+            if (parent->position_fixed) { fixed = 1; break; }
+            if (overflow_clips(parent->overflow_x) && right > parent->x + parent->w)
+                right = parent->x + parent->w;
+            if (overflow_clips(parent->overflow_y) && bottom > parent->y + parent->h)
+                bottom = parent->y + parent->h;
+        }
+        if (fixed) continue;
+        if (right > g_document_width) g_document_width = right;
+        if (bottom > g_document_height) g_document_height = bottom;
+    }
+    float max_x = g_document_width - window_width;
+    float max_y = g_document_height - window_height;
+    if (g_document_scroll_x > max_x) g_document_scroll_x = max_x;
+    if (g_document_scroll_y > max_y) g_document_scroll_y = max_y;
+}
+
 static void apply_scroll_metrics(void) {
-    unsigned char visible[MAX_ELEMENTS];
+    LUNA_SCRATCH(unsigned char, visible, elem_count + 1);
     g_scroll_container_count = 0;
 
     /* Parent indices are normally earlier than children, so visibility can be
      * propagated while clearing each scroll container's measured extent. */
     for (int i = 0; i < elem_count; i++) {
         int p = elements[i].parent_idx;
-        visible[i] = (unsigned char)(!elements[i].display_none &&
+        visible[i] = (unsigned char)(!elements[i].display_none && !elements[i].dom_detached &&
                      (p < 0 ? 1 : (p < i ? visible[p] : is_visible(i))));
         if (overflow_scrollable(elements[i].overflow_y) ||
             overflow_scrollable(elements[i].overflow_x)) {
@@ -11980,7 +14074,7 @@ static int ensure_overlay_element(const char* id, const char* classes, int host,
         strncpy(elements[idx].id, id, sizeof(elements[idx].id) - 1);
         strncpy(elements[idx].class_name, classes, sizeof(elements[idx].class_name) - 1);
         strncpy(elements[idx].type, "div", sizeof(elements[idx].type) - 1);
-        elements[idx].parent_idx = -1;
+        elements[idx].parent_idx = -1; g_dom_struct_ver++;
         elements[idx].luna_internal = 1;
         elements[idx].position_mode = POS_ABSOLUTE;
         elements[idx].css_positioned = 1;
@@ -12021,7 +14115,7 @@ static void place_overlay_rect(int idx, float x, float y, float w, float h, int 
 }
 
 static int element_aria_hidden(int idx);
-static int g_sb_slots[MAX_ELEMENTS][4];
+static int (*g_sb_slots)[4];
 
 /* Position scrollbar + a11y overlay nodes from layout geometry (CSS draws them). */
 static void sync_css_overlay_elements(void) {
@@ -12071,7 +14165,7 @@ static void sync_css_overlay_elements(void) {
         strncpy(elements[a11y].id, "luna_a11y_bar", sizeof(elements[a11y].id) - 1);
         strncpy(elements[a11y].class_name, "luna_a11y hidden", sizeof(elements[a11y].class_name) - 1);
         strncpy(elements[a11y].type, "div", sizeof(elements[a11y].type) - 1);
-        elements[a11y].parent_idx = -1;
+        elements[a11y].parent_idx = -1; g_dom_struct_ver++;
         elements[a11y].luna_internal = 1;
         elements[a11y].position_mode = POS_ABSOLUTE;
         elements[a11y].css_positioned = 1;
@@ -12202,7 +14296,7 @@ static void set_scroll_top(int idx, float val, int instant) {
     sc->scroll_dest_top = val;
     if (instant || !sc->scroll_smooth) sc->scroll_top = val;
     clamp_scroll_y(idx);
-    g_layout_dirty = 1;
+    LUNA_LAYOUT_DIRTY();
 }
 
 static void set_scroll_left(int idx, float val, int instant) {
@@ -12210,7 +14304,7 @@ static void set_scroll_left(int idx, float val, int instant) {
     sc->scroll_dest_left = val;
     if (instant || !sc->scroll_smooth) sc->scroll_left = val;
     clamp_scroll_x(idx);
-    g_layout_dirty = 1;
+    LUNA_LAYOUT_DIRTY();
 }
 
 static void add_scroll_top(int idx, float delta, int instant) {
@@ -12233,8 +14327,8 @@ static void apply_scroll_snap_y(int idx) {
     float cur = sc->scroll_dest_top;
     float best = cur;
     float best_dist = 1e9f;
-    for (int i = 0; i < elem_count; i++) {
-        if (elements[i].parent_idx != idx || elements[i].display_none) continue;
+    LUNA_FOR_KIDS(i, idx) {
+        if (elements[i].display_none) continue;
         if (!is_visible(i)) continue;
         LunaElement* ch = &elements[i];
         float cy = ch->rel_y + ch->margin_top;
@@ -12266,7 +14360,7 @@ void tick_smooth_scroll(double dt) {
         float dy = c->scroll_dest_top - c->scroll_top;
         float dx = c->scroll_dest_left - c->scroll_left;
         if (c->scroll_smooth) {
-            if (fabsf(dy) > 0.001f || fabsf(dx) > 0.001f) g_layout_dirty = 1;
+            if (fabsf(dy) > 0.001f || fabsf(dx) > 0.001f) LUNA_LAYOUT_DIRTY();
             if (fabsf(dy) > 0.25f) c->scroll_top += dy * k;
             else c->scroll_top = c->scroll_dest_top;
             if (fabsf(dx) > 0.25f) c->scroll_left += dx * k;
@@ -12333,8 +14427,13 @@ static void scroll_track_click_x(int idx, double mx, double my) {
 
 static int hit_test_at(double xpos, double ypos);
 
+static int g_input_drag_idx = -1;
+static int g_ctx_open = 0;
+static int g_luna_ctx_menu_enabled = 1;
+
 void scroll_callback(void* window, double xoffset, double yoffset) {
     (void)window; /* used via Luna mouse API / GLFW host */
+    if (g_ctx_open) { g_ctx_open = 0; luna_platform_request_redraw(); }
     double mx = g_luna_mx, my = g_luna_my;
     int hit = hit_test_at(mx, my);
     int shift = g_luna_shift;
@@ -12346,12 +14445,20 @@ void scroll_callback(void* window, double xoffset, double yoffset) {
         int scroll_idx = find_scroll_target_y(hit);
         if (scroll_idx != -1) {
             add_scroll_top(scroll_idx, -(float)yoffset * 18.0f, 0);
+        } else if (g_luna_web_compat) {
+            int allowed = 1;
+            for (int i = 0; i < elem_count; ++i)
+                if (elements[i].parent_idx < 0 && !strcmp(elements[i].type, "body") &&
+                    (elements[i].overflow_y == OVERFLOW_HIDDEN)) allowed = 0;
+            if (allowed) luna_document_scroll(g_document_scroll_x, g_document_scroll_y - (float)yoffset * 18.0f);
         }
     }
     if (fabs(xoffset) > 0.001) {
         int scroll_idx = find_scroll_target_x(hit);
         if (scroll_idx != -1) {
             add_scroll_left(scroll_idx, -(float)xoffset * 18.0f, 0);
+        } else if (g_luna_web_compat) {
+            luna_document_scroll(g_document_scroll_x - (float)xoffset * 18.0f, g_document_scroll_y);
         }
     }
 }
@@ -12373,19 +14480,23 @@ static float element_effective_opacity(int idx) {
  * dropped ancestor scale entirely: animating a container left every child
  * frozen in place.  Walking root-to-leaf preserves CSS's nested transform
  * order, including an outer scale scaling an inner translation. */
+/* Where a transform is anchored: transform-origin within the layout box. */
+static float tf_cx(const LunaElement* e) { return e->x + e->w * e->tf_ox + e->tf_oxpx; }
+static float tf_cy(const LunaElement* e) { return e->y + e->h * e->tf_oy + e->tf_oypx; }
+
 static void accum_ancestor_transform(int idx, float* scale, float* dx, float* dy) {
-    int chain[LUNA_UI_MAX_ELEMENTS];
+    LUNA_SCRATCH(int, chain, elem_count + 1);
     int n = 0;
     for (int p = elements[idx].parent_idx;
-         p != -1 && n < LUNA_UI_MAX_ELEMENTS; p = elements[p].parent_idx)
+         p != -1 && n < elem_count + 1; p = elements[p].parent_idx)
         chain[n++] = p;
 
     float a = 1.0f, x = 0.0f, y = 0.0f;
     while (n > 0) {
         LunaElement* p = &elements[chain[--n]];
         float s = p->cur_scale;
-        float cx = p->x + p->w * 0.5f;
-        float cy = p->y + p->h * 0.5f;
+        float cx = tf_cx(p);
+        float cy = tf_cy(p);
         x += a * ((1.0f - s) * cx + p->cur_tx);
         y += a * ((1.0f - s) * cy + p->cur_ty);
         a *= s;
@@ -12398,8 +14509,8 @@ static void get_element_draw_bounds(LunaElement* e, float* out_x, float* out_y, 
     float dw = e->w * scale, dh = e->h * scale;
     float as, adx, ady;
     accum_ancestor_transform((int)(e - elements), &as, &adx, &ady);
-    *out_x = as * (e->x + (e->w - dw) * 0.5f + e->cur_tx) + adx;
-    *out_y = as * (e->y + (e->h - dh) * 0.5f + e->cur_ty) + ady;
+    *out_x = as * (e->x + (1.0f - scale) * (e->w * e->tf_ox + e->tf_oxpx) + e->cur_tx) + adx;
+    *out_y = as * (e->y + (1.0f - scale) * (e->h * e->tf_oy + e->tf_oypx) + e->cur_ty) + ady;
     *out_w = dw * as;
     *out_h = dh * as;
 }
@@ -12442,16 +14553,14 @@ static void drag_layout_origin(const LunaElement* e, float* ox, float* oy) {
 static void drag_set_screen_origin(LunaElement* e, float screen_x, float screen_y) {
     float parent_scale = 1.0f, parent_tx = 0.0f, parent_ty = 0.0f;
     float origin_x, origin_y;
-    float scaled_w = e->w * e->cur_scale;
-    float scaled_h = e->h * e->cur_scale;
 
     accum_ancestor_transform((int)(e - elements), &parent_scale, &parent_tx, &parent_ty);
     if (fabsf(parent_scale) < 0.0001f) parent_scale = 1.0f;
     drag_layout_origin(e, &origin_x, &origin_y);
     e->rel_x = (screen_x - parent_tx) / parent_scale -
-               (e->w - scaled_w) * 0.5f - e->cur_tx - origin_x;
+               (1.0f - e->cur_scale) * (e->w * e->tf_ox + e->tf_oxpx) - e->cur_tx - origin_x;
     e->rel_y = (screen_y - parent_ty) / parent_scale -
-               (e->h - scaled_h) * 0.5f - e->cur_ty - origin_y;
+               (1.0f - e->cur_scale) * (e->h * e->tf_oy + e->tf_oypx) - e->cur_ty - origin_y;
     e->pos_overridden_x = 1;
     e->pos_overridden_y = 1;
 }
@@ -12552,7 +14661,7 @@ typedef struct {
     float lx, ly, lw, lh;
 } LunaRenderCache;
 
-static LunaRenderCache g_rc[LUNA_UI_MAX_ELEMENTS];
+static LunaRenderCache* g_rc;
 
 static void rc_rect_init(float* x, float* y, float* w, float* h) {
     *x = -LUNA_RC_INF; *y = -LUNA_RC_INF;
@@ -12589,8 +14698,8 @@ static void rc_fill_slow(int i) {
         float pas, ptx, pty;
         accum_ancestor_transform(p, &pas, &ptx, &pty);
         float ps = par->cur_scale;
-        float pcx = par->x + par->w * 0.5f;
-        float pcy = par->y + par->h * 0.5f;
+        float pcx = tf_cx(par);
+        float pcy = tf_cy(par);
         ptx += pas * ((1.0f - ps) * pcx + par->cur_tx);
         pty += pas * ((1.0f - ps) * pcy + par->cur_ty);
         pas *= ps;
@@ -12630,7 +14739,7 @@ static void rc_build(void) {
             c->anc_tx  = 0.0f;
             c->anc_ty  = 0.0f;
             c->clip_anc = -1;
-            c->vis     = (unsigned char)(!e->display_none && !e->visibility_hidden);
+            c->vis     = (unsigned char)(!e->display_none && !e->visibility_hidden && !e->dom_detached);
             c->clipped = 0;
             c->in_root = (unsigned char)(g_render_root < 0 || i == g_render_root);
             rc_rect_init(&c->cx, &c->cy, &c->cw, &c->ch);
@@ -12642,12 +14751,12 @@ static void rc_build(void) {
         c->eff_op  = pc->eff_op * e->opacity;
         c->anc_scale = pc->anc_scale * par->cur_scale;
         c->anc_tx  = pc->anc_tx + pc->anc_scale *
-                     ((1.0f - par->cur_scale) * (par->x + par->w * 0.5f) +
+                     ((1.0f - par->cur_scale) * tf_cx(par) +
                       par->cur_tx);
         c->anc_ty  = pc->anc_ty + pc->anc_scale *
-                     ((1.0f - par->cur_scale) * (par->y + par->h * 0.5f) +
+                     ((1.0f - par->cur_scale) * tf_cy(par) +
                       par->cur_ty);
-        c->vis     = (unsigned char)(pc->vis && !e->display_none && !e->visibility_hidden);
+        c->vis     = (unsigned char)(pc->vis && !e->display_none && !e->visibility_hidden && !e->dom_detached);
         c->in_root = (unsigned char)(g_render_root < 0 || i == g_render_root || pc->in_root);
         int cx_on = overflow_clips(par->overflow_x);
         int cy_on = overflow_clips(par->overflow_y);
@@ -12716,17 +14825,56 @@ typedef struct {
     unsigned char drawn;
 } LunaDrawRec;
 
-static LunaDrawRec g_draw_rec[LUNA_UI_MAX_ELEMENTS];
+static LunaDrawRec* g_draw_rec;
+
+/* Side tables indexed by element: grown with the element array, new tails zeroed. */
+static int luna_aux_grow(int cap) {
+    if (cap <= g_aux_cap) return 1;
+#define LUNA_AUX(p) do { void* n_ = realloc((p), sizeof(*(p)) * (size_t)cap); if (!n_) return 0; (p) = n_; \
+        memset((p) + g_aux_cap, 0, sizeof(*(p)) * (size_t)(cap - g_aux_cap)); } while (0)
+    LUNA_AUX(g_scroll_tick_idx); LUNA_AUX(g_scroll_container_idx); LUNA_AUX(g_css_anim_idx);
+    LUNA_AUX(g_visual_active_idx); LUNA_AUX(g_visual_active_flag); LUNA_AUX(render_order);
+    LUNA_AUX(g_hover_mark); LUNA_AUX(g_hover_chain); LUNA_AUX(g_hover_next);
+    LUNA_AUX(g_intrinsic_width_cache); LUNA_AUX(g_intrinsic_width_valid);
+    LUNA_AUX(g_min_content_width_cache); LUNA_AUX(g_min_content_width_valid);
+    LUNA_AUX(g_cached_eff_z); LUNA_AUX(g_sb_slots); LUNA_AUX(g_rc); LUNA_AUX(g_draw_rec);
+#undef LUNA_AUX
+    g_aux_cap = cap;
+    return 1;
+}
 static float g_dmg_x0, g_dmg_y0, g_dmg_x1, g_dmg_y1;
 static int   g_dmg_any;
 static int   g_dmg_enabled = 0;
+/* Host-supplied paint clip for partial redraw (surface coords). */
+static int   g_paint_clip_on = 0;
+static float g_paint_clip_x, g_paint_clip_y, g_paint_clip_w, g_paint_clip_h;
+
+void luna_redraw_set_paint_clip(float x, float y, float w, float h) {
+    if (w <= 0.0f || h <= 0.0f) {
+        g_paint_clip_on = 0;
+        return;
+    }
+    g_paint_clip_on = 1;
+    g_paint_clip_x = x;
+    g_paint_clip_y = y;
+    g_paint_clip_w = w;
+    g_paint_clip_h = h;
+}
+
+static int paint_clip_hits(float x, float y, float w, float h) {
+    if (!g_paint_clip_on) return 1;
+    if (w <= 0.0f || h <= 0.0f) return 0;
+    return rects_intersect(x, y, w, h,
+                           g_paint_clip_x, g_paint_clip_y,
+                           g_paint_clip_w, g_paint_clip_h);
+}
 
 void luna_redraw_track_damage(int enabled) {
     if (!enabled == !g_dmg_enabled) return;
     g_dmg_enabled = enabled ? 1 : 0;
     /* Turning it on mid-session must not report "unchanged" against records
      * left over from before. */
-    for (int i = 0; i < LUNA_UI_MAX_ELEMENTS; i++) g_draw_rec[i].drawn = 0;
+    for (int i = 0; i < g_aux_cap; i++) g_draw_rec[i].drawn = 0;
 }
 
 static void damage_reset(void) {
@@ -12871,9 +15019,9 @@ static void rc_element_draw_bounds(int idx, float* out_x, float* out_y,
     float scale = e->cur_scale;
     float dw = e->w * scale, dh = e->h * scale;
     *out_x = c->anc_scale *
-             (e->x + (e->w - dw) * 0.5f + e->cur_tx) + c->anc_tx;
+             (e->x + (1.0f - scale) * (e->w * e->tf_ox + e->tf_oxpx) + e->cur_tx) + c->anc_tx;
     *out_y = c->anc_scale *
-             (e->y + (e->h - dh) * 0.5f + e->cur_ty) + c->anc_ty;
+             (e->y + (1.0f - scale) * (e->h * e->tf_oy + e->tf_oypx) + e->cur_ty) + c->anc_ty;
     *out_w = dw * c->anc_scale;
     *out_h = dh * c->anc_scale;
 }
@@ -13226,7 +15374,7 @@ static void apply_keyframe_stop_to_element(LunaElement* e, const KeyframeStop* s
         e->rel_x = stop->left;
         e->pos_overridden_x = 1;
     }
-    if (layout_changed) g_layout_dirty = 1;
+    if (layout_changed) LUNA_LAYOUT_DIRTY();
     if (stop->has_opacity) e->opacity = stop->opacity;
     if (stop->has_transform_scale) e->transform_scale = stop->transform_scale;
     if (stop->has_transform_tx) { e->transform_tx = stop->transform_tx; e->has_custom_bg = 0; }
@@ -13591,7 +15739,12 @@ static unsigned char* luna_try_font_candidates(const char* const* paths,
     return NULL;
 }
 
-void init_font() {
+int luna_prepare_font_metrics(void) {
+    if (g_font_ttf) return g_font_info_ok;
+    g_font_info_ok = g_bold_font_info_ok = g_cjk_font_info_ok = 0;
+    g_mono_font_info_ok = g_icon_font_info_ok = g_brand_font_info_ok = 0;
+    memset(g_font_pick, 0, sizeof g_font_pick);
+    memset(g_advance_memo, 0, sizeof g_advance_memo);
     FontPathList reg = {0};
     FontPathList bold_list = {0};
     unsigned char* reg_buf = NULL;
@@ -13627,6 +15780,18 @@ void init_font() {
         reg_buf = luna_try_font_candidates(cands, sizeof(cands)/sizeof(cands[0]),
                                            &g_font_ttf_sz, "regular font");
     }
+#if defined(__APPLE__)
+    /* No font scan on macOS, so name the system faces.  Without a Japanese face every
+     * kana and kanji (file names included) draws as a missing-glyph box. */
+    if (!reg_buf) {
+        static const char* const cands[] = {
+            "/System/Library/Fonts/Helvetica.ttc", "/System/Library/Fonts/HelveticaNeue.ttc",
+            "/System/Library/Fonts/Geneva.ttf", "/Library/Fonts/Arial.ttf"
+        };
+        reg_buf = luna_try_font_candidates(cands, sizeof(cands)/sizeof(cands[0]),
+                                           &g_font_ttf_sz, "regular font");
+    }
+#endif
     if (!reg_buf) reg_buf = try_load_font_list(&reg, font_path_score_ui, &g_font_ttf_sz);
 
     if (!g_bold_font_ttf) {
@@ -13646,12 +15811,36 @@ void init_font() {
         const char* env = getenv("LUNA_FONT_CJK");
         if (env && env[0]) g_cjk_font_ttf = read_file_bytes(env, &cjk_sz);
     }
+#if defined(__APPLE__)
+    if (!g_cjk_font_ttf) {
+        static const char* const cands[] = {
+            "/System/Library/Fonts/\343\203\222\343\203\251\343\202\256\343\203\216\350\247\222\343\202\264\343\202\267\343\203\203\343\202\257 W3.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+        };
+        g_cjk_font_ttf = luna_try_font_candidates(cands, sizeof(cands)/sizeof(cands[0]),
+                                                  &cjk_sz, "CJK font");
+    }
+#endif
     if (!g_cjk_font_ttf) g_cjk_font_ttf = try_load_font_list(&reg, font_path_score, &cjk_sz);
 
     if (!g_mono_font_ttf) {
         const char* env = getenv("LUNA_FONT_MONO");
         if (env && env[0]) g_mono_font_ttf = read_file_bytes(env, &mono_sz);
     }
+#if defined(__APPLE__)
+    if (!g_mono_font_ttf) {
+        static const char* const cands[] = {
+            "/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Monaco.ttf",
+            "/System/Library/Fonts/Courier.ttc"
+        };
+        g_mono_font_ttf = luna_try_font_candidates(cands, sizeof(cands)/sizeof(cands[0]),
+                                                   &mono_sz, "mono font");
+    }
+#endif
     if (!g_mono_font_ttf) g_mono_font_ttf = try_load_font_list(&reg, font_path_score_mono, &mono_sz);
 
     if (!g_icon_font_ttf) {
@@ -13695,7 +15884,6 @@ void init_font() {
         int off = stbtt_GetFontOffsetForIndex(g_font_ttf, 0);
         if (off < 0) off = 0;
         g_font_info_ok = stbtt_InitFont(&g_font_info, g_font_ttf, off) ? 1 : 0;
-        dyn_atlas_reset();
         font_loaded = 1;
     } else {
         fprintf(stderr, "[luna-ui] warning: no regular font available\n");
@@ -13731,6 +15919,12 @@ void init_font() {
     fpl_free(&reg);
     fpl_free(&bold_list);
 
+    return g_font_info_ok;
+}
+
+void init_font() {
+    (void)luna_prepare_font_metrics();
+    dyn_atlas_reset();
     glGenVertexArrays(1, &text_vao);
     glGenBuffers(1, &text_vbo);
     glBindVertexArray(text_vao); g_current_vao = text_vao;
@@ -13854,7 +16048,10 @@ static int fit_text_chars(FontAtlas* atlas, const char* text, int len, float max
 // ============================================================
 
 void init_rect_geometry() {
-    float vertices[] = { 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+    /* Two explicit triangles.  Some GLES/Vulkan translations only submit the
+     * first triangle of a four-vertex fan, leaving half of every UI box empty. */
+    float vertices[] = { 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f,
+                         0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
     glGenVertexArrays(1, &g_rect_vao);
     glGenBuffers(1, &g_rect_vbo);
     /* Setup path: bind unconditionally, then tell the tracker what is current. */
@@ -13972,11 +16169,29 @@ static unsigned char* luna_rasterize_svg(unsigned char* encoded, long encoded_sz
 #endif /* LUNA_UI_NANOSVG */
 
 // Load (or retrieve cached) texture from file path.
-static GLuint LUNA_UNUSED load_or_get_texture(const char* path) {
-    if (!path || !path[0]) return 0;
+static GLuint load_texture_tinted(const char* path0, unsigned tint);
+static LunaImageDecoder g_image_decoder = NULL;
+void luna_set_image_decoder(LunaImageDecoder fn) { g_image_decoder = fn; }
+static GLuint LUNA_UNUSED load_or_get_texture(const char* path) { return load_texture_tinted(path, 0); }
+
+/* tint != 0: the picture's alpha, painted in that RGBA colour (CSS mask-image). */
+static GLuint load_texture_tinted(const char* path0, unsigned tint) {
+    if (!path0 || !path0[0]) return 0;
+    char keybuf[96];
+    const char* key = path0;
+    if (tint) {
+        snprintf(keybuf, sizeof keybuf, "%.80s\x01%08x", path0, tint);
+        key = keybuf;
+    }
+    const char* path = luna_expand_path(path0);
     for (int i = 0; i < g_tex_count; i++)
-        if (strcmp(g_tex_cache[i].path, path) == 0) return g_tex_cache[i].tex;
-    if (g_tex_count >= MAX_TEXTURES) return 0;
+        if (strcmp(g_tex_cache[i].path, key) == 0) return g_tex_cache[i].tex;
+    if (g_tex_count == g_tex_cap) {
+        int cap = g_tex_cap ? g_tex_cap * 2 : 64;
+        TexEntry* g = (TexEntry*)realloc(g_tex_cache, sizeof(*g) * (size_t)cap);
+        if (!g) return 0;
+        g_tex_cache = g; g_tex_cap = cap;
+    }
 
     char resolved[512];
     resolve_resource_path(path, resolved, sizeof(resolved));
@@ -13999,9 +16214,15 @@ static GLuint LUNA_UNUSED load_or_get_texture(const char* path) {
     } else
 #endif
     {
+        if (g_image_decoder) {
+            data = g_image_decoder(encoded, (size_t)encoded_sz, &w, &h);
+            if (data) { luna_flip_rgba_vertical(data, w, h); free_with_stbi = 0; }
+        }
+        if (!data) {
         stbi_set_flip_vertically_on_load(1);
         data = stbi_load_from_memory(encoded, (int)encoded_sz, &w, &h, &ch, 4);
         free_with_stbi = 1;
+        }
 #if defined(LUNA_UI_NANOSVG)
         /* Extension lied / missing: fall back to SVG when stb cannot decode. */
         if (!data && luna_bytes_look_like_svg(encoded, encoded_sz)) {
@@ -14012,6 +16233,15 @@ static GLuint LUNA_UNUSED load_or_get_texture(const char* path) {
     }
     free(encoded);
     if (!data) return 0;
+    if (tint) {
+        const unsigned char tr = (unsigned char)(tint >> 24), tg = (unsigned char)(tint >> 16),
+                            tb = (unsigned char)(tint >> 8), ta = (unsigned char)tint;
+        for (long px = 0; px < (long)w * h; px++) {
+            unsigned char* p = data + px * 4;
+            p[3] = (unsigned char)((p[3] * ta + 127) / 255);
+            p[0] = tr; p[1] = tg; p[2] = tb;
+        }
+    }
 
     GLuint tex;
     glGenTextures(1, &tex);
@@ -14025,7 +16255,7 @@ static GLuint LUNA_UNUSED load_or_get_texture(const char* path) {
     if (free_with_stbi) stbi_image_free(data);
     else free(data);
 
-    strncpy(g_tex_cache[g_tex_count].path, path, sizeof(g_tex_cache[0].path) - 1);
+    strncpy(g_tex_cache[g_tex_count].path, key, sizeof(g_tex_cache[0].path) - 1);
     g_tex_cache[g_tex_count].path[sizeof(g_tex_cache[0].path) - 1] = '\0';
     g_tex_cache[g_tex_count].tex = tex;
     g_tex_cache[g_tex_count].tw = w;
@@ -14109,7 +16339,7 @@ static void draw_image(float x, float y, float w, float h, float radius, GLuint 
     glBindTexture(GL_TEXTURE_2D, tex);
     glUniform1i_(img_loc.uImage, 0);
     luna_bind_vao(g_rect_vao);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -14132,7 +16362,7 @@ static void draw_image_piece(float dx, float dy, float dw, float dh,
     glUniform2f(img_loc.uImgOrigin, -sx * dw / sw,
                 -((float)th - sy - sh) * dh / sh);
     glUniform2f(img_loc.uImgDrawSize, img_w, img_h);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 /* CSS border-image with `stretch`: nine pieces, the corners at their edge
@@ -14294,7 +16524,7 @@ static void draw_bg_layer(float x, float y, float w, float h,
                     g_bg_clip_rad4[2], g_bg_clip_rad4[3]);
     }
     luna_bind_vao(g_rect_vao);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 /* CSS Backgrounds §5.5: radii are scaled together when adjacent corners do
@@ -14399,7 +16629,7 @@ void draw_rect_full(float x, float y, float w, float h,
     }
 
     luna_bind_vao(g_rect_vao);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 // Simplified solid-color rect (no gradient, uniform corner radius).
@@ -14496,7 +16726,7 @@ static void draw_shadow(float ex, float ey, float ew, float eh,
     uni2f(sh_loc.uOffset,      &sh_uni.uOffset,      off_x, off_y);
 
     luna_bind_vao(g_rect_vao);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 /* Flush accumulated glyph quads for the given texture. */
@@ -14715,10 +16945,29 @@ static void apply_text_transform_buf(char* buf, int transform) {
 
 /* fx: optional element supplying letter-spacing / text-transform /
    text-decoration / text-shadow (NULL for plain text). */
+/* Every line of text drawn this frame: where it is, and which bytes of which
+ * element it shows.  Selecting and copying page text works from these. */
+typedef struct { int idx, off, len; float x, base, w, lh, cap; int root; } TextLine;
+static TextLine* g_tl;
+static int g_tl_n, g_tl_cap;
+static int g_text_rec_idx = -1;   /* the element whose own text is being drawn, else -1 */
+
+static void text_line_record(int idx, int off, int len, float x, float base, float w, float lh, float cap) {
+    if (len <= 0) return;
+    if (g_tl_n == g_tl_cap) {
+        int cap2 = g_tl_cap ? g_tl_cap * 2 : 256;
+        TextLine* g = (TextLine*)realloc(g_tl, sizeof(*g) * (size_t)cap2);
+        if (!g) return;
+        g_tl = g; g_tl_cap = cap2;
+    }
+    g_tl[g_tl_n++] = (TextLine){ idx, off, len, x, base, w, lh, cap, g_render_root };
+}
+
 void render_text_fx(const char* text, float x, float y, float box_w, float box_h, int align,
                     int v_align, float r, float g, float b, float a, float fsize, int bold,
                     float css_line_height, int white_space, int text_overflow, int overflow_wrap,
     const LunaElement* fx) {
+    const char* text0 = text;
     g_text_letter_spacing = fx ? fx->letter_spacing : 0.0f;
     if (!font_loaded || !text || !*text) {
         g_text_letter_spacing = 0.0f;
@@ -14752,6 +17001,7 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
         }
         tbuf[n] = '\0';
         text = tbuf;
+        text0 = tbuf;      /* byte-wise transform keeps offsets; record against the copy */
     }
 
     int is_fake_bold = 0;
@@ -14875,6 +17125,11 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
         }
         if (baseline < y + cap_h) baseline = y + cap_h;
         if (baseline + (line_h - cap_h) * 0.5f > y + box_h + 0.5f) break;
+        if (g_text_rec_idx >= 0) {
+            int rl = take;
+            while (rl > 0 && (p[rl - 1] == ' ' || p[rl - 1] == '\t')) rl--;
+            text_line_record(g_text_rec_idx, (int)(p - text0), rl, start_x, baseline, line_w, line_h, cap_h);
+        }
         /* CSS text-shadow: offset pass(es) under the main glyphs */
         if (fx && fx->has_text_shadow && fx->tsh_a > 0.004f) {
             float sa = fx->tsh_a * a;
@@ -14966,7 +17221,7 @@ void render_text(const char* text, float x, float y, float box_w, float box_h, i
  * explicitly center/end their anonymous text item on the cross axis, and
  * native text inputs retain their platform-like centered line. */
 static int css_text_vertical_align(const LunaElement* e) {
-    if (strcmp(e->type, "button") == 0) return 1;
+    if (el_is_button_like(e)) return 1;
     if (e->is_input) return e->input_multiline ? 0 : 1;
     if (e->display_mode != DISPLAY_FLEX) return 0;
     if (e->flex_direction == FLEX_DIR_ROW) {
@@ -15025,6 +17280,13 @@ static LunaTrapDismissFn get_trap_dismiss_fn(int trap_idx) {
         if (g_focus_traps[i].idx == trap_idx)
             return g_focus_traps[i].on_dismiss;
     return NULL;
+}
+
+static int focus_trap_is_popup(int trap) {
+    for (int i = g_focus_trap_count - 1; i >= 0; --i)
+        if (g_focus_traps[i].idx == trap)
+            return g_focus_traps[i].backdrop_dismiss == 2;
+    return 0;
 }
 
 static float content_offset_y(int target, int ancestor) {
@@ -15159,11 +17421,11 @@ void recompute_hover(void* window, double xpos, double ypos) {
 
     int hit = hit_test_at(xpos, ypos);
     if (++g_hover_epoch == 0) {
-        memset(g_hover_mark, 0, sizeof(g_hover_mark));
+        LUNA_AUX_ZERO(g_hover_mark);
         g_hover_epoch = 1;
     }
     int next_count = 0;
-    for (int a = hit; a != -1 && next_count < MAX_ELEMENTS;
+    for (int a = hit; a != -1 && next_count < g_aux_cap;
          a = elements[a].parent_idx) {
         g_hover_mark[a] = g_hover_epoch;
         g_hover_next[next_count++] = a;
@@ -15200,9 +17462,26 @@ void recompute_hover(void* window, double xpos, double ypos) {
     set_window_cursor(window, best_cursor);
 }
 
+/* Text selection and the context menu (defined with the input editing code). */
+static int ctx_menu_mouse_button(int button, int action, double mx, double my);
+static int ctx_menu_mouse_move(double mx, double my);
+static void input_mouse_press(LunaElement* e, double mx, double my, int mods, int had_focus);
+static void input_mouse_drag(double mx, double my);
+static void ctx_menu_open_input(int idx, double mx, double my);
+static int g_ds_drag = 0;
+static void ds_mouse_press(double mx, double my, int mods);
+static void ds_mouse_drag(double mx, double my);
+static void ds_clear(void);
+static void ds_copy(void);
+static void ds_select_all(void);
+static int ds_try_open_menu(int hit, double mx, double my);
+
 void cursor_position_callback(void* window, double xpos, double ypos) {
     g_luna_mx = xpos;
     g_luna_my = ypos;
+    if (g_ctx_open) { ctx_menu_mouse_move(xpos, ypos); return; }
+    if (g_input_drag_idx != -1) { input_mouse_drag(xpos, ypos); return; }
+    if (g_ds_drag) { ds_mouse_drag(xpos, ypos); return; }
     if (g_scroll_drag_idx != -1) {
         LunaElement* sc = &elements[g_scroll_drag_idx];
         float pad = sc->padding;
@@ -15225,7 +17504,7 @@ void cursor_position_callback(void* window, double xpos, double ypos) {
                         fabsf(sc->scroll_dest_top - val) > 0.01f) {
                         sc->scroll_top = val;
                         sc->scroll_dest_top = val;
-                        g_layout_dirty = 1;
+                        LUNA_LAYOUT_DIRTY();
                     }
                 }
             }
@@ -15248,7 +17527,7 @@ void cursor_position_callback(void* window, double xpos, double ypos) {
                         fabsf(sc->scroll_dest_left - val) > 0.01f) {
                         sc->scroll_left = val;
                         sc->scroll_dest_left = val;
-                        g_layout_dirty = 1;
+                        LUNA_LAYOUT_DIRTY();
                     }
                 }
             }
@@ -15282,7 +17561,7 @@ void cursor_position_callback(void* window, double xpos, double ypos) {
          * actually changed, not once for every raw pointer packet. */
         if (fabsf(d->rel_x - old_rel_x) > 0.001f ||
             fabsf(d->rel_y - old_rel_y) > 0.001f)
-            g_layout_dirty = 1;
+            LUNA_LAYOUT_DIRTY();
         return;
     }
     recompute_hover(window, xpos, ypos);
@@ -15291,10 +17570,18 @@ void cursor_position_callback(void* window, double xpos, double ypos) {
 void mouse_button_callback(void* window, int button, int action, int mods) {
     (void)window;
     double mx = g_luna_mx, my = g_luna_my;
+    if (g_ctx_open && ctx_menu_mouse_button(button, action, mx, my)) return;
     if (action == LUNA_PRESS)
         g_luna_last_click_mods = mods;
 
     if (action == LUNA_PRESS && button == LUNA_MOUSE_BUTTON_LEFT) {
+        int popup = get_focus_trap_root();
+        if (popup != -1 && focus_trap_is_popup(popup) &&
+            !is_descendant_of(hit_test_at(mx, my), popup)) {
+            LunaTrapDismissFn dismiss = get_trap_dismiss_fn(popup);
+            if (dismiss) dismiss(popup);
+            return;
+        }
         g_luna_last_click_button = LUNA_MOUSE_BUTTON_LEFT;
         g_drag_moved = 0;
         g_press_x = mx;
@@ -15332,6 +17619,7 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
 
         int hit = hit_test_at(mx, my);
         if (g_mouse_press_hook) g_mouse_press_hook(hit, button, mods);
+        if (hit == -1) ds_clear();
         if (hit != -1) {
             LunaElement* e = &elements[hit];
             if (g_focused_element_idx != -1 && g_focused_element_idx != hit)
@@ -15339,14 +17627,11 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
             /* A pointer target is necessarily already visible. Scrolling it
                into view here can move a scroll container between press and
                release, causing the release to activate a different row. */
+            int had_focus = g_focused_element_idx == hit;
             focus_element_pointer(hit);
             bring_window_ptr_to_front(hit);
-            if (e->is_input) {
-                float bx, by, bw, bh;
-                get_element_draw_bounds(e, &bx, &by, &bw, &bh);
-                input_set_caret_from_point(e, (float)mx - bx - e->pad_l,
-                                           (float)my - by - e->pad_t);
-            }
+            if (e->is_input) { ds_clear(); input_mouse_press(e, mx, my, mods, had_focus); }
+            else if (!e->is_draggable) ds_mouse_press(mx, my, mods);
             e->is_active = 1;
             (void)restyle_element_checked(e);
             restyle_descendants_of(hit);
@@ -15375,8 +17660,17 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
         g_luna_last_click_button = LUNA_MOUSE_BUTTON_RIGHT;
         g_pointer_event_consumed = 0;
         if (g_mouse_press_hook) g_mouse_press_hook(hit, button, mods);
+        if (!g_pointer_event_consumed && g_luna_ctx_menu_enabled && hit != -1 && elements[hit].is_input &&
+            !element_is_inert(hit)) {
+            ctx_menu_open_input(hit, mx, my);
+            g_pointer_event_consumed = 1;
+        } else if (!g_pointer_event_consumed && g_luna_ctx_menu_enabled && hit != -1 && ds_try_open_menu(hit, mx, my)) {
+            g_pointer_event_consumed = 1;
+        }
     } else if (action == LUNA_RELEASE && button == LUNA_MOUSE_BUTTON_LEFT) {
         int hit = hit_test_at(mx, my);
+        g_input_drag_idx = -1;
+        g_ds_drag = 0;
 
         for (int i = 0; i < elem_count; i++) {
             if (elements[i].is_active) {
@@ -15396,7 +17690,7 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
             if (trap != -1 && hit == trap) {
                 for (int ti = g_focus_trap_count - 1; ti >= 0; ti--) {
                     if (g_focus_traps[ti].idx != trap) continue;
-                    if (!g_focus_traps[ti].backdrop_dismiss) break;
+                    if (g_focus_traps[ti].backdrop_dismiss != 1) break;
                     if (g_focus_traps[ti].on_dismiss)
                         g_focus_traps[ti].on_dismiss(trap);
                     break;
@@ -15437,7 +17731,7 @@ static void LUNA_UNUSED framebuffer_size_callback(void* window, int width, int h
     (void)window;
     (void)width;
     (void)height;
-    g_layout_dirty = 1; g_render_order_dirty = 1;
+    LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
 }
 
 static int element_is_inert(int idx) {
@@ -15528,7 +17822,7 @@ static int tab_order_cmp(const void* a, const void* b) {
 
 static void focus_move_tab(int backward) {
     int trap = get_focus_trap_root();
-    int order[MAX_ELEMENTS];
+    LUNA_SCRATCH(int, order, elem_count + 1);
     int n = 0;
     for (int i = 0; i < elem_count; i++) {
         if (!element_is_focusable(i)) continue;
@@ -15552,7 +17846,7 @@ static void focus_select_option_step(int backward) {
     int trap = get_focus_trap_root();
     if (trap == -1) return;
     if (element_has_class(&elements[trap], "hidden")) return;
-    int options[MAX_ELEMENTS];
+    LUNA_SCRATCH(int, options, elem_count + 1);
     int n = 0;
     for (int i = 0; i < elem_count; i++) {
         if (elements[i].parent_idx != trap) continue;
@@ -15564,7 +17858,8 @@ static void focus_select_option_step(int backward) {
     int cur = -1;
     for (int i = 0; i < n; i++)
         if (options[i] == g_focused_element_idx) { cur = i; break; }
-    int next = (cur == -1) ? 0 : backward ? (cur - 1 + n) % n : (cur + 1) % n;
+    int next = backward == 2 ? 0 : backward == 3 ? n - 1 :
+        cur == -1 ? 0 : backward ? (cur > 0 ? cur - 1 : 0) : (cur < n - 1 ? cur + 1 : n - 1);
     focus_element_ex(options[next], 1, 1);
 }
 
@@ -15586,6 +17881,12 @@ static void input_ensure_caret(LunaElement* e) {
     /* Snap to UTF-8 boundary */
     while (e->caret > 0 && ((unsigned char)e->text[e->caret] & 0xC0) == 0x80)
         e->caret--;
+    if (e->sel_has) {
+        if (e->sel_anchor < 0) e->sel_anchor = 0;
+        if (e->sel_anchor > n) e->sel_anchor = n;
+        while (e->sel_anchor > 0 && ((unsigned char)e->text[e->sel_anchor] & 0xC0) == 0x80)
+            e->sel_anchor--;
+    }
 }
 
 static void input_mark_dirty(void) {
@@ -15594,35 +17895,327 @@ static void input_mark_dirty(void) {
     luna_app_request_redraw();
 }
 
+static void input_set_caret_from_point(LunaElement* e, float local_x, float local_y);
+static int input_line_start(const LunaElement* e, int pos);
+static int input_line_end(const LunaElement* e, int pos);
+
+/* The selection as [a, b) byte offsets; 0 when there is none. */
+static int input_sel_range(LunaElement* e, int* a, int* b) {
+    if (!e->sel_has) return 0;
+    input_ensure_caret(e);
+    int x = e->sel_anchor, y = e->caret;
+    if (x == y) { e->sel_has = 0; return 0; }
+    if (x > y) { int t = x; x = y; y = t; }
+    if (a) *a = x;
+    if (b) *b = y;
+    return 1;
+}
+
+static void input_select(LunaElement* e, int anchor, int caret) {
+    e->sel_anchor = anchor;
+    e->caret = caret;
+    e->sel_has = anchor != caret;
+    input_ensure_caret(e);
+    input_mark_dirty();
+}
+
+
+/* ── Undo / redo: snapshots of the focused field, typing merged into one step ── */
+typedef struct { char* text; int caret, anchor, has; } InputSnap;
+#define INPUT_HIST_MAX 100
+static InputSnap g_undo[INPUT_HIST_MAX], g_redo[INPUT_HIST_MAX];
+static int g_undo_n, g_redo_n;
+static int g_hist_kind, g_hist_caret = -1;
+
+static void input_snap_free(InputSnap* sn) { free(sn->text); sn->text = NULL; }
+
+static void input_hist_reset(void) {
+    for (int i = 0; i < g_undo_n; i++) input_snap_free(&g_undo[i]);
+    for (int i = 0; i < g_redo_n; i++) input_snap_free(&g_redo[i]);
+    g_undo_n = g_redo_n = 0;
+    g_hist_idx = -1; g_hist_kind = 0; g_hist_caret = -1;
+}
+
+static int input_snap_take(InputSnap* sn, const LunaElement* e) {
+    sn->text = luna_strdup_local(e->text);
+    sn->caret = e->caret; sn->anchor = e->sel_anchor; sn->has = e->sel_has;
+    return sn->text != NULL;
+}
+
+/* Called before an edit.  kind 1 = typing, 2 = backspace, 3 = delete forward,
+ * 0 = anything else; runs of the same kind that continue at the caret share a step. */
+static void input_hist_before(LunaElement* e, int kind) {
+    int idx = (int)(e - elements);
+    if (idx != g_hist_idx) { input_hist_reset(); g_hist_idx = idx; }
+    if (kind && kind == g_hist_kind && e->caret == g_hist_caret && !e->sel_has) return;
+    for (int i = 0; i < g_redo_n; i++) input_snap_free(&g_redo[i]);
+    g_redo_n = 0;
+    if (g_undo_n == INPUT_HIST_MAX) {
+        input_snap_free(&g_undo[0]);
+        memmove(&g_undo[0], &g_undo[1], sizeof(InputSnap) * (INPUT_HIST_MAX - 1));
+        g_undo_n--;
+    }
+    if (input_snap_take(&g_undo[g_undo_n], e)) g_undo_n++;
+    g_hist_kind = kind;
+}
+
+/* After the edit: where a continuing run would have the caret. */
+static void input_hist_after(const LunaElement* e) { g_hist_caret = e->caret; }
+
+static void input_restore(LunaElement* e, const InputSnap* sn) {
+    snprintf(e->text, sizeof e->text, "%s", sn->text);
+    e->caret = sn->caret; e->sel_anchor = sn->anchor; e->sel_has = sn->has;
+    input_ensure_caret(e);
+    g_hist_kind = 0;
+    input_mark_dirty();
+}
+
+static int input_can_undo(const LunaElement* e) { return g_hist_idx == (int)(e - elements) && g_undo_n > 0; }
+static int input_can_redo(const LunaElement* e) { return g_hist_idx == (int)(e - elements) && g_redo_n > 0; }
+
+static void input_cmd_undo(LunaElement* e) {
+    if (!input_can_undo(e) || g_redo_n == INPUT_HIST_MAX) return;
+    if (input_snap_take(&g_redo[g_redo_n], e)) g_redo_n++;
+    InputSnap sn = g_undo[--g_undo_n];
+    input_restore(e, &sn);
+    input_snap_free(&sn);
+}
+
+static void input_cmd_redo(LunaElement* e) {
+    if (!input_can_redo(e) || g_undo_n == INPUT_HIST_MAX) return;
+    if (input_snap_take(&g_undo[g_undo_n], e)) g_undo_n++;
+    InputSnap sn = g_redo[--g_redo_n];
+    input_restore(e, &sn);
+    input_snap_free(&sn);
+}
+
+static int input_delete_selection(LunaElement* e) {
+    int a, b;
+    if (!input_sel_range(e, &a, &b)) return 0;
+    input_hist_before(e, 0);
+    int n = (int)strlen(e->text);
+    memmove(e->text + a, e->text + b, (size_t)(n - b) + 1);
+    e->caret = a;
+    e->sel_has = 0;
+    input_hist_after(e);
+    g_hist_kind = 0;
+    input_mark_dirty();
+    return 1;
+}
+
 static void input_insert_utf8(LunaElement* e, const char* bytes, int blen) {
     if (!e || !bytes || blen <= 0) return;
+    int had_sel = input_sel_range(e, NULL, NULL);
+    input_delete_selection(e);
     input_ensure_caret(e);
+    input_hist_before(e, had_sel || blen > 4 ? 0 : 1);
     int n = (int)strlen(e->text);
     int cap = (int)sizeof(e->text) - 1;
-    if (n + blen > cap) blen = cap - n;
+    if (n + blen > cap) {
+        blen = cap - n;
+        /* Never cut a multi-byte character in two. */
+        while (blen > 0 && ((unsigned char)bytes[blen] & 0xC0) == 0x80) blen--;
+    }
     if (blen <= 0) return;
     memmove(e->text + e->caret + blen, e->text + e->caret, (size_t)(n - e->caret) + 1);
     memcpy(e->text + e->caret, bytes, (size_t)blen);
     e->caret += blen;
+    input_hist_after(e);
     input_mark_dirty();
 }
 
 static void input_backspace(LunaElement* e) {
+    if (input_delete_selection(e)) return;
     input_ensure_caret(e);
     if (e->caret <= 0) return;
+    input_hist_before(e, 2);
     int prev = utf8_prev_boundary(e->text, e->caret);
     int n = (int)strlen(e->text);
     memmove(e->text + prev, e->text + e->caret, (size_t)(n - e->caret) + 1);
     e->caret = prev;
+    input_hist_after(e);
     input_mark_dirty();
 }
 
 static void input_delete_forward(LunaElement* e) {
+    if (input_delete_selection(e)) return;
     input_ensure_caret(e);
     int n = (int)strlen(e->text);
     if (e->caret >= n) return;
+    input_hist_before(e, 3);
     int next = utf8_next_boundary(e->text, e->caret);
     memmove(e->text + e->caret, e->text + next, (size_t)(n - next) + 1);
+    input_hist_after(e);
+    input_mark_dirty();
+}
+
+/* Words: runs of letters, digits, '_' and non-ASCII text. */
+static int input_is_word_byte(unsigned char c) { return isalnum(c) || c == '_' || c >= 0x80; }
+
+static int input_word_left(const LunaElement* e, int pos) {
+    while (pos > 0 && !input_is_word_byte((unsigned char)e->text[pos - 1])) pos--;
+    while (pos > 0 && input_is_word_byte((unsigned char)e->text[pos - 1])) pos--;
+    while (pos > 0 && ((unsigned char)e->text[pos] & 0xC0) == 0x80) pos--;
+    return pos;
+}
+
+static int input_word_right(const LunaElement* e, int pos) {
+    int n = (int)strlen(e->text);
+    while (pos < n && input_is_word_byte((unsigned char)e->text[pos])) pos++;
+    while (pos < n && !input_is_word_byte((unsigned char)e->text[pos])) pos++;
+    return pos;
+}
+
+/* The run of same-kind characters around pos (a word, or white space). */
+static void input_word_at(const LunaElement* e, int pos, int* a, int* b) {
+    int n = (int)strlen(e->text);
+    if (pos > n) pos = n;
+    int probe = pos < n ? pos : (pos > 0 ? pos - 1 : 0);
+    unsigned char c = (unsigned char)e->text[probe];
+    int kind = input_is_word_byte(c) ? 1 : isspace(c) ? 2 : 3;
+    int x = probe, y = probe;
+    #define KIND(ch) (input_is_word_byte(ch) ? 1 : isspace(ch) ? 2 : 3)
+    while (x > 0 && KIND((unsigned char)e->text[x - 1]) == kind) x--;
+    while (y < n && KIND((unsigned char)e->text[y]) == kind) y++;
+    #undef KIND
+    *a = x; *b = y;
+}
+
+/* Moves the caret; with `extend` the selection grows from where it started. */
+static void input_move_to(LunaElement* e, int pos, int extend) {
+    input_ensure_caret(e);
+    if (extend) {
+        if (!e->sel_has) e->sel_anchor = e->caret;
+        e->caret = pos;
+        e->sel_has = e->sel_anchor != e->caret;
+    } else {
+        e->caret = pos;
+        e->sel_has = 0;
+    }
+    input_ensure_caret(e);
+    input_mark_dirty();
+}
+
+/* ── Clipboard (the platform's, else a private one so copy/paste still work) ── */
+static char* g_clip_internal;
+
+static void luna_clip_put(const char* utf8) {
+    if (g_luna_platform.set_clipboard) g_luna_platform.set_clipboard(utf8 ? utf8 : "");
+    free(g_clip_internal);
+    g_clip_internal = luna_strdup_local(utf8 ? utf8 : "");
+}
+
+static char* luna_clip_take(void) {
+    char* c = g_luna_platform.get_clipboard ? g_luna_platform.get_clipboard() : NULL;
+    if (!c && g_clip_internal) c = luna_strdup_local(g_clip_internal);
+    return c;
+}
+
+/* ── Editing commands: shared by keys and the context menu ── */
+static int input_can_copy(LunaElement* e) { return !e->input_password && input_sel_range(e, NULL, NULL); }
+
+static void input_cmd_copy(LunaElement* e) {
+    int a, b;
+    if (e->input_password || !input_sel_range(e, &a, &b)) return;
+    char* t = (char*)malloc((size_t)(b - a) + 1);
+    if (!t) return;
+    memcpy(t, e->text + a, (size_t)(b - a));
+    t[b - a] = '\0';
+    luna_clip_put(t);
+    free(t);
+}
+
+static void input_cmd_cut(LunaElement* e) {
+    if (!input_can_copy(e)) return;
+    input_cmd_copy(e);
+    input_delete_selection(e);
+}
+
+static void input_cmd_paste(LunaElement* e) {
+    char* clip = luna_clip_take();
+    if (!clip) return;
+    if (!e->input_multiline) {          /* one line: line breaks become spaces */
+        for (char* q = clip; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
+    } else {                            /* CRLF -> LF */
+        char* w = clip;
+        for (char* q = clip; *q; q++) if (*q != '\r' || q[1] != '\n') *w++ = *q;
+        *w = '\0';
+    }
+    input_insert_utf8(e, clip, (int)strlen(clip));
+    free(clip);
+}
+
+static void input_cmd_select_all(LunaElement* e) { input_select(e, 0, (int)strlen(e->text)); }
+
+/* ── Mouse: caret, drag selection, double / triple click ── */
+static int g_click_idx = -1, g_click_n;
+static double g_click_time, g_click_x, g_click_y;
+static int g_input_drag_anchor0, g_input_drag_anchor1;   /* the word / line the drag started from */
+static int g_input_drag_unit;                             /* 1 char, 2 word, 3 line */
+
+static void input_point_to_caret(LunaElement* e, double mx, double my) {
+    float bx, by, bw, bh;
+    get_element_draw_bounds(e, &bx, &by, &bw, &bh);
+    input_set_caret_from_point(e, (float)mx - bx - e->pad_l, (float)my - by - e->pad_t);
+}
+
+static void input_mouse_press(LunaElement* e, double mx, double my, int mods, int had_focus) {
+    int idx = (int)(e - elements);
+    int old_caret = e->caret;
+    double now = luna_now();
+    if (idx == g_click_idx && now - g_click_time < 0.45 && fabs(mx - g_click_x) < 5 && fabs(my - g_click_y) < 5)
+        g_click_n = g_click_n >= 3 ? 1 : g_click_n + 1;
+    else g_click_n = 1;
+    g_click_idx = idx; g_click_time = now; g_click_x = mx; g_click_y = my;
+
+    input_point_to_caret(e, mx, my);
+    input_ensure_caret(e);
+    int pos = e->caret;
+    g_input_drag_idx = idx;
+    g_input_drag_unit = g_click_n;
+    if (g_click_n == 1) {
+        if ((mods & LUNA_MOD_SHIFT) && had_focus) {
+            if (!e->sel_has) e->sel_anchor = old_caret;
+            e->sel_has = e->sel_anchor != pos;
+        } else {
+            e->sel_anchor = pos; e->sel_has = 0;
+        }
+        g_input_drag_anchor0 = g_input_drag_anchor1 = e->sel_anchor;
+    } else if (g_click_n == 2) {
+        int a, b;
+        input_word_at(e, pos, &a, &b);
+        input_select(e, a, b);
+        g_input_drag_anchor0 = a; g_input_drag_anchor1 = b;
+    } else {
+        int a = e->input_multiline ? input_line_start(e, pos) : 0;
+        int b = e->input_multiline ? input_line_end(e, pos) : (int)strlen(e->text);
+        input_select(e, a, b);
+        g_input_drag_anchor0 = a; g_input_drag_anchor1 = b;
+    }
+    input_mark_dirty();
+}
+
+static void input_mouse_drag(double mx, double my) {
+    int idx = g_input_drag_idx;
+    if (idx < 0 || idx >= elem_count || !elements[idx].is_input) { g_input_drag_idx = -1; return; }
+    LunaElement* e = &elements[idx];
+    input_point_to_caret(e, mx, my);
+    input_ensure_caret(e);
+    int pos = e->caret;
+    if (g_input_drag_unit == 2) {          /* extend by whole words */
+        int a, b;
+        input_word_at(e, pos, &a, &b);
+        if (pos < g_input_drag_anchor0) { e->sel_anchor = g_input_drag_anchor1; e->caret = a; }
+        else { e->sel_anchor = g_input_drag_anchor0; e->caret = b; }
+    } else if (g_input_drag_unit == 3) {   /* by whole lines */
+        int a = e->input_multiline ? input_line_start(e, pos) : 0;
+        int b = e->input_multiline ? input_line_end(e, pos) : (int)strlen(e->text);
+        if (pos < g_input_drag_anchor0) { e->sel_anchor = g_input_drag_anchor1; e->caret = a; }
+        else { e->sel_anchor = g_input_drag_anchor0; e->caret = b; }
+    } else {
+        e->sel_anchor = g_input_drag_anchor0;
+    }
+    e->sel_has = e->sel_anchor != e->caret;
     input_mark_dirty();
 }
 
@@ -15650,7 +18243,16 @@ static float measure_input_range(LunaElement* e, int begin, int end) {
     float css_px = e->font_size > 0.0f ? e->font_size : 16.0f;
     FontAtlas* atlas = get_atlas(css_px, e->font_bold, NULL);
     text_metrics_begin(css_px, e->font_bold, e->font_face, atlas);
-    float result = measure_text_range(atlas, e->text + begin, end - begin);
+    float result;
+    if (e->input_password) {
+        int n = 0;
+        const char* p = e->text + begin;
+        const char* stop = e->text + end;
+        while (p < stop && *p) { (void)utf8_decode(&p); n++; }
+        result = glyph_advance(atlas, (int)'*', css_px) * (float)n;
+    } else {
+        result = measure_text_range(atlas, e->text + begin, end - begin);
+    }
     text_metrics_end();
     return result;
 }
@@ -15760,6 +18362,7 @@ static int g_ime_preedit_begin = 0;
 static int g_ime_preedit_end = 0;
 
 static void char_callback_impl(unsigned int codepoint) {
+    if (g_ctx_open) return;
     if (g_text_commit_handler &&
         g_text_commit_handler(codepoint, g_text_commit_userdata))
         return;
@@ -15837,6 +18440,649 @@ void luna_ime_delete_surrounding(unsigned before_bytes, unsigned after_bytes) {
     }
 }
 
+
+/* ── Context menu (right-click in a text field) ───────────────────────────
+ * Drawn and hit-tested here, on top of the document, so it works the same in
+ * every host and needs no DOM nodes. */
+static char* g_ctx_link;           /* the link under a page-text right-click, if any */
+enum { CTX_CUT = 1, CTX_COPY, CTX_PASTE, CTX_DELETE, CTX_SELALL, CTX_SEP, CTX_UNDO, CTX_REDO, CTX_LINKCOPY };
+typedef struct { int id; int enabled; } CtxItem;
+static struct { float x, y, w, h; int target; int n; CtxItem it[10]; int hover; } g_ctx;
+#define CTX_ITEM_H 30.0f
+#define CTX_SEP_H 9.0f
+#define CTX_PAD 4.0f
+#define CTX_W 216.0f
+
+void luna_context_menu_enable(int enabled) { g_luna_ctx_menu_enabled = enabled ? 1 : 0; if (!enabled) g_ctx_open = 0; }
+
+static int ctx_japanese(void) {
+    static int ja = -1;
+    if (ja < 0) {
+        const char* l = getenv("LC_ALL");
+        if (!l || !*l) l = getenv("LC_MESSAGES");
+        if (!l || !*l) l = getenv("LANG");
+        ja = l && !strncmp(l, "ja", 2);
+    }
+    return ja;
+}
+
+static const char* ctx_label(int id) {
+    int ja = ctx_japanese();
+    switch (id) {
+    case CTX_CUT:    return ja ? "\xe5\x88\x87\xe3\x82\x8a\xe5\x8f\x96\xe3\x82\x8a" : "Cut";
+    case CTX_COPY:   return ja ? "\xe3\x82\xb3\xe3\x83\x94\xe3\x83\xbc" : "Copy";
+    case CTX_PASTE:  return ja ? "\xe8\xb2\xbc\xe3\x82\x8a\xe4\xbb\x98\xe3\x81\x91" : "Paste";
+    case CTX_DELETE: return ja ? "\xe5\x89\x8a\xe9\x99\xa4" : "Delete";
+    case CTX_SELALL: return ja ? "\xe3\x81\x99\xe3\x81\xb9\xe3\x81\xa6\xe9\x81\xb8\xe6\x8a\x9e" : "Select All";
+    case CTX_LINKCOPY: return ja ? "\xe3\x83\xaa\xe3\x83\xb3\xe3\x82\xaf\xe3\x81\xae\xe3\x82\xa2\xe3\x83\x89\xe3\x83\xac\xe3\x82\xb9\xe3\x82\x92\xe3\x82\xb3\xe3\x83\x94\xe3\x83\xbc" : "Copy Link Address";
+    case CTX_UNDO:   return ja ? "\xe5\x85\x83\xe3\x81\xab\xe6\x88\xbb\xe3\x81\x99" : "Undo";
+    case CTX_REDO:   return ja ? "\xe3\x82\x84\xe3\x82\x8a\xe7\x9b\xb4\xe3\x81\x97" : "Redo";
+    }
+    return "";
+}
+
+static const char* ctx_shortcut(int id) {
+    switch (id) {
+    case CTX_CUT: return "Ctrl+X";
+    case CTX_COPY: return "Ctrl+C";
+    case CTX_PASTE: return "Ctrl+V";
+    case CTX_SELALL: return "Ctrl+A";
+    case CTX_UNDO: return "Ctrl+Z";
+    case CTX_REDO: return "Ctrl+Shift+Z";
+    }
+    return "";
+}
+
+static void ctx_menu_open_input(int idx, double mx, double my) {
+    LunaElement* e = &elements[idx];
+    focus_element_pointer(idx);
+    /* A right-click inside the selection keeps it; elsewhere it moves the caret. */
+    int sa = e->sel_anchor, sc = e->caret, sh = e->sel_has, a = 0, b = 0;
+    int had = input_sel_range(e, &a, &b);
+    input_point_to_caret(e, mx, my);
+    input_ensure_caret(e);
+    int pos = e->caret;
+    if (had && pos >= a && pos <= b) { e->sel_anchor = sa; e->caret = sc; e->sel_has = sh; }
+    else e->sel_has = 0;
+
+    char* clip = luna_clip_take();
+    int can_paste = clip && clip[0];
+    free(clip);
+    int has_sel = input_sel_range(e, NULL, NULL);
+    g_ctx.n = 0;
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_UNDO, input_can_undo(e) };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_REDO, input_can_redo(e) };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_SEP, 0 };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_CUT, input_can_copy(e) };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_COPY, input_can_copy(e) };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_PASTE, can_paste };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_DELETE, has_sel };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_SEP, 0 };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_SELALL, e->text[0] != '\0' };
+    float h = CTX_PAD * 2.0f;
+    for (int i = 0; i < g_ctx.n; i++) h += g_ctx.it[i].id == CTX_SEP ? CTX_SEP_H : CTX_ITEM_H;
+    float rw = LUNA_RRES_X, rh = LUNA_RRES_Y;
+    float x = (float)mx + 2.0f, y = (float)my + 2.0f;
+    if (x + CTX_W > rw - 2.0f) x = (float)mx - CTX_W - 2.0f;
+    if (y + h > rh - 2.0f) y = (float)my - h - 2.0f;
+    if (x < 2.0f) x = 2.0f;
+    if (y < 2.0f) y = 2.0f;
+    g_ctx.x = x; g_ctx.y = y; g_ctx.w = CTX_W; g_ctx.h = h;
+    g_ctx.target = idx;
+    g_ctx.hover = -1;
+    g_ctx_open = 1;
+    input_mark_dirty();
+}
+
+static int ctx_hit(double mx, double my) {
+    if (mx < g_ctx.x || mx >= g_ctx.x + g_ctx.w || my < g_ctx.y || my >= g_ctx.y + g_ctx.h) return -2;
+    float y = g_ctx.y + CTX_PAD;
+    for (int i = 0; i < g_ctx.n; i++) {
+        float ih = g_ctx.it[i].id == CTX_SEP ? CTX_SEP_H : CTX_ITEM_H;
+        if (my >= y && my < y + ih) return g_ctx.it[i].id == CTX_SEP ? -1 : i;
+        y += ih;
+    }
+    return -1;
+}
+
+static void ctx_menu_close(void) {
+    if (!g_ctx_open) return;
+    g_ctx_open = 0;
+    input_mark_dirty();
+}
+
+static void ctx_menu_exec(int i) {
+    if (i < 0 || i >= g_ctx.n || !g_ctx.it[i].enabled) return;
+    int id = g_ctx.it[i].id, t = g_ctx.target;
+    ctx_menu_close();
+    if (t < 0) {                           /* page text */
+        if (id == CTX_COPY) ds_copy();
+        else if (id == CTX_LINKCOPY) { if (g_ctx_link) luna_clip_put(g_ctx_link); }
+        else if (id == CTX_SELALL) ds_select_all();
+        return;
+    }
+    if (t >= elem_count || !elements[t].is_input) return;
+    LunaElement* e = &elements[t];
+    switch (id) {
+    case CTX_UNDO: input_cmd_undo(e); break;
+    case CTX_REDO: input_cmd_redo(e); break;
+    case CTX_CUT: input_cmd_cut(e); break;
+    case CTX_COPY: input_cmd_copy(e); break;
+    case CTX_PASTE: input_cmd_paste(e); break;
+    case CTX_DELETE: input_delete_selection(e); break;
+    case CTX_SELALL: input_cmd_select_all(e); break;
+    }
+    input_mark_dirty();
+}
+
+static int ctx_menu_mouse_move(double mx, double my) {
+    int h = ctx_hit(mx, my);
+    if (h >= 0 && !g_ctx.it[h].enabled) h = -1;
+    if (h != g_ctx.hover) { g_ctx.hover = h; input_mark_dirty(); }
+    return 1;
+}
+
+static int ctx_menu_mouse_button(int button, int action, double mx, double my) {
+    if (action == LUNA_PRESS) {
+        int h = ctx_hit(mx, my);
+        if (h == -2) {                         /* outside: close; a right-click goes on to open a new one */
+            ctx_menu_close();
+            return button == LUNA_MOUSE_BUTTON_RIGHT ? 0 : 1;
+        }
+        if (button == LUNA_MOUSE_BUTTON_LEFT && h >= 0) ctx_menu_exec(h);
+    }
+    return 1;
+}
+
+static int ctx_menu_key(int key, int action) {
+    if (!g_ctx_open) return 0;
+    if (action == LUNA_RELEASE) return 1;
+    if (key == LUNA_KEY_ESCAPE) { ctx_menu_close(); return 1; }
+    if (key == LUNA_KEY_UP || key == LUNA_KEY_DOWN) {
+        int dir = key == LUNA_KEY_DOWN ? 1 : -1, i = g_ctx.hover;
+        for (int step = 0; step < g_ctx.n; step++) {
+            i = i < 0 ? (dir > 0 ? 0 : g_ctx.n - 1) : (i + dir + g_ctx.n) % g_ctx.n;
+            if (g_ctx.it[i].id != CTX_SEP && g_ctx.it[i].enabled) { g_ctx.hover = i; break; }
+        }
+        input_mark_dirty();
+        return 1;
+    }
+    if (key == LUNA_KEY_ENTER || key == LUNA_KEY_KP_ENTER || key == LUNA_KEY_SPACE) {
+        if (g_ctx.hover >= 0) ctx_menu_exec(g_ctx.hover);
+        return 1;
+    }
+    if (key == LUNA_KEY_TAB) ctx_menu_close();
+    return 1;
+}
+
+static void ctx_menu_draw(void) {
+    if (!g_ctx_open) return;
+    glDisable(GL_SCISSOR_TEST);
+    rc_scissor_reset();
+    float x = g_ctx.x, y = g_ctx.y, w = g_ctx.w, h = g_ctx.h;
+    draw_rect(x - 2, y + 1, w + 4, h + 5, 0, 0, 0, 0.07f, 9, 0, 0, 0, 0, 0);
+    draw_rect(x - 1, y + 2, w + 2, h + 2, 0, 0, 0, 0.12f, 8, 0, 0, 0, 0, 0);
+    draw_rect(x, y, w, h, 0.99f, 0.99f, 0.99f, 1, 6, 1, 0.76f, 0.77f, 0.79f, 1);
+    float iy = y + CTX_PAD;
+    for (int i = 0; i < g_ctx.n; i++) {
+        const CtxItem* it = &g_ctx.it[i];
+        if (it->id == CTX_SEP) {
+            draw_rect(x + 8, iy + CTX_SEP_H * 0.5f, w - 16, 1, 0.84f, 0.85f, 0.87f, 1, 0, 0, 0, 0, 0, 0);
+            iy += CTX_SEP_H;
+            continue;
+        }
+        int hot = i == g_ctx.hover && it->enabled;
+        if (hot) draw_rect(x + 4, iy, w - 8, CTX_ITEM_H, 0.16f, 0.43f, 0.86f, 1, 4, 0, 0, 0, 0, 0);
+        float r = hot ? 1.0f : it->enabled ? 0.1f : 0.58f;
+        float g = r, b = r;
+        render_text(ctx_label(it->id), x + 16, iy, w - 32, CTX_ITEM_H, 0, 1, r, g, b, 1, 14, 0, 0, 1, 0, 0);
+        if (ctx_shortcut(it->id)[0])
+            render_text(ctx_shortcut(it->id), x + 16, iy, w - 32, CTX_ITEM_H, 2, 1,
+                        hot ? 0.9f : 0.5f, hot ? 0.93f : 0.5f, hot ? 1.0f : 0.52f, it->enabled ? 1 : 0.6f,
+                        12, 0, 0, 1, 0, 0);
+        iy += CTX_ITEM_H;
+    }
+}
+
+/* A single-line input scrolls its text under the caret.  The text has to be cut at
+ * the input's own content box, or a long value is drawn over the neighbouring
+ * controls (the path field of a file dialog showed this). */
+static void input_clip_begin(float x, float y, float w, float h, int fbw, int fbh) {
+    float res_y = LUNA_RRES_Y, sx = (float)fbw / LUNA_RRES_X, sy = (float)fbh / res_y;
+    int sc[4];
+    sc[0] = (int)((x - g_render_off_x) * sx + 0.5f);
+    sc[1] = (int)((res_y - (y - g_render_off_y) - h) * sy + 0.5f);
+    sc[2] = (int)(w * sx + 0.5f);
+    sc[3] = (int)(h * sy + 0.5f);
+    if (g_rc_scissor_on == 1) {
+        int x2 = sc[0] + sc[2], y2 = sc[1] + sc[3];
+        int cx2 = g_rc_scissor[0] + g_rc_scissor[2], cy2 = g_rc_scissor[1] + g_rc_scissor[3];
+        if (sc[0] < g_rc_scissor[0]) sc[0] = g_rc_scissor[0];
+        if (sc[1] < g_rc_scissor[1]) sc[1] = g_rc_scissor[1];
+        if (x2 > cx2) x2 = cx2;
+        if (y2 > cy2) y2 = cy2;
+        sc[2] = x2 - sc[0]; sc[3] = y2 - sc[1];
+    }
+    if (sc[2] < 0) sc[2] = 0;
+    if (sc[3] < 0) sc[3] = 0;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(sc[0], sc[1], sc[2], sc[3]);
+}
+
+/* The selected part of a field painted as blue with white text over the
+ * normally drawn line: the highlight covers the text, and the same text is
+ * drawn again in white, clipped to it. */
+static void input_draw_selection(LunaElement* e, int idx, int fbw, int fbh, const char* tbuf,
+                                 float dx, float dy, float pad_l, float pad_t, float inner_w, float inner_h,
+                                 int align, int ws, float eff_op, float scale) {
+    int a, b;
+    if (!e->is_input || !input_sel_range(e, &a, &b) || !font_loaded || !tbuf[0]) return;
+    float fs = e->font_size > 0 ? (float)e->font_size : 16.0f;
+    float lh = e->line_height;
+    if (lh < 0.0f) lh = -lh * fs;
+    if (lh <= 0.0f) lh = css_normal_line_height(fs);
+    int first_line = e->input_multiline ? input_line_number(e, a) : 0;
+    int last_line = e->input_multiline ? input_line_number(e, b) : 0;
+    float res_x = LUNA_RRES_X, res_y = LUNA_RRES_Y;
+    float sx = (float)fbw / res_x, sy = (float)fbh / res_y;
+    for (int line = first_line; line <= last_line; line++) {
+        int ls = 0;
+        if (e->input_multiline) {
+            const char* p = e->text;
+            for (int k = 0; k < line && *p; k++) { const char* nl = strchr(p, '\n'); if (!nl) { p += strlen(p); break; } p = nl + 1; }
+            ls = (int)(p - e->text);
+        }
+        int le = input_line_end(e, ls);
+        int sa = a > ls ? a : ls, sb = b < le ? b : le;
+        float x0 = measure_input_range(e, ls, sa) - e->input_scroll_x;
+        float x1 = measure_input_range(e, ls, sb) - e->input_scroll_x;
+        if (b > le) x1 += fs * 0.3f;                    /* the selected line break */
+        if (x1 <= x0) continue;
+        float left = dx + pad_l, right = dx + pad_l + inner_w;
+        float hx = left + x0, hr = left + x1;
+        if (hx < left) hx = left;
+        if (hr > right) hr = right;
+        if (hr <= hx) continue;
+        float ch, cy;
+        if (e->input_multiline) { ch = lh; cy = dy + pad_t + (float)line * lh; }
+        else { ch = fs * 1.25f; if (ch > inner_h) ch = inner_h; cy = dy + pad_t + (inner_h - ch) * 0.5f; }
+        draw_rect(hx, cy, hr - hx, ch, 0.16f, 0.43f, 0.86f, eff_op, 0, 0, 0, 0, 0, 0);
+        int sc[4];
+        sc[0] = (int)((hx - g_render_off_x) * sx + 0.5f);
+        sc[1] = (int)((res_y - (cy - g_render_off_y) - ch) * sy + 0.5f);
+        sc[2] = (int)((hr - hx) * sx + 0.5f);
+        sc[3] = (int)(ch * sy + 0.5f);
+        if (g_rc_scissor_on == 1) {                      /* stay inside the element's own clip */
+            int x2 = sc[0] + sc[2], y2 = sc[1] + sc[3];
+            int cx2 = g_rc_scissor[0] + g_rc_scissor[2], cy2 = g_rc_scissor[1] + g_rc_scissor[3];
+            if (sc[0] < g_rc_scissor[0]) sc[0] = g_rc_scissor[0];
+            if (sc[1] < g_rc_scissor[1]) sc[1] = g_rc_scissor[1];
+            if (x2 > cx2) x2 = cx2;
+            if (y2 > cy2) y2 = cy2;
+            sc[2] = x2 - sc[0]; sc[3] = y2 - sc[1];
+        }
+        if (sc[2] <= 0 || sc[3] <= 0) continue;
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(sc[0], sc[1], sc[2], sc[3]);
+        float tx = dx + pad_l - (e->input_multiline ? 0.0f : e->input_scroll_x);
+        render_text_fx(tbuf, tx, dy + pad_t, inner_w + e->input_scroll_x, inner_h, align, css_text_vertical_align(e),
+                       1, 1, 1, eff_op, e->font_size, e->font_bold, e->line_height, ws, e->text_overflow,
+                       e->overflow_wrap, e);
+        glDisable(GL_SCISSOR_TEST);
+        rc_scissor_reset();
+        rc_set_element_scissor(idx, fbw, fbh);
+    }
+    (void)scale;
+}
+
+
+/* ── Page text: select with the mouse, copy ─────────────────────────────
+ * The renderer records every line of text it draws (TextLine); a position is
+ * an element (by uid, so it survives DOM edits) and a byte offset into its
+ * text.  Highlight and copy work from those. */
+static unsigned g_ds_au, g_ds_fu;
+static int g_ds_ao, g_ds_fo, g_ds_on;
+static int g_ds_click_n;
+static double g_ds_click_time, g_ds_click_x, g_ds_click_y;
+
+static void ds_clear(void) {
+    if (!g_ds_on) return;
+    g_ds_on = 0;
+    input_mark_dirty();
+}
+
+/* The recorded line nearest the point, and the byte offset under it. */
+static int ds_pos_from_point(double mx, double my, int* oidx, int* ooff, double* odist) {
+    int best = -1;
+    double bestd = 1e18;
+    for (int k = g_tl_n - 1; k >= 0; k--) {
+        const TextLine* t = &g_tl[k];
+        float top = t->base - t->cap - (t->lh - t->cap) * 0.5f, bot = top + t->lh;
+        double dy = my < top ? top - my : my > bot ? my - bot : 0.0;
+        double dx = mx < t->x ? t->x - mx : mx > t->x + t->w ? mx - t->x - t->w : 0.0;
+        double d = dy * 1000.0 + dx;
+        if (d < bestd) { bestd = d; best = k; }
+    }
+    if (best < 0) return 0;
+    const TextLine* t = &g_tl[best];
+    if (t->idx < 0 || t->idx >= elem_count) return 0;
+    LunaElement* e = &elements[t->idx];
+    int len = (int)strlen(e->text);
+    if (t->off < 0 || t->len < 0 || t->off + t->len > len) return 0;
+    float fs = e->font_size > 0 ? (float)e->font_size : 16.0f;
+    int fake = 0;
+    FontAtlas* atlas = get_atlas(fs, e->font_bold, &fake);
+    int off = t->off;
+    if (atlas && atlas->loaded && font_loaded) {
+        text_metrics_begin(fs, e->font_bold, e->font_face, atlas);
+        const char* p = e->text + t->off;
+        const char* end = p + t->len;
+        float cx = t->x, bestx = 1e9f;
+        int boff = t->off;
+        for (;;) {
+            float d = fabsf(cx - (float)mx);
+            if (d < bestx) { bestx = d; boff = (int)(p - e->text); }
+            /* utf8_decode() does not advance on NUL: stop there, or a stale
+             * TextLine spins the shell forever inside a click handler. */
+            if (p >= end || !*p) break;
+            int cp = utf8_decode(&p);
+            cx += glyph_advance(atlas, cp, fs);
+            if (cx > (float)mx + 4096.0f) break;     /* far past the pointer */
+        }
+        off = boff;
+        text_metrics_end();
+    }
+    *oidx = t->idx;
+    *ooff = off;
+    if (odist) *odist = bestd / 1000.0;
+    return 1;
+}
+
+static int ds_ends(int* i0, int* o0, int* i1, int* o1) {
+    if (!g_ds_on) return 0;
+    int a = g_ds_au ? luna_dom_find(g_ds_au) : -1, f = g_ds_fu ? luna_dom_find(g_ds_fu) : -1;
+    if (a < 0 || f < 0) { g_ds_on = 0; return 0; }
+    int oa = g_ds_ao, of = g_ds_fo;
+    if (a > f || (a == f && oa > of)) { int t = a; a = f; f = t; t = oa; oa = of; of = t; }
+    if (a == f && oa == of) return 0;
+    *i0 = a; *o0 = oa; *i1 = f; *o1 = of;
+    return 1;
+}
+
+static void ds_set(int ai, int ao, int fi, int fo) {
+    g_ds_au = luna_dom_uid(ai); g_ds_fu = luna_dom_uid(fi);
+    g_ds_ao = ao; g_ds_fo = fo;
+    g_ds_on = g_ds_au && g_ds_fu && !(ai == fi && ao == fo);
+    input_mark_dirty();
+}
+
+static void ds_word_at(int idx, int off, int* a, int* b) {
+    LunaElement tmp;
+    memset(&tmp, 0, sizeof tmp);
+    snprintf(tmp.text, sizeof tmp.text, "%s", elements[idx].text);
+    input_word_at(&tmp, off, a, b);
+}
+
+static void ds_mouse_press(double mx, double my, int mods) {
+    int idx, off;
+    double dist;
+    (void)mods;
+    ds_clear();
+    if (!ds_pos_from_point(mx, my, &idx, &off, &dist) || dist > 24.0) { g_ds_click_n = 0; return; }
+    double now = luna_now();
+    if (now - g_ds_click_time < 0.45 && fabs(mx - g_ds_click_x) < 5 && fabs(my - g_ds_click_y) < 5)
+        g_ds_click_n = g_ds_click_n >= 3 ? 1 : g_ds_click_n + 1;
+    else g_ds_click_n = 1;
+    g_ds_click_time = now; g_ds_click_x = mx; g_ds_click_y = my;
+    if (g_ds_click_n == 2) {
+        int a, b;
+        ds_word_at(idx, off, &a, &b);
+        ds_set(idx, a, idx, b);
+    } else if (g_ds_click_n == 3) {
+        ds_set(idx, 0, idx, (int)strlen(elements[idx].text));
+    } else {
+        g_ds_au = g_ds_fu = luna_dom_uid(idx);
+        g_ds_ao = g_ds_fo = off;
+        g_ds_on = 0;
+        g_ds_drag = 1;
+    }
+}
+
+static void ds_mouse_drag(double mx, double my) {
+    if (fabs(mx - g_press_x) > DRAG_THRESHOLD || fabs(my - g_press_y) > DRAG_THRESHOLD) g_drag_moved = 1;
+    if (!g_drag_moved) return;
+    int idx, off;
+    if (!ds_pos_from_point(mx, my, &idx, &off, NULL)) return;
+    g_ds_fu = luna_dom_uid(idx);
+    g_ds_fo = off;
+    g_ds_on = g_ds_au && g_ds_fu && !(g_ds_au == g_ds_fu && g_ds_ao == g_ds_fo);
+    input_mark_dirty();
+}
+
+static void ds_select_all(void) {
+    int first = -1, last = -1;
+    for (int k = 0; k < g_tl_n; k++) {
+        int i = g_tl[k].idx;
+        if (first < 0 || i < first) first = i;
+        if (i > last) last = i;
+    }
+    if (first < 0) return;
+    ds_set(first, 0, last, (int)strlen(elements[last].text));
+}
+
+/* The selected text as a malloc'd string, or NULL. */
+static char* ds_text(void) {
+    int i0, o0, i1, o1;
+    if (!ds_ends(&i0, &o0, &i1, &o1)) return NULL;
+    size_t cap = 256, n = 0;
+    char* out = (char*)malloc(cap);
+    if (!out) return NULL;
+    out[0] = '\0';
+    char* seen = (char*)calloc((size_t)(i1 - i0 + 1), 1);
+    if (seen) for (int k = 0; k < g_tl_n; k++) if (g_tl[k].idx >= i0 && g_tl[k].idx <= i1) seen[g_tl[k].idx - i0] = 1;
+    int prev = -1;
+    for (int i = i0; i <= i1; i++) {
+        if (seen && !seen[i - i0]) continue;
+        const LunaElement* e = &elements[i];
+        int len = (int)strlen(e->text);
+        int a = i == i0 ? o0 : 0, b = i == i1 ? o1 : len;
+        if (a > len) a = len;
+        if (b > len) b = len;
+        if (b <= a) continue;
+        const char* sep = "";
+        if (prev >= 0) sep = (!e->inline_level || !elements[prev].inline_level) ? "\n" : e->ws_before ? " " : "";
+        size_t add = strlen(sep) + (size_t)(b - a);
+        if (n + add + 1 > cap) {
+            while (n + add + 1 > cap) cap *= 2;
+            char* g = (char*)realloc(out, cap);
+            if (!g) break;
+            out = g;
+        }
+        memcpy(out + n, sep, strlen(sep)); n += strlen(sep);
+        memcpy(out + n, e->text + a, (size_t)(b - a)); n += (size_t)(b - a);
+        out[n] = '\0';
+        prev = i;
+    }
+    free(seen);
+    if (!n) { free(out); return NULL; }
+    return out;
+}
+
+static void ds_copy(void) {
+    char* t = ds_text();
+    if (!t) return;
+    luna_clip_put(t);
+    free(t);
+}
+
+
+/* ── Find in page, and what hosts need around the selection ─────────────── */
+static char* (*g_url_resolver)(const char*);
+void luna_set_url_resolver(char* (*fn)(const char*)) { g_url_resolver = fn; }
+
+void luna_input_select_all(int idx) {
+    if (idx >= 0 && idx < elem_count && elements[idx].is_input) input_cmd_select_all(&elements[idx]);
+}
+
+/* Selects the next occurrence of `needle` (case-insensitive) in the page's
+ * text after the current selection (before it when !forward), wrapping around,
+ * and scrolls it into view.  Returns 1 when found. */
+int luna_find_text(const char* needle, int forward) {
+    if (!needle || !needle[0]) { ds_clear(); return 0; }
+    size_t nl = strlen(needle);
+    int i0 = 0, o0 = 0, i1 = -1, o1 = 0;
+    int have = ds_ends(&i0, &o0, &i1, &o1);
+    int start_i = have ? (forward ? i1 : i0) : (forward ? 0 : elem_count - 1);
+    int start_o = have ? (forward ? o1 : o0) : (forward ? 0 : 0x7fffffff);
+    for (int pass = 0; pass < 2; pass++)
+        for (int step = 0; step < elem_count; step++) {
+            int i = forward ? start_i + step : start_i - step;
+            if (i < 0 || i >= elem_count) continue;
+            LunaElement* e = &elements[i];
+            if (e->is_input || !e->text[0] || e->display_none || e->luna_internal || !is_visible(i)) continue;
+            int len = (int)strlen(e->text), from, to;
+            if (forward) { from = step == 0 && pass == 0 ? start_o : 0; to = len - (int)nl; }
+            else { from = 0; to = step == 0 && pass == 0 ? start_o - (int)nl : len - (int)nl; }
+            if (forward) {
+                for (int o = from; o <= to; o++)
+                    if (!strncasecmp(e->text + o, needle, nl)) {
+                        ds_set(i, o, i, o + (int)nl);
+                        luna_document_scroll(g_document_scroll_x, e->y + g_document_scroll_y - window_height * 0.3f);
+                        scroll_into_view(i);
+                        return 1;
+                    }
+            } else {
+                if (to > len - (int)nl) to = len - (int)nl;
+                for (int o = to; o >= from; o--)
+                    if (o >= 0 && !strncasecmp(e->text + o, needle, nl)) {
+                        ds_set(i, o, i, o + (int)nl);
+                        luna_document_scroll(g_document_scroll_x, e->y + g_document_scroll_y - window_height * 0.3f);
+                        scroll_into_view(i);
+                        return 1;
+                    }
+            }
+        }
+    return 0;
+}
+
+/* The nearest enclosing link's address (resolved by the host when it set a resolver); malloc'd. */
+static char* ds_link_at(int hit) {
+    for (int p = hit; p != -1; p = elements[p].parent_idx) {
+        char href[1024];
+        if (!strcmp(elements[p].type, "a") && html_attr_get(elements[p].dom_attrs, "href", href, sizeof href) == 1 && href[0] &&
+            strncasecmp(href, "javascript:", 11)) {
+            char* r = g_url_resolver ? g_url_resolver(href) : NULL;
+            return r ? r : luna_strdup_local(href);
+        }
+    }
+    return NULL;
+}
+
+/* The link address under a point (absolute when a resolver is set), or NULL; free() it. */
+char* luna_link_at_point(double x, double y) {
+    int hit = hit_test_at(x, y);
+    return hit < 0 ? NULL : ds_link_at(hit);
+}
+
+/* Right-click on text: select the word under the pointer unless it is inside
+ * the selection, then offer Copy / Select All.  Not over anything clickable. */
+static void ctx_menu_open_doc(double mx, double my);
+static int ds_try_open_menu(int hit, double mx, double my) {
+    free(g_ctx_link);
+    g_ctx_link = g_luna_web_compat ? ds_link_at(hit) : NULL;
+    for (int p = hit; p != -1; p = elements[p].parent_idx)
+        if (elements[p].is_input || (elements[p].on_click && !g_ctx_link)) return 0;
+    int idx, off;
+    double dist;
+    if (!ds_pos_from_point(mx, my, &idx, &off, &dist) || dist > 6.0) { if (!g_ds_on) return 0; }
+    else {
+        int i0, o0, i1, o1;
+        int inside = ds_ends(&i0, &o0, &i1, &o1) &&
+                     (idx > i0 || (idx == i0 && off >= o0)) && (idx < i1 || (idx == i1 && off <= o1));
+        if (!inside) { int a, b; ds_word_at(idx, off, &a, &b); ds_set(idx, a, idx, b); }
+    }
+    ctx_menu_open_doc(mx, my);
+    return 1;
+}
+
+/* Highlight: blue under the text, the same text again in white on top. */
+static void ds_draw(int fbw, int fbh) {
+    int i0, o0, i1, o1;
+    if (!ds_ends(&i0, &o0, &i1, &o1) || !font_loaded) return;
+    for (int k = 0; k < g_tl_n; k++) {
+        const TextLine* t = &g_tl[k];
+        if (t->idx < i0 || t->idx > i1 || t->idx >= elem_count) continue;
+        LunaElement* e = &elements[t->idx];
+        int a = t->off, b = t->off + t->len;
+        if (t->idx == i0 && o0 > a) a = o0;
+        if (t->idx == i1 && o1 < b) b = o1;
+        if (b <= a) continue;
+        float fs = e->font_size > 0 ? (float)e->font_size : 16.0f;
+        int fake = 0;
+        FontAtlas* atlas = get_atlas(fs, e->font_bold, &fake);
+        if (!atlas || !atlas->loaded) continue;
+        text_metrics_begin(fs, e->font_bold, e->font_face, atlas);
+        g_text_letter_spacing = e->letter_spacing;
+        float x0 = t->x + (a > t->off ? measure_text_range(atlas, e->text + t->off, a - t->off) : 0.0f);
+        float w = measure_text_range(atlas, e->text + a, b - a);
+        char buf[LUNA_UI_TEXT_CAP];
+        int n = b - a;
+        if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;
+        memcpy(buf, e->text + a, (size_t)n);
+        buf[n] = '\0';
+        float top = t->base - t->cap - (t->lh - t->cap) * 0.5f;
+        rc_scissor_reset();
+        rc_set_element_scissor(t->idx, fbw, fbh);
+        draw_rect(x0, top, w, t->lh, 0.16f, 0.43f, 0.86f, 1, 0, 0, 0, 0, 0, 0);
+        render_text_pass(atlas, buf, x0, t->base, 1, 1, 1, 1);
+        g_text_letter_spacing = 0.0f;
+        text_metrics_end();
+        glDisable(GL_SCISSOR_TEST);
+        rc_scissor_reset();
+    }
+}
+
+char* luna_selection_text(void) {
+    if (focused_is_input()) {
+        LunaElement* e = &elements[g_focused_element_idx];
+        int a, b;
+        if (e->input_password || !input_sel_range(e, &a, &b)) return NULL;
+        char* t = (char*)malloc((size_t)(b - a) + 1);
+        if (t) { memcpy(t, e->text + a, (size_t)(b - a)); t[b - a] = '\0'; }
+        return t;
+    }
+    return ds_text();
+}
+
+void luna_selection_clear(void) {
+    ds_clear();
+    if (focused_is_input()) { elements[g_focused_element_idx].sel_has = 0; input_mark_dirty(); }
+}
+
+static void ctx_menu_open_doc(double mx, double my) {
+    g_ctx.n = 0;
+    if (g_ctx_link) {
+        g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_LINKCOPY, 1 };
+        g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_SEP, 0 };
+    }
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_COPY, g_ds_on };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_SEP, 0 };
+    g_ctx.it[g_ctx.n++] = (CtxItem){ CTX_SELALL, g_tl_n > 0 };
+    float h = CTX_PAD * 2.0f;
+    for (int i = 0; i < g_ctx.n; i++) h += g_ctx.it[i].id == CTX_SEP ? CTX_SEP_H : CTX_ITEM_H;
+    float rw = LUNA_RRES_X, rh = LUNA_RRES_Y;
+    float x = (float)mx + 2.0f, y = (float)my + 2.0f;
+    if (x + CTX_W > rw - 2.0f) x = (float)mx - CTX_W - 2.0f;
+    if (y + h > rh - 2.0f) y = (float)my - h - 2.0f;
+    if (x < 2.0f) x = 2.0f;
+    if (y < 2.0f) y = 2.0f;
+    g_ctx.x = x; g_ctx.y = y; g_ctx.w = CTX_W; g_ctx.h = h;
+    g_ctx.target = -1;
+    g_ctx.hover = -1;
+    g_ctx_open = 1;
+    input_mark_dirty();
+}
+
 static void key_callback(void* window, int key, int scancode, int action, int mods) {
     (void)window; (void)scancode;
     if (action == LUNA_PRESS && key == LUNA_KEY_F12) {
@@ -15849,6 +19095,8 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
             take_screenshot("screenshot.png");
         return;
     }
+
+    if (ctx_menu_key(key, action)) return;
 
     if (action == LUNA_PRESS && key == LUNA_KEY_ESCAPE) {
         int trap = get_focus_trap_root();
@@ -15869,12 +19117,17 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
     }
 
     if (action == LUNA_PRESS && key == LUNA_KEY_TAB) {
+        int trap = get_focus_trap_root();
+        if (trap != -1 && focus_trap_is_popup(trap)) {
+            LunaTrapDismissFn dismiss = get_trap_dismiss_fn(trap);
+            if (dismiss) dismiss(trap);
+        }
         focus_move_tab((mods & LUNA_MOD_SHIFT) != 0);
         return;
     }
 
     if ((action == LUNA_PRESS || action == LUNA_REPEAT) &&
-        (key == LUNA_KEY_UP || key == LUNA_KEY_DOWN)) {
+        (key == LUNA_KEY_UP || key == LUNA_KEY_DOWN || key == LUNA_KEY_HOME || key == LUNA_KEY_END)) {
         int trap = get_focus_trap_root();
         if (trap != -1) {
             int has_options = 0;
@@ -15885,62 +19138,74 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
                 break;
             }
             if (has_options) {
-                focus_select_option_step(key == LUNA_KEY_UP);
+                focus_select_option_step(key == LUNA_KEY_HOME ? 2 : key == LUNA_KEY_END ? 3 : key == LUNA_KEY_UP);
                 return;
             }
         }
     }
 
-    /* Text field editing — consume keys so scroll/button shortcuts don't fight IME.
-     * This compact editor has no selection model yet, so copy/cut operate on
-     * the complete value and paste inserts at the caret. */
+    if (action == LUNA_PRESS && (key == LUNA_KEY_UP || key == LUNA_KEY_DOWN) &&
+        get_focus_trap_root() == -1 && g_focused_element_idx >= 0 &&
+        !element_is_inert(g_focused_element_idx) && html_attr_get(elements[g_focused_element_idx].dom_attrs, "disabled", (char[2]){0}, 2) < 0 &&
+        !strcmp(elements[g_focused_element_idx].role, "combobox") &&
+        elements[g_focused_element_idx].on_click) {
+        elements[g_focused_element_idx].on_click(&elements[g_focused_element_idx]);
+        return;
+    }
+
+    if (!focused_is_input() && action == LUNA_PRESS && (mods & (LUNA_MOD_CONTROL | LUNA_MOD_SUPER))) {
+        if (key == LUNA_KEY_A && g_tl_n > 0) { ds_select_all(); return; }
+        if (key == LUNA_KEY_C && g_ds_on) { ds_copy(); return; }
+    }
+
+    /* Text field editing — consume keys so scroll/button shortcuts don't fight IME. */
     if (focused_is_input() && (action == LUNA_PRESS || action == LUNA_REPEAT)) {
         LunaElement* fe = &elements[g_focused_element_idx];
         int primary_mod = (mods & (LUNA_MOD_CONTROL | LUNA_MOD_SUPER)) != 0;
-        if (primary_mod && action == LUNA_PRESS && key == 'C') {
-            if (g_luna_platform.set_clipboard && !fe->input_password)
-                g_luna_platform.set_clipboard(fe->text);
-            return;
+        int shift = (mods & LUNA_MOD_SHIFT) != 0;
+        int word = (mods & (LUNA_MOD_CONTROL | LUNA_MOD_ALT)) != 0;
+        int len = (int)strlen(fe->text);
+        input_ensure_caret(fe);
+        if (primary_mod && key == LUNA_KEY_Z) { if (shift) input_cmd_redo(fe); else input_cmd_undo(fe); return; }
+        if (primary_mod && key == LUNA_KEY_Y) { input_cmd_redo(fe); return; }
+        if (primary_mod && action == LUNA_PRESS && key == LUNA_KEY_A) { input_cmd_select_all(fe); return; }
+        if (primary_mod && action == LUNA_PRESS && key == LUNA_KEY_C) { input_cmd_copy(fe); return; }
+        if (primary_mod && action == LUNA_PRESS && key == LUNA_KEY_X) { input_cmd_cut(fe); return; }
+        if (primary_mod && action == LUNA_PRESS && key == LUNA_KEY_V) { input_cmd_paste(fe); return; }
+        if (action == LUNA_PRESS && key == LUNA_KEY_INSERT && primary_mod) { input_cmd_copy(fe); return; }
+        if (action == LUNA_PRESS && key == LUNA_KEY_INSERT && shift) { input_cmd_paste(fe); return; }
+        if (key == LUNA_KEY_BACKSPACE) {
+            if (word && !fe->sel_has) { input_select(fe, fe->caret, input_word_left(fe, fe->caret)); }
+            input_backspace(fe); return;
         }
-        if (primary_mod && action == LUNA_PRESS && key == 'X') {
-            if (!fe->input_password && g_luna_platform.set_clipboard)
-                g_luna_platform.set_clipboard(fe->text);
-            if (!fe->input_password) { fe->text[0] = '\0'; fe->caret = 0; input_mark_dirty(); }
-            return;
+        if (key == LUNA_KEY_DELETE) {
+            if (shift && !primary_mod) { input_cmd_cut(fe); return; }
+            if (word && !fe->sel_has) { input_select(fe, fe->caret, input_word_right(fe, fe->caret)); }
+            input_delete_forward(fe); return;
         }
-        if (primary_mod && action == LUNA_PRESS && key == 'V') {
-            if (g_luna_platform.get_clipboard) {
-                char* clip = g_luna_platform.get_clipboard();
-                if (clip) {
-                    input_insert_utf8(fe, clip, (int)strlen(clip));
-                    free(clip);
-                }
-            }
-            return;
-        }
-        if (key == LUNA_KEY_BACKSPACE) { input_backspace(fe); return; }
-        if (key == LUNA_KEY_DELETE) { input_delete_forward(fe); return; }
         if (key == LUNA_KEY_LEFT) {
-            fe->caret = utf8_prev_boundary(fe->text, fe->caret);
-            input_ensure_caret(fe); input_mark_dirty(); return;
+            int a, b;
+            if (!shift && !word && input_sel_range(fe, &a, &b)) input_move_to(fe, a, 0);
+            else input_move_to(fe, word ? input_word_left(fe, fe->caret) : utf8_prev_boundary(fe->text, fe->caret), shift);
+            return;
         }
         if (key == LUNA_KEY_RIGHT) {
-            fe->caret = utf8_next_boundary(fe->text, fe->caret);
-            input_ensure_caret(fe); input_mark_dirty(); return;
+            int a, b;
+            if (!shift && !word && input_sel_range(fe, &a, &b)) input_move_to(fe, b, 0);
+            else input_move_to(fe, word ? input_word_right(fe, fe->caret) : utf8_next_boundary(fe->text, fe->caret), shift);
+            return;
         }
-        if (key == LUNA_KEY_UP && fe->input_multiline) {
-            fe->caret = input_move_vertical(fe, fe->caret, -1); input_mark_dirty(); return;
+        if (key == LUNA_KEY_UP) {
+            input_move_to(fe, fe->input_multiline ? input_move_vertical(fe, fe->caret, -1) : 0, shift); return;
         }
-        if (key == LUNA_KEY_DOWN && fe->input_multiline) {
-            fe->caret = input_move_vertical(fe, fe->caret, 1); input_mark_dirty(); return;
+        if (key == LUNA_KEY_DOWN) {
+            input_move_to(fe, fe->input_multiline ? input_move_vertical(fe, fe->caret, 1) : len, shift); return;
         }
         if (key == LUNA_KEY_HOME) {
-            fe->caret = fe->input_multiline ? input_line_start(fe, fe->caret) : 0;
-            input_mark_dirty(); return;
+            input_move_to(fe, fe->input_multiline && !primary_mod ? input_line_start(fe, fe->caret) : 0, shift); return;
         }
         if (key == LUNA_KEY_END) {
-            fe->caret = fe->input_multiline ? input_line_end(fe, fe->caret) : (int)strlen(fe->text);
-            input_mark_dirty(); return;
+            input_move_to(fe, fe->input_multiline && !primary_mod ? input_line_end(fe, fe->caret) : len, shift); return;
         }
         if (key == LUNA_KEY_ENTER || key == LUNA_KEY_KP_ENTER) {
             if (fe->input_multiline) { char_callback_impl('\n'); return; }
@@ -15952,7 +19217,7 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
     }
 
     if (action == LUNA_PRESS &&
-        (key == LUNA_KEY_ENTER || key == LUNA_KEY_KP_ENTER || key == LUNA_KEY_SPACE)) {
+        (key == LUNA_KEY_ENTER || key == LUNA_KEY_KP_ENTER || (key == LUNA_KEY_SPACE && g_focused_element_idx != -1))) {
         if (g_focused_element_idx != -1) {
             LunaElement* fe = &elements[g_focused_element_idx];
             if (fe->is_input) return;
@@ -15979,6 +19244,20 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
     int sy = find_scroll_target_y(start);
     int sx = find_scroll_target_x(start);
     float line = 20.0f;
+
+    /* The web viewport scrolls by itself: arrows, Page Up/Down, Home/End, Space. */
+    if (sy == -1 && g_luna_web_compat && !(mods & (LUNA_MOD_CONTROL | LUNA_MOD_ALT | LUNA_MOD_SUPER)) &&
+        (key == LUNA_KEY_UP || key == LUNA_KEY_DOWN || key == LUNA_KEY_PAGE_UP || key == LUNA_KEY_PAGE_DOWN ||
+         key == LUNA_KEY_HOME || key == LUNA_KEY_END || key == LUNA_KEY_SPACE) && !(mods & LUNA_MOD_SHIFT && key != LUNA_KEY_SPACE)) {
+        float page = window_height * 0.875f, y = g_document_scroll_y;
+        int back = key == LUNA_KEY_UP || key == LUNA_KEY_PAGE_UP || (key == LUNA_KEY_SPACE && (mods & LUNA_MOD_SHIFT));
+        if (key == LUNA_KEY_UP || key == LUNA_KEY_DOWN) y += back ? -40.0f : 40.0f;
+        else if (key == LUNA_KEY_HOME) y = 0.0f;
+        else if (key == LUNA_KEY_END) y = 1e9f;
+        else y += back ? -page : page;
+        luna_document_scroll(g_document_scroll_x, y);
+        return;
+    }
 
     if (sy != -1 && (key == LUNA_KEY_UP || key == LUNA_KEY_DOWN ||
                      key == LUNA_KEY_PAGE_UP || key == LUNA_KEY_PAGE_DOWN ||
@@ -16193,6 +19472,9 @@ int luna_element_count(void) { return elem_count; }
 LunaElement* luna_element_at(int i) { return (i >= 0 && i < elem_count) ? &elements[i] : NULL; }
 int luna_element_parent(int i) { return (i >= 0 && i < elem_count) ? elements[i].parent_idx : -1; }
 int luna_get_element_by_id(const char* id) { return get_element_by_id(id); }
+void luna_set_clear_before_paint(int idx, int clear) {
+    if (idx >= 0 && idx < elem_count) elements[idx].clear_before_paint = clear != 0;
+}
 int luna_get_element_by_class(const char* class_name) {
     int i;
     if (!class_name || !*class_name) return -1;
@@ -16202,18 +19484,25 @@ int luna_get_element_by_class(const char* class_name) {
 }
 int luna_focused_element(void) { return g_focused_element_idx; }
 void luna_focus_element(int idx) { if (idx == -1 || (idx >= 0 && idx < elem_count)) focus_element(idx); }
-void luna_clipboard_set(const char* utf8) {
-    if (g_luna_platform.set_clipboard) g_luna_platform.set_clipboard(utf8 ? utf8 : "");
-}
-char* luna_clipboard_get(void) {
-    return g_luna_platform.get_clipboard ? g_luna_platform.get_clipboard() : NULL;
-}
+void luna_clipboard_set(const char* utf8) { luna_clip_put(utf8); }
+char* luna_clipboard_get(void) { return luna_clip_take(); }
 void luna_clipboard_free(char* utf8) { free(utf8); }
 float luna_platform_scale(void) {
     float s = g_luna_platform.get_scale ? g_luna_platform.get_scale() : 1.0f;
     return s > 0.0f ? s : 1.0f;
 }
 int luna_element_visible(int idx) { return (idx >= 0 && idx < elem_count) ? is_visible(idx) : 0; }
+int luna_element_bounds(int idx, float* x, float* y, float* w, float* h) {
+    if (idx < 0 || idx >= elem_count) return 0;
+    float bx, by, bw, bh;
+    get_element_hit_bounds(&elements[idx], &bx, &by, &bw, &bh);
+    if (x) *x = bx;
+    if (y) *y = by;
+    if (w) *w = bw;
+    if (h) *h = bh;
+    return 1;
+}
+
 void luna_set_text(int i, const char* t) { g_probe_prepared = 0; set_text(i, t); }
 void luna_invalidate_texture(const char* path) {
     if (!path || !*path) return;
@@ -16226,8 +19515,10 @@ void luna_invalidate_texture(const char* path) {
         break;
     }
     for (int i = 0; i < elem_count; i++) {
-        if (elements[i].has_bg_image && strcmp(elements[i].bg_image_path, path) == 0)
+        if (elements[i].bg_image_path[0] && strcmp(elements[i].bg_image_path, path) == 0) {
+            elements[i].has_bg_image = 1;      /* a failed first try (picture still in flight) is retried */
             elements[i].bg_image_tex = 0;
+        }
     }
 }
 void luna_set_background_image(int idx, const char* path) {
@@ -16278,12 +19569,13 @@ int luna_load_css_file(const char* p) {
     if (elem_count > 0 && (rule_count != old_rules || g_keyframe_count != old_keyframes)) {
         for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
         generate_pseudo_elements();
-        memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
-        g_layout_dirty = 1; g_render_order_dirty = 1;
+        LUNA_AUX_ZERO(g_intrinsic_width_valid);
+        LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
     }
     return 1;
 }
 void luna_reset_css(void) {
+    g_rem_px = LUNA_REM_PX;
     rule_bg_layers_release_all();
     luna_css_variables_clear();
     free(css_rules);
@@ -16294,20 +19586,28 @@ void luna_reset_css(void) {
     g_css_from_document = 0;
     g_rule_index_ready = 0;
     g_has_structural_selectors = 0;
+    g_restyle_pending = 0; g_pseudo_pending = 0;
     g_css_generation++;
     if (!g_css_generation) g_css_generation = 1;
 }
 void luna_set_preserve_backdrop(int enabled) { g_preserve_backdrop = enabled ? 1 : 0; }
 
 void luna_reset_document(void) {
+    g_dom_struct_ver++;
+    g_document_scroll_x = g_document_scroll_y = 0.0f;
+    g_document_width = window_width;
+    g_document_height = window_height;
     for (int i = 0; i < elem_count; i++) {
         free(elements[i].bg_layers);
         elements[i].bg_layers = NULL;
         elements[i].bg_layer_count = 0;
         free(elements[i].dom_attrs);
         elements[i].dom_attrs = NULL;
+        free(elements[i].dom_raw_text);
+        elements[i].dom_raw_text = NULL;
         free(elements[i].css_vars);
         elements[i].css_vars = NULL;
+        css_vars_reset(&elements[i]);
     }
     elem_count = 0;
     g_dom_uid_seq = 0;
@@ -16315,8 +19615,8 @@ void luna_reset_document(void) {
     /* Keyed by element index: a scrollbar slot or an "already active" flag
        left from the previous document names an unrelated element of the next
        one (the slot then repositions it as a scrollbar). */
-    memset(g_sb_slots, 0, sizeof(g_sb_slots));
-    memset(g_visual_active_flag, 0, sizeof(g_visual_active_flag));
+    LUNA_AUX_ZERO(g_sb_slots);
+    LUNA_AUX_ZERO(g_visual_active_flag);
     /* Everything below is an index into elements[] or a cache keyed by one.
        Leaving any of it behind points at an element that no longer exists. */
     g_focused_element_idx = -1;
@@ -16332,7 +19632,7 @@ void luna_reset_document(void) {
     g_id_map_built = 0;
     g_activity_registry_dirty = 1;
     g_visual_scan_needed = 1;
-    g_layout_dirty = 1;
+    LUNA_LAYOUT_DIRTY();
     g_render_order_dirty = 1;
     g_probe_prepared = 0;
     luna_doc_title[0] = '\0';
@@ -16371,13 +19671,34 @@ unsigned luna_dom_uid(int idx) { return dom_valid(idx) ? elements[idx].dom_uid :
 
 void luna_set_web_compat(int enabled) { g_luna_web_compat = enabled ? 1 : 0; }
 
+void luna_document_scroll(float x, float y) {
+    if (!g_luna_web_compat) return;
+    float max_x = fmaxf(0.0f, g_document_width - window_width);
+    float max_y = fmaxf(0.0f, g_document_height - window_height);
+    if (!isfinite(x)) x = 0.0f;
+    if (!isfinite(y)) y = 0.0f;
+    x = fminf(max_x, fmaxf(0.0f, x));
+    y = fminf(max_y, fmaxf(0.0f, y));
+    if (x == g_document_scroll_x && y == g_document_scroll_y) return;
+    g_document_scroll_x = x; g_document_scroll_y = y;
+    if (!g_layout_dirty) g_layout_scroll_only = 1;
+    g_layout_dirty = g_render_order_dirty = g_visual_scan_needed = 1;
+}
+
+void luna_document_scroll_state(float* x, float* y, float* width, float* height) {
+    if (x) *x = g_document_scroll_x;
+    if (y) *y = g_document_scroll_y;
+    if (width) *width = g_document_width;
+    if (height) *height = g_document_height;
+}
+
 int luna_dom_create_text(const char* text) {
     if (elem_count >= MAX_ELEMENTS || !luna_ensure_element_capacity(elem_count + 1)) return -1;
     int idx = elem_count;
     LunaElement* t = &elements[idx];
     memset(t, 0, sizeof(*t));
     t->id_idx = idx;
-    t->parent_idx = -1;
+    t->parent_idx = -1; g_dom_struct_ver++;
     t->dom_detached = 1;
     t->tabindex = -2;
     t->aria_expanded = -1;
@@ -16408,12 +19729,13 @@ static int dom_is_ancestor(int anc, int idx) {
 
 /* Every cache that is keyed by, or holds, an element index. */
 static void dom_invalidate_index_state(void) {
+    g_dom_struct_ver++;
     g_scroll_tick_count = 0;
     g_scroll_container_count = 0;
     g_css_anim_count = 0;
     for (int i = 0; i < g_visual_active_count; i++) {
         int v = g_visual_active_idx[i];
-        if (v >= 0 && v < MAX_ELEMENTS) g_visual_active_flag[v] = 0;
+        if (v >= 0 && v < g_aux_cap) g_visual_active_flag[v] = 0;
     }
     g_visual_active_count = 0;
     g_visual_scan_needed = 1;
@@ -16421,9 +19743,9 @@ static void dom_invalidate_index_state(void) {
     g_id_map_ready = 0;
     g_id_map_built = 0;
     g_dom_uid_dirty = 1;
-    memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
-    memset(g_min_content_width_valid, 0, sizeof(g_min_content_width_valid));
-    g_layout_dirty = 1;
+    LUNA_AUX_ZERO(g_intrinsic_width_valid);
+    LUNA_AUX_ZERO(g_min_content_width_valid);
+    LUNA_LAYOUT_DIRTY();
     g_render_order_dirty = 1;
     g_probe_prepared = 0;
 }
@@ -16432,12 +19754,18 @@ static void dom_invalidate_index_state(void) {
  * renumbers everything that refers to an element by index. */
 static int dom_apply_order(const int* order) {
     int n = elem_count;
+    /* Only the span between the first and last displaced element is copied. */
+    int lo = 0, hi = n - 1;
+    while (lo < n && order[lo] == lo) lo++;
+    if (lo == n) { g_dom_struct_ver++; return 1; }   /* already in this order */
+    while (order[hi] == hi) hi--;
     int* remap = (int*)malloc(sizeof(int) * (size_t)n);
-    LunaElement* moved = (LunaElement*)malloc(sizeof(LunaElement) * (size_t)n);
+    LunaElement* moved = (LunaElement*)malloc(sizeof(LunaElement) * (size_t)(hi - lo + 1));
     int (*slots)[4] = (int (*)[4])calloc((size_t)n, sizeof(int[4]));
     if (!remap || !moved || !slots) { free(remap); free(moved); free(slots); return 0; }
-    for (int k = 0; k < n; k++) { remap[order[k]] = k; moved[k] = elements[order[k]]; }
-    memcpy(elements, moved, sizeof(LunaElement) * (size_t)n);
+    for (int k = 0; k < n; k++) remap[k] = k;
+    for (int k = lo; k <= hi; k++) { remap[order[k]] = k; moved[k - lo] = elements[order[k]]; }
+    memcpy(elements + lo, moved, sizeof(LunaElement) * (size_t)(hi - lo + 1));
     free(moved);
 #define DOM_RM(v) (((v) >= 0 && (v) < n) ? remap[(v)] : (v))
     for (int k = 0; k < n; k++) {
@@ -16446,10 +19774,10 @@ static int dom_apply_order(const int* order) {
         e->id_idx = k;
         if (e->luna_internal) e->sb_host_idx = DOM_RM(e->sb_host_idx);
     }
-    for (int i = 0; i < n && i < MAX_ELEMENTS; i++)
+    for (int i = 0; i < n && i < g_aux_cap; i++)
         for (int a = 0; a < 4; a++)
             if (g_sb_slots[i][a]) slots[remap[i]][a] = DOM_RM(g_sb_slots[i][a]);
-    memset(g_sb_slots, 0, sizeof(g_sb_slots));
+    LUNA_AUX_ZERO(g_sb_slots);
     memcpy(g_sb_slots, slots, sizeof(int[4]) * (size_t)n);
     free(slots);
     g_focused_idx = DOM_RM(g_focused_idx);
@@ -16472,6 +19800,12 @@ static int dom_apply_order(const int* order) {
 /* Restyles idx and its subtree (selectors see ancestors and siblings). */
 static void dom_restyle_subtree(int idx) {
     if (!dom_valid(idx)) return;
+    if (g_has_structural_selectors && g_restyle_deferred) {
+        if (!g_restyle_pending) g_restyle_pending = 1;
+        LUNA_LAYOUT_DIRTY();
+        g_probe_prepared = 0;
+        return;
+    }
     if (g_has_structural_selectors) {
         for (int i = 0; i < elem_count; i++)
             if (!elements[i].luna_internal) (void)restyle_element_checked(&elements[i]);
@@ -16481,15 +19815,52 @@ static void dom_restyle_subtree(int idx) {
             if (!elements[i].luna_internal && dom_is_ancestor(idx, i))
                 (void)restyle_element_checked(&elements[i]);
     }
-    generate_pseudo_elements();
-    memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
-    g_layout_dirty = 1;
+    if (g_restyle_deferred) g_pseudo_pending = 1;
+    else generate_pseudo_elements();
+    LUNA_AUX_ZERO(g_intrinsic_width_valid);
+    LUNA_LAYOUT_DIRTY();
     g_render_order_dirty = 1;
     g_visual_scan_needed = 1;
     g_probe_prepared = 0;
 }
 
 void luna_dom_restyle(int idx) { dom_restyle_subtree(idx); }
+
+void luna_dom_defer_restyle(int enabled) {
+    if (!enabled) luna_dom_flush_restyle();
+    g_restyle_deferred = enabled != 0;
+}
+
+void luna_dom_flush_restyle(void) {
+    if (!g_restyle_pending && !g_pseudo_pending) return;
+    int full = g_restyle_pending;
+    g_restyle_pending = 0; g_pseudo_pending = 0;
+    if (full)
+        for (int i = 0; i < elem_count; i++) {
+            LunaElement* e = &elements[i];
+            if (e->luna_internal) continue;
+            (void)restyle_element_checked(e);
+            if (full == 2) {
+                e->cur_r = e->r; e->cur_g = e->g; e->cur_b = e->b; e->cur_a = e->a;
+                e->cur_bd_r = e->bd_r; e->cur_bd_g = e->bd_g;
+                e->cur_bd_b = e->bd_b; e->cur_bd_a = e->bd_a;
+            }
+        }
+    generate_pseudo_elements();
+    LUNA_AUX_ZERO(g_intrinsic_width_valid);
+    LUNA_LAYOUT_DIRTY();
+    g_render_order_dirty = 1;
+    g_visual_scan_needed = 1;
+    g_probe_prepared = 0;
+}
+
+void luna_dom_set_checked(int idx, int checked) {
+    if (!dom_valid(idx)) return;
+    elements[idx].checked_state = checked ? 1 : 2;
+    /* sibling and ancestor selectors (:checked ~ x, :has(:checked)) see it too */
+    int p = elements[idx].parent_idx;
+    dom_restyle_subtree(p >= 0 ? p : idx);
+}
 
 int luna_dom_create(const char* tag, const char* attrs) {
     if (!tag || !tag[0] || strlen(tag) >= sizeof(((LunaElement*)0)->type)) return -1;
@@ -16506,7 +19877,7 @@ int luna_dom_create(const char* tag, const char* attrs) {
     free(html);
     if (elem_count == before) return -1;
     int idx = before;
-    elements[idx].parent_idx = -1;
+    elements[idx].parent_idx = -1; g_dom_struct_ver++;
     elements[idx].dom_detached = 1;
     g_dom_uid_dirty = 1;
     g_id_map_ready = 0;
@@ -16593,7 +19964,7 @@ int luna_dom_set_inner_html(int idx, const char* html) {
         for (int i = 0; i < nk && i < 256; i++) luna_dom_remove(kids[i]);
     elements[idx].text[0] = '\0';
     elements[idx].direct_text_before_children = 0;
-    if (!html || !html[0]) { g_layout_dirty = 1; g_probe_prepared = 0; return 0; }
+    if (!html || !html[0]) { LUNA_LAYOUT_DIRTY(); g_probe_prepared = 0; return 0; }
     unsigned uid = elements[idx].dom_uid;
     int before = elem_count;
     /* Text that precedes the first child tag belongs to idx itself. */
@@ -16605,17 +19976,39 @@ int luna_dom_set_inner_html(int idx, const char* html) {
     elements[idx].direct_text_before_children = elements[idx].text[0] != '\0';
     parse_html_into(html + lead, idx);
     int after = elem_count;
-    /* Top-level uids, in order, to re-find them after each move. */
+    /* The parsed elements were appended at the end of the array with idx as
+     * their parent; they belong right after idx.  One reorder places them all
+     * (inserting the top-level nodes one by one is quadratic). */
     int count = 0;
-    unsigned* tops = (unsigned*)malloc(sizeof(unsigned) * (size_t)(after - before + 1));
-    if (!tops) return -1;
     for (int i = before; i < after; i++)
-        if (elements[i].parent_idx == idx && elements[i].dom_uid) tops[count++] = elements[i].dom_uid;
-    for (int i = 0; i < count; i++) {
-        int p = luna_dom_find(uid), c = luna_dom_find(tops[i]);
-        if (p >= 0 && c >= 0) luna_dom_insert(p, c, -1);
+        if (elements[i].parent_idx == idx) count++;
+    if (after > before && after - before < elem_count && before > idx + 1) {
+        int n = elem_count, k = 0;
+        int* order = (int*)malloc(sizeof(int) * (size_t)n);
+        if (order) {
+            for (int i = 0; i <= idx; i++) order[k++] = i;
+            for (int i = before; i < after; i++) order[k++] = i;
+            for (int i = idx + 1; i < before; i++) order[k++] = i;
+            for (int i = after; i < n; i++) order[k++] = i;
+            dom_apply_order(order);
+            free(order);
+        }
     }
-    free(tops);
+    if (after > before) dom_restyle_subtree(idx);
+    /* Leading text is a real first child when element children follow it.
+       DOM fragment insertion must be able to move it along with those nodes. */
+    int p = luna_dom_find(uid);
+    if (g_luna_web_compat && count && p >= 0 && elements[p].text[0]) {
+        char text[sizeof(elements[p].text)];
+        snprintf(text, sizeof(text), "%s", elements[p].text);
+        elements[p].text[0] = '\0';
+        elements[p].direct_text_before_children = 0;
+        int first = -1;
+        for (int i = p + 1; i < elem_count; ++i)
+            if (elements[i].parent_idx == p) { first = i; break; }
+        int t = luna_dom_create_text(text);
+        if (t >= 0) luna_dom_insert(p, t, first);
+    }
     return count;
 }
 
@@ -16770,8 +20163,8 @@ void luna_parse_css(const char* c) {
     if (elem_count > 0 && (rule_count != old_rules || g_keyframe_count != old_keyframes)) {
         for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
         generate_pseudo_elements();
-        memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
-        g_layout_dirty = 1; g_render_order_dirty = 1;
+        LUNA_AUX_ZERO(g_intrinsic_width_valid);
+        LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
     }
 }
 void luna_css_set_variables(const LunaCssVariable* variables, int count) {
@@ -16780,8 +20173,8 @@ void luna_css_set_variables(const LunaCssVariable* variables, int count) {
         luna_css_variable_store(&g_api_variables, variables[i].name, variables[i].value);
     g_probe_prepared = 0;
     for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
-    memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
-    g_layout_dirty = 1;
+    LUNA_AUX_ZERO(g_intrinsic_width_valid);
+    LUNA_LAYOUT_DIRTY();
     g_render_order_dirty = 1;
     g_css_generation++;
     if (!g_css_generation) g_css_generation = 1;
@@ -16827,15 +20220,15 @@ int luna_last_click_mods(void) { return g_luna_last_click_mods; }
 void luna_resize(float w, float h) {
     if (w == luna_window_width && h == luna_window_height) return;
     g_probe_prepared = 0;
-    luna_window_width = w; luna_window_height = h; g_layout_dirty = 1; g_render_order_dirty = 1;
+    luna_window_width = w; luna_window_height = h; LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
     g_visual_scan_needed = 1;
 }
 void luna_mark_layout_dirty(void) {
-    g_probe_prepared = 0; g_layout_dirty = 1; g_render_order_dirty = 1;
+    g_probe_prepared = 0; LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
     g_visual_scan_needed = 1;
 }
 void luna_framebuffer_resized(void) {
-    g_probe_prepared = 0; g_layout_dirty = 1; g_render_order_dirty = 1;
+    g_probe_prepared = 0; LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
     g_visual_scan_needed = 1;
 }
 void luna_take_screenshot(const char* path) { take_screenshot(path); }
@@ -16864,7 +20257,7 @@ void luna_inject_body_background(void) {
         body->z_override_valid = 1;
         body->z_override = -9999;
         body->z_index = body->z_override;
-        g_layout_dirty = 1;
+        LUNA_LAYOUT_DIRTY();
         g_render_order_dirty = 1;
         g_visual_scan_needed = 1;
         return;
@@ -16887,7 +20280,7 @@ void luna_inject_body_background(void) {
     body_e.pct_h = 1; body_e.raw_h = 1.0f;
     body_e.w = luna_window_width; body_e.h = luna_window_height;
     body_e.opacity = 1.0f;
-    body_e.transform_scale = 1.0f;
+    body_e.transform_scale = 1.0f; body_e.tf_ox = body_e.tf_oy = 0.5f;
     body_e.cur_scale = 1.0f;
     body_e.anim_speed = 14.0f;
     body_e.pointer_events_none = 1;
@@ -16904,6 +20297,7 @@ void luna_inject_body_background(void) {
 }
 
 static void luna_update_prepare(double now, double dt) {
+    luna_dom_flush_restyle();
     g_probe_prepared = 0;
     rebuild_activity_registries();
     tick_smooth_scroll(dt);
@@ -17091,7 +20485,7 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     glUniform2f(blur_loc.uFbSize, ww, wh);
     glUniform2f(blur_loc.uBlurOrigin, lx, hy0);
     luna_bind_vao(g_rect_vao);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 
     /* Vertical pass over the element itself. */
     glBindFramebuffer_(GL_FRAMEBUFFER, g_blur_fbo[0]);
@@ -17100,7 +20494,7 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     glUniform2f(blur_loc.uSize, sw, sh);
     glUniform2f(blur_loc.uBlurOrigin, lx, ly);
     glUniform2f(blur_loc.uBlurDir, 0.0f, 1.0f / th);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
     glBindTexture(GL_TEXTURE_2D, 0);
 
     /* Restore the real target framebuffer. */
@@ -17144,7 +20538,7 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     glUniform1f(backdrop_loc.uSaturate, saturate);
     glUniform1f(backdrop_loc.uBrightness, brightness);
     luna_bind_vao(g_rect_vao);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -17248,6 +20642,121 @@ int luna_redraw_probe_region(int root_idx, int fbw, int fbh,
     return changed;
 }
 
+/* Surface-local padded bounds for damage / paint-clip tests.  Returns 0 when
+ * the element contributes nothing visible in the current render root. */
+static int element_damage_bounds(int idx, float* ox, float* oy, float* ow, float* oh) {
+    if (!g_rc[idx].in_root || !rc_is_rendered(idx) || g_rc[idx].eff_op <= 0.004f)
+        return 0;
+    float dx, dy, dw, dh;
+    rc_element_draw_bounds(idx, &dx, &dy, &dw, &dh);
+    LunaElement* e = &elements[idx];
+    int canvas_body = g_render_root < 0 && e->parent_idx == -1 &&
+                      strcmp(e->type, "body") == 0;
+    if (canvas_body) {
+        dx = g_render_off_x;
+        dy = g_render_off_y;
+        dw = LUNA_RRES_X;
+        dh = LUNA_RRES_Y;
+    }
+    if (dw <= 0.0f || dh <= 0.0f) return 0;
+    float pad = 4.0f;
+    if (e->has_shadow) {
+        for (int s = 0; s < e->shadow_count; s++) {
+            float ext = e->shadows[s].blur * 1.55f +
+                        fabsf(e->shadows[s].dx) + fabsf(e->shadows[s].dy) +
+                        e->shadows[s].spread + 2.0f;
+            if (ext > pad) pad = ext;
+        }
+    }
+    float sdx = dx - g_render_off_x, sdy = dy - g_render_off_y;
+    if (sdx - pad > LUNA_RRES_X || sdy - pad > LUNA_RRES_Y ||
+        sdx + dw + pad < 0.0f || sdy + dh + pad < 0.0f)
+        return 0;
+    float dmg_pad = pad;
+    if (e->has_outline) {
+        float ring = e->outline_width + e->outline_offset + 2.0f;
+        if (ring > dmg_pad) dmg_pad = ring;
+    }
+    *ox = sdx - dmg_pad;
+    *oy = sdy - dmg_pad;
+    *ow = dw + dmg_pad * 2.0f;
+    *oh = dh + dmg_pad * 2.0f;
+    return 1;
+}
+
+int luna_redraw_collect_region(int root_idx, int fbw, int fbh,
+                               float origin_x, float origin_y,
+                               float region_w, float region_h) {
+    damage_reset();
+    if (!g_dmg_enabled) {
+        damage_add(0, 0, region_w > 0.0f ? region_w : (float)fbw,
+                   region_h > 0.0f ? region_h : (float)fbh);
+        return 1;
+    }
+    if (fbw <= 0 || fbh <= 0) return 0;
+    int saved_root = g_render_root;
+    float saved_ox = g_render_off_x, saved_oy = g_render_off_y;
+    float saved_rx = g_render_res_x, saved_ry = g_render_res_y;
+    int saved_fbw = g_luna_fbw, saved_fbh = g_luna_fbh;
+    g_render_root = root_idx;
+    g_render_off_x = origin_x;
+    g_render_off_y = origin_y;
+    g_render_res_x = region_w > 0.0f ? region_w : (float)fbw;
+    g_render_res_y = region_h > 0.0f ? region_h : (float)fbh;
+    g_luna_fbw = fbw;
+    g_luna_fbh = fbh;
+    build_render_order();
+    rc_build();
+    /* Gone / hidden elements still covering previous pixels. */
+    for (int i = 0; i < elem_count; i++) {
+        if (!g_draw_rec[i].drawn || !g_rc[i].in_root) continue;
+        if (!rc_is_rendered(i) || g_rc[i].eff_op <= 0.004f) {
+            damage_add(g_draw_rec[i].x, g_draw_rec[i].y,
+                       g_draw_rec[i].w, g_draw_rec[i].h);
+        }
+    }
+    for (int ri = 0; ri < elem_count; ri++) {
+        int i = render_order[ri];
+        if (!g_rc[i].in_root) continue;
+        if (!rc_is_rendered(i) || g_rc[i].eff_op <= 0.004f) {
+            if (damage_would_drop(i))
+                damage_add(g_draw_rec[i].x, g_draw_rec[i].y,
+                           g_draw_rec[i].w, g_draw_rec[i].h);
+            continue;
+        }
+        float bx, by, bw, bh;
+        if (!element_damage_bounds(i, &bx, &by, &bw, &bh)) {
+            if (damage_would_drop(i))
+                damage_add(g_draw_rec[i].x, g_draw_rec[i].y,
+                           g_draw_rec[i].w, g_draw_rec[i].h);
+            continue;
+        }
+        if (damage_would_change(i, bx, by, bw, bh)) {
+            if (g_draw_rec[i].drawn)
+                damage_add(g_draw_rec[i].x, g_draw_rec[i].y,
+                           g_draw_rec[i].w, g_draw_rec[i].h);
+            damage_add(bx, by, bw, bh);
+        }
+    }
+    g_render_root = saved_root;
+    g_render_off_x = saved_ox;
+    g_render_off_y = saved_oy;
+    g_render_res_x = saved_rx;
+    g_render_res_y = saved_ry;
+    g_luna_fbw = saved_fbw;
+    g_luna_fbh = saved_fbh;
+    /* Collect rebuilt the same caches a following paint needs. */
+    g_probe_prepared = g_dmg_any ? 1 : 0;
+    if (g_probe_prepared) {
+        g_probe_root = root_idx;
+        g_probe_fbw = fbw; g_probe_fbh = fbh;
+        g_probe_ox = origin_x; g_probe_oy = origin_y;
+        g_probe_rw = region_w > 0.0f ? region_w : (float)fbw;
+        g_probe_rh = region_h > 0.0f ? region_h : (float)fbh;
+    }
+    return g_dmg_any;
+}
+
 void luna_invalidate_gl_state(void) {
     /* A host may paint with its own shaders/VAOs between Luna passes.  The
      * cached IDs then describe Luna's last request rather than the driver's
@@ -17296,6 +20805,18 @@ void luna_render(int fbw, int fbh) {
     glDisable(GL_FRAMEBUFFER_SRGB);
 #endif
 
+    /* Page-text records: this pass re-records its own root, so drop that
+     * root's previous lines (all of them for a full-document pass).  They used
+     * to be dropped only by the redraw probe for root -1, so layer surfaces
+     * grew the list without bound and clicks scanned tens of thousands of
+     * stale lines. */
+    if (g_render_root == -1) g_tl_n = 0;
+    else {
+        int w = 0;
+        for (int k = 0; k < g_tl_n; k++) if (g_tl[k].root != g_render_root) g_tl[w++] = g_tl[k];
+        g_tl_n = w;
+    }
+
     /* A swapped back buffer has undefined contents.  The old standalone editor
      * cleared it explicitly before every full DOM paint; the native-host path
      * lost that step, so a frame could start from the compositor/driver's blank
@@ -17303,9 +20824,11 @@ void luna_render(int fbw, int fbh) {
      * Region/subtree passes intentionally keep the existing pixels because they
      * are used to restore dialogs above the custom editor surface.  Transparent
      * black is correct for both transparent windows and normal opaque windows;
-     * the document background is painted immediately afterwards. */
+     * the document background is painted immediately afterwards.
+     * A host-driven paint clip means the host already cleared the damaged
+     * rectangle; wiping the whole buffer would undo that optimisation. */
     if (g_render_root == -1 && g_render_res_x <= 0.0f && g_render_res_y <= 0.0f &&
-        !g_preserve_backdrop) {
+        !g_preserve_backdrop && !g_paint_clip_on) {
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
     }
@@ -17322,6 +20845,9 @@ void luna_render(int fbw, int fbh) {
     /* Consume the exact cache built by an immediately preceding probe. */
     if (!reuse_probe) rc_build();
     damage_reset();
+    /* The cleared clip is already dirty even before any element is redrawn. */
+    if (g_paint_clip_on)
+        damage_add(g_paint_clip_x, g_paint_clip_y, g_paint_clip_w, g_paint_clip_h);
     glDisable(GL_SCISSOR_TEST);
     rc_scissor_reset();
     g_bg_clip_enabled = 0;
@@ -17329,9 +20855,21 @@ void luna_render(int fbw, int fbh) {
         int i = render_order[ri];
         LunaElement* e = &elements[i];
         if (!g_rc[i].in_root) continue;
-        if (!rc_is_rendered(i)) { damage_drop(i); continue; }
+        if (!rc_is_rendered(i)) {
+            if (!g_paint_clip_on || (g_draw_rec[i].drawn &&
+                    paint_clip_hits(g_draw_rec[i].x, g_draw_rec[i].y,
+                                    g_draw_rec[i].w, g_draw_rec[i].h)))
+                damage_drop(i);
+            continue;
+        }
         float eff_op = g_rc[i].eff_op;
-        if (eff_op <= 0.004f) { damage_drop(i); continue; }
+        if (eff_op <= 0.004f) {
+            if (!g_paint_clip_on || (g_draw_rec[i].drawn &&
+                    paint_clip_hits(g_draw_rec[i].x, g_draw_rec[i].y,
+                                    g_draw_rec[i].w, g_draw_rec[i].h)))
+                damage_drop(i);
+            continue;
+        }
         float dx, dy, dw, dh;
         rc_element_draw_bounds(i, &dx, &dy, &dw, &dh);
         /* CSS propagates the root body's background to the canvas.  Keep the
@@ -17345,7 +20883,13 @@ void luna_render(int fbw, int fbh) {
             dw = LUNA_RRES_X;
             dh = LUNA_RRES_Y;
         }
-        if (dw <= 0.0f || dh <= 0.0f) { damage_drop(i); continue; }
+        if (dw <= 0.0f || dh <= 0.0f) {
+            if (!g_paint_clip_on || (g_draw_rec[i].drawn &&
+                    paint_clip_hits(g_draw_rec[i].x, g_draw_rec[i].y,
+                                    g_draw_rec[i].w, g_draw_rec[i].h)))
+                damage_drop(i);
+            continue;
+        }
         float scale = e->cur_scale * g_rc[i].anc_scale;
         /* Viewport culling: skip elements fully off the surface region. */
         {
@@ -17361,7 +20905,10 @@ void luna_render(int fbw, int fbh) {
             float sdx = dx - g_render_off_x, sdy = dy - g_render_off_y;
             if (sdx - pad > LUNA_RRES_X || sdy - pad > LUNA_RRES_Y ||
                 sdx + dw + pad < 0.0f || sdy + dh + pad < 0.0f) {
-                damage_drop(i);
+                if (!g_paint_clip_on || (g_draw_rec[i].drawn &&
+                        paint_clip_hits(g_draw_rec[i].x, g_draw_rec[i].y,
+                                        g_draw_rec[i].w, g_draw_rec[i].h)))
+                    damage_drop(i);
                 continue;
             }
             /* Record what this element covers, so the host can tell the
@@ -17374,8 +20921,13 @@ void luna_render(int fbw, int fbh) {
                 float ring = e->outline_width + e->outline_offset + 2.0f;
                 if (ring > dmg_pad) dmg_pad = ring;
             }
-            damage_note(i, sdx - dmg_pad, sdy - dmg_pad,
-                        dw + dmg_pad * 2.0f, dh + dmg_pad * 2.0f);
+            float bx = sdx - dmg_pad, by = sdy - dmg_pad;
+            float bw = dw + dmg_pad * 2.0f, bh = dh + dmg_pad * 2.0f;
+            /* Partial redraw: skip GL for elements outside the host-cleared
+             * clip.  Collect already guaranteed those are unchanged. */
+            if (!paint_clip_hits(bx, by, bw, bh))
+                continue;
+            damage_note(i, bx, by, bw, bh);
         }
         /* Set smooth rounded-clip via bg_fs shader for nearest overflow-hidden ancestor. */
         {
@@ -17401,6 +20953,21 @@ void luna_render(int fbw, int fbh) {
         }
         float rad4[4] = { e->rad_c[0] * scale, e->rad_c[1] * scale,
                           e->rad_c[2] * scale, e->rad_c[3] * scale };
+        if (e->clear_before_paint) {
+            /* Destination-out with an opaque rectangle is Canvas CLEAR.
+             * Keep the shader's clip coverage so rounded ancestor edges retain
+             * antialiasing. A zero source/destination blend would also erase
+             * the transparent pixels outside those edges. */
+            rc_set_element_scissor(i, fbw, fbh);
+            g_blend_premul_rgb = 0;
+            glBlendFuncSeparate(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA,
+                                GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+            g_draw_rotate = e->transform_rotate;
+            draw_rect(dx, dy, dw, dh, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0);
+            g_draw_rotate = 0;
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        }
         if (e->has_shadow) {
             rc_set_element_scissor(i, fbw, fbh);
             for (int s = 0; s < e->shadow_count; s++) {
@@ -17451,7 +21018,7 @@ void luna_render(int fbw, int fbh) {
                            rad4, e->border_width,
                            e->cur_bd_r, e->cur_bd_g, e->cur_bd_b, e->cur_bd_a * eff_op, NULL);
         } else {
-        draw_rect_full(dx, dy, dw, dh, e->cur_r, e->cur_g, e->cur_b, e->cur_a * eff_op,
+        draw_rect_full(dx, dy, dw, dh, e->cur_r, e->cur_g, e->cur_b, (e->mask_tint ? 0.0f : e->cur_a) * eff_op,
                        rad4, canvas_body ? 0.0f : e->border_width,
                        e->cur_bd_r, e->cur_bd_g, e->cur_bd_b,
                        canvas_body ? 0.0f : e->cur_bd_a * eff_op, e);
@@ -17486,7 +21053,14 @@ void luna_render(int fbw, int fbh) {
             draw_border_image(dx, dy, dw, dh, scale, e, eff_op);
         if (e->has_bg_image && e->bg_image_path[0]) {
             if (!e->bg_image_tex) {
-                e->bg_image_tex = load_or_get_texture(e->bg_image_path);
+                if (e->mask_tint) {
+                    unsigned tint = ((unsigned)(fminf(fmaxf(e->cur_r, 0.0f), 1.0f) * 255.0f + 0.5f) << 24) |
+                                    ((unsigned)(fminf(fmaxf(e->cur_g, 0.0f), 1.0f) * 255.0f + 0.5f) << 16) |
+                                    ((unsigned)(fminf(fmaxf(e->cur_b, 0.0f), 1.0f) * 255.0f + 0.5f) << 8) |
+                                    (unsigned)(fminf(fmaxf(e->cur_a, 0.0f), 1.0f) * 255.0f + 0.5f);
+                    if (!(tint & 0xff)) tint = 0xff;  /* keep a transparent tint from meaning "none" */
+                    e->bg_image_tex = load_texture_tinted(e->bg_image_path, tint);
+                } else e->bg_image_tex = load_or_get_texture(e->bg_image_path);
                 if (!e->bg_image_tex) e->has_bg_image = 0; /* don't retry every frame */
             }
             if (e->bg_image_tex) {
@@ -17548,11 +21122,20 @@ void luna_render(int fbw, int fbh) {
                     inner_w = e->inline_text_w * scale + 0.5f;
                     align = 0;
                 }
-                if (tbuf[0])
+                g_text_rec_idx = (!e->is_input && !e->no_select && !show_ph) ? i : -1;
+                if (tbuf[0]) {
+                    int clip_input = e->is_input && !e->input_multiline;
+                    if (clip_input) input_clip_begin(dx + pad_l, dy, inner_w, dh, fbw, fbh);
                     render_text_fx(tbuf, tx, dy + pad_t, inner_w + (e->is_input ? e->input_scroll_x : 0.0f),
                                    inner_h, align, css_text_vertical_align(e), tr, tg, tb, ta, e->font_size, e->font_bold,
                                    e->line_height, ws, e->text_overflow, e->overflow_wrap,
                                    show_ph ? NULL : e);
+                    if (clip_input) { glDisable(GL_SCISSOR_TEST); rc_scissor_reset(); rc_set_element_scissor(i, fbw, fbh); }
+                }
+                g_text_rec_idx = -1;
+                if (e->is_input && g_focused_element_idx == i && !show_ph)
+                    input_draw_selection(e, i, fbw, fbh, tbuf, dx, dy, pad_l, pad_t, inner_w, inner_h,
+                                         align, ws, eff_op, scale);
                 /* Caret — CSS caret-color (falls back to text color) */
                 if (e->is_input && g_focused_element_idx == i) {
                     double blink = luna_now();
@@ -17596,6 +21179,7 @@ void luna_render(int fbw, int fbh) {
     }
     g_bg_clip_enabled = 0;
     repaint_stuck_sticky_layers(fbw, fbh);
+    if (g_render_root == -1) { ds_draw(fbw, fbh); ctx_menu_draw(); }
     /* Hand the host back the default vertex array.  Leaving ours bound let a
      * host's next glVertexAttribPointer/glDisableVertexAttribArray edit it —
      * a compositor drawing its own quad disabled attribute 0 of the rect VAO,
@@ -17679,7 +21263,7 @@ static void repaint_stuck_sticky_layers(int fbw, int fbh) {
 }
 
 int luna_pointer_dragging(void) {
-    return g_scroll_drag_idx != -1 || drag_target_idx != -1;
+    return g_scroll_drag_idx != -1 || drag_target_idx != -1 || g_input_drag_idx != -1 || g_ds_drag;
 }
 
 void luna_get_pointer(double* x, double* y) {
@@ -17992,20 +21576,23 @@ void luna_shutdown(void) {
     luna_css_variables_clear();
     g_css_generation++;
     if (!g_css_generation) g_css_generation = 1;
-    for (int i = 0; i < elem_count; i++) {
-        free(elements[i].bg_layers);
-        elements[i].bg_layers = NULL;
-        elements[i].bg_layer_count = 0;
-        free(elements[i].dom_attrs);
-        elements[i].dom_attrs = NULL;
-        free(elements[i].css_vars);
-        elements[i].css_vars = NULL;
-    }
+    luna_reset_document();
+#define LUNA_AUX_FREE(p) do { free(p); (p) = NULL; } while (0)
+    LUNA_AUX_FREE(g_scroll_tick_idx); LUNA_AUX_FREE(g_scroll_container_idx); LUNA_AUX_FREE(g_css_anim_idx);
+    LUNA_AUX_FREE(g_visual_active_idx); LUNA_AUX_FREE(g_visual_active_flag); LUNA_AUX_FREE(render_order);
+    LUNA_AUX_FREE(g_hover_mark); LUNA_AUX_FREE(g_hover_chain); LUNA_AUX_FREE(g_hover_next);
+    LUNA_AUX_FREE(g_intrinsic_width_cache); LUNA_AUX_FREE(g_intrinsic_width_valid);
+    LUNA_AUX_FREE(g_min_content_width_cache); LUNA_AUX_FREE(g_min_content_width_valid);
+    LUNA_AUX_FREE(g_cached_eff_z); LUNA_AUX_FREE(g_sb_slots); LUNA_AUX_FREE(g_rc); LUNA_AUX_FREE(g_draw_rec);
+#undef LUNA_AUX_FREE
+    g_aux_cap = 0;
     free(elements); elements = NULL; g_elements_cap = 0; elem_count = 0;
     free(css_rules); css_rules = NULL; g_rules_cap = 0; rule_count = 0;
+    free(g_rule_order); g_rule_order = NULL;
     for (int i = 0; i < g_tex_count; ++i)
         if (g_tex_cache[i].tex) glDeleteTextures(1, &g_tex_cache[i].tex);
     g_tex_count = 0;
+    free(g_tex_cache); g_tex_cache = NULL; g_tex_cap = 0;
     for (int i = 0; i < NUM_FONT_SIZES; ++i) {
         if (font_regular[i].loaded && font_regular[i].tex)
             glDeleteTextures(1, &font_regular[i].tex);

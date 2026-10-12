@@ -16,35 +16,10 @@
  * luna_file_dialog_prepare(), then luna_file_dialog_show() with a callback.
  * Standalone luna-fm uses luna_file_dialog_run() instead.
  *
- * luna-window.h will raise LUNA_UI_MAX_ELEMENTS to 2048 for this case.
- *
  * Copyright © 2026 Yuichiro Nakada / Project Luna (Vespera) — MPL 2.0
  */
 #ifndef LUNA_WINDOW_H
 #define LUNA_WINDOW_H
-
-/*
- * The built-in Luna file dialog preallocates 384 item slots (four UI
- * elements per slot) plus its chrome, menus and modals.  The default Luna UI
- * capacity is therefore not large enough when the full dialog implementation
- * is compiled into this translation unit.
- *
- * Keep the larger capacity local to users of the file dialog rather than
- * increasing Luna UI's global default for every application.
- */
-#if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION)
-#  if defined(LUNA_UI_H)
-#    if LUNA_UI_MAX_ELEMENTS < 2048
-#      error "Luna file dialog requires LUNA_UI_MAX_ELEMENTS >= 2048; include luna-window.h before luna-ui.h or increase LUNA_UI_MAX_ELEMENTS"
-#    endif
-#  else
-#    ifndef LUNA_UI_MAX_ELEMENTS
-#      define LUNA_UI_MAX_ELEMENTS 2048
-#    elif LUNA_UI_MAX_ELEMENTS < 2048
-#      error "Luna file dialog requires LUNA_UI_MAX_ELEMENTS >= 2048"
-#    endif
-#  endif
-#endif
 
 #ifndef LUNA_UI_H
 #include "luna-ui.h"
@@ -1074,7 +1049,7 @@ int luna_file_dialog_handle_key(int key, int scancode, int action, int mods) {
 #if defined(LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION)
 #ifndef LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION_INCLUDED
 #define LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION_INCLUDED
-#if !defined(__linux__) && !defined(__FreeBSD__)
+#if !defined(__linux__) && !defined(__FreeBSD__) && !defined(__APPLE__)
 #error "The full Luna file-dialog implementation currently requires a POSIX desktop host."
 #endif
 #include <stdio.h>
@@ -1098,13 +1073,25 @@ int luna_file_dialog_handle_key(int key, int scancode, int action, int mods) {
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <math.h>
+#include <spawn.h>
+#include <poll.h>
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+extern char **environ;
 #include <time.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
-#define MAX_ITEMS       384
+#define MAX_COMPLETIONS 384
+/* The list is virtual: only the rows near the viewport exist as elements.  A
+ * folder may hold any number of entries (up to MAX_ENTRIES); POOL_ITEMS is how
+ * many of them can be on screen at once, plus a margin to scroll into. */
+#define POOL_ITEMS      192
+#define MAX_ENTRIES  200000
 #define MAX_CLIP_ITEMS  256
 #define MAX_HISTORY      64
 #define MAX_SEARCH      256
@@ -1116,7 +1103,7 @@ int luna_file_dialog_handle_key(int key, int scancode, int action, int mods) {
 #define DEFAULT_WINDOW_W 700
 #define DEFAULT_WINDOW_H 460
 #define MODAL_INFO_PARTS 28
-#define VOLUME_REFRESH_SEC 2.5
+#define VOLUME_REFRESH_SEC 5.0
 
 typedef enum {
     SORT_NAME = 0,
@@ -1126,13 +1113,15 @@ typedef enum {
 
 typedef struct {
     char name[NAME_MAX + 1];
-    char path[PATH_MAX];
+    char *path;         /* full path; malloc'd by load_directory(), see free_entries() */
     off_t size;
     time_t mtime;
     mode_t mode;
     int is_dir;
     int is_link;
     int selected;
+    int stat_done;      /* size/mtime/mode are read on demand: listing a folder needs
+                           names, not one lstat() per file (slow on network volumes) */
 } FileEntry;
 
 typedef struct {
@@ -1149,11 +1138,23 @@ typedef struct {
 
 typedef struct {
     void *window; /* deprecated standalone-host token; kept until file split */
-    FileEntry entries[MAX_ITEMS];
+    FileEntry *entries;
     int entry_count;
+    int entry_cap;
     int truncated;
-    int slot_entry[MAX_ITEMS];
-    int visible_count;
+    int *vis;           /* indices into entries[] that pass the filters, in order */
+    int vis_count;
+    int vis_cap;
+    int slot_entry[POOL_ITEMS];   /* entry shown by each element slot, or -1 */
+    int slot_item[POOL_ITEMS], slot_icon[POOL_ITEMS], slot_name[POOL_ITEMS], slot_meta[POOL_ITEMS];
+    int visible_count;  /* slots currently bound to an entry */
+    int first_idx;      /* index into vis[] of slot 0 */
+    int id_vtop, id_vbottom;
+    int view_cols;      /* measured from the laid-out slots; 0 until known */
+    float view_stride;  /* row pitch in px: item height + gap */
+    float view_item_h;
+    int view_settle;    /* frames to wait after a rebind before measuring again */
+    int view_grid_mode; /* grid_view value the geometry above was measured for */
     int anchor_entry;
     int context_entry;
     int last_click_entry;
@@ -1302,8 +1303,8 @@ typedef struct {
        longer common prefix, repeated Tab presses cycle through the sorted
        candidates instead of only reporting their count. */
     char completion_display_dir[PATH_MAX];
-    char completion_names[MAX_ITEMS][NAME_MAX + 1];
-    unsigned char completion_is_dir[MAX_ITEMS];
+    char completion_names[MAX_COMPLETIONS][NAME_MAX + 1];
+    unsigned char completion_is_dir[MAX_COMPLETIONS];
     char completion_last_value[PATH_MAX];
     int completion_count;
     int completion_index;
@@ -1369,6 +1370,7 @@ static void close_modal(void);
 static int load_directory(const char *path);
 static void request_overlay_layout(void);
 static void refresh_volumes(int force);
+static void volumes_poll(void);
 static void render_volumes(void);
 static void navigate(const char *path, int add_history);
 static void hide_volume_context(void);
@@ -1727,6 +1729,15 @@ static const char *UI_CSS =
 "px; background:white; }\n.lfd-shell.theme-dark .file-dialog-actions{ background:#172130; bo"
 "rder-top-color:rgba(148,163,184,.15); }\n.lfd-shell.theme-dark .file-dialog-name{ backgroun"
 "d:#111a26; color:#eef3f8; border-color:#40536b; }\n"
+
+"\n.lfd-shell .vspacer{ width:100%; flex:0 0 auto; height:0; pointer-events:none; }\n.lfd-shell .vspacer.hidden{ display:none; }"
+"\n.lfd-shell .grid-item.type-apk .file-icon{ color:#2f9e5b; background:linear-gradient(145deg,#e4f8ea,#c9efd6); }"
+"\n.lfd-shell .grid-item.type-pdf .file-icon{ color:#d64545; background:linear-gradient(145deg,#ffe8e8,#ffd0d0); }"
+"\n.lfd-shell .grid-item.type-doc .file-icon{ color:#5a6b85; background:linear-gradient(145deg,#eef2f8,#dde4ef); }"
+"\n.lfd-shell .list-item.type-apk .file-icon{ background:#d9f3e2; color:#2f9e5b; }"
+"\n.lfd-shell .list-item.type-pdf .file-icon{ background:#ffe1e1; color:#d64545; }"
+"\n.lfd-shell .file-icon{ font-size:20px; }\n.lfd-shell .list-item .file-icon{ font-size:14px; }"
+"\n.lfd-shell .tool, .lfd-shell .side-item{ font-size:13px; }"
 ;
 
 static const char *LFD_OVERLAY_CSS =
@@ -1916,8 +1927,18 @@ static void human_size(off_t value, char *out, size_t cap) {
     else snprintf(out, cap, "%.1f %s", n, units[u]);
 }
 
-static void format_meta(const FileEntry *f, char *out, size_t cap) {
+static void entry_stat(FileEntry *f) {
+    struct stat st;
+    if (f->stat_done) return;
+    f->stat_done = 1;
+    if (f->path && lstat(f->path, &st) == 0) {
+        f->size = st.st_size; f->mtime = st.st_mtime; f->mode = st.st_mode;
+    }
+}
+
+static void format_meta(FileEntry *f, char *out, size_t cap) {
     char when[32] = "";
+    entry_stat(f);
     struct tm tmv;
     localtime_r(&f->mtime, &tmv);
     strftime(when, sizeof(when), "%Y/%m/%d %H:%M", &tmv);
@@ -1948,19 +1969,63 @@ static const char *type_class(const FileEntry *f) {
         !strcasecmp(ext,"html") || !strcasecmp(ext,"css") || !strcasecmp(ext,"json") ||
         !strcasecmp(ext,"md") || !strcasecmp(ext,"sh")) return "type-code";
     if (!strcasecmp(ext,"desktop")) return "type-desktop";
+    if (!strcasecmp(ext,"apk") || !strcasecmp(ext,"xapk") || !strcasecmp(ext,"apks") ||
+        !strcasecmp(ext,"aab")) return "type-apk";
+    if (!strcasecmp(ext,"pdf")) return "type-pdf";
+    if (!strcasecmp(ext,"txt") || !strcasecmp(ext,"log") || !strcasecmp(ext,"rtf") ||
+        !strcasecmp(ext,"doc") || !strcasecmp(ext,"docx") || !strcasecmp(ext,"odt") ||
+        !strcasecmp(ext,"xls") || !strcasecmp(ext,"xlsx") || !strcasecmp(ext,"ppt") ||
+        !strcasecmp(ext,"pptx") || !strcasecmp(ext,"csv") || !strcasecmp(ext,"ini") ||
+        !strcasecmp(ext,"conf") || !strcasecmp(ext,"toml") || !strcasecmp(ext,"yaml") ||
+        !strcasecmp(ext,"yml")) return "type-doc";
     return "type-file";
 }
 
+#define FA_FOLDER "\357\201\273"
+#define FA_FILE   "\357\205\233"
+#define FA_TEXT   "\357\205\234"
+#define FA_IMAGE  "\357\207\205"
+#define FA_AUDIO  "\357\207\207"
+#define FA_VIDEO  "\357\207\210"
+#define FA_ARCHIVE "\357\207\206"
+#define FA_CODE   "\357\207\211"
+#define FA_PACKAGE "\357\206\262"
+#define FA_PDF    "\357\207\201"
+#define FA_DESKTOP "\357\204\210"
+#define FA_LINK   "\357\203\201"
+#define FA_BACK "\357\201\223"
+#define FA_FWD "\357\201\224"
+#define FA_UP "\357\201\267"
+#define FA_HOME "\357\200\225"
+#define FA_RELOAD "\357\200\241"
+#define FA_GRID "\357\200\212"
+#define FA_LIST "\357\203\211"
+#define FA_HIDDEN "\357\201\260"
+#define FA_NEWDIR "\357\231\236"
+#define FA_PASTE "\357\203\252"
+#define FA_GEAR "\357\200\223"
+#define FA_DESKTOP2 "\357\204\210"
+#define FA_DOCS "\357\205\234"
+#define FA_DOWNLOAD "\357\200\231"
+#define FA_PICTURES "\357\200\276"
+#define FA_MUSIC "\357\200\201"
+#define FA_MOVIES "\357\200\275"
+#define FA_TRASH "\357\207\270"
+#define FA_DRIVE "\357\202\240"
+
 static const char *type_icon(const FileEntry *f) {
     const char *t = type_class(f);
-    if (!strcmp(t,"type-folder")) return "◆";
-    if (!strcmp(t,"type-image")) return "▧";
-    if (!strcmp(t,"type-audio")) return "♫";
-    if (!strcmp(t,"type-video")) return "▶";
-    if (!strcmp(t,"type-archive")) return "▤";
-    if (!strcmp(t,"type-code")) return "⌘";
-    if (!strcmp(t,"type-desktop")) return "☆";
-    return "◇";
+    if (!strcmp(t,"type-folder")) return FA_FOLDER;
+    if (!strcmp(t,"type-image")) return FA_IMAGE;
+    if (!strcmp(t,"type-audio")) return FA_AUDIO;
+    if (!strcmp(t,"type-video")) return FA_VIDEO;
+    if (!strcmp(t,"type-archive")) return FA_ARCHIVE;
+    if (!strcmp(t,"type-code")) return FA_CODE;
+    if (!strcmp(t,"type-apk")) return FA_PACKAGE;
+    if (!strcmp(t,"type-pdf")) return FA_PDF;
+    if (!strcmp(t,"type-doc")) return FA_TEXT;
+    if (!strcmp(t,"type-desktop")) return FA_DESKTOP;
+    return f->is_link ? FA_LINK : FA_FILE;
 }
 
 static int compare_entries(const void *pa, const void *pb) {
@@ -1973,6 +2038,15 @@ static int compare_entries(const void *pa, const void *pb) {
     if (g.sort_desc) r = -r;
     if (r == 0) r = strcasecmp(a->name, b->name);
     return r;
+}
+
+static void sort_entries(void) {
+    /* Date and size sorts need the stat data of every entry; a name sort never
+     * touches the disk beyond the directory read itself. */
+    if (g.sort_mode != SORT_NAME)
+        for (int i = 0; i < g.entry_count; i++) entry_stat(&g.entries[i]);
+    if (g.entry_count > 1)
+        qsort(g.entries, (size_t)g.entry_count, sizeof(g.entries[0]), compare_entries);
 }
 
 static int path_is_directory(const char *path) {
@@ -2125,6 +2199,105 @@ static void refresh_sidebar_visibility(void) {
     request_redraw();
 }
 
+/* Run a program and collect its standard output.  posix_spawn, not fork: this
+ * runs inside processes that hold gigabytes of address space and several GL and
+ * audio threads, where fork() has to duplicate all of it before exec().  The
+ * wait is bounded, so a hung helper (a dead network mount under gio, a missing
+ * selection owner under xclip) costs two seconds, not the application. */
+typedef struct { pid_t pid; int fd; } ProcRead;
+
+static int proc_read_start(const char *prog, char *const argv[], ProcRead *pr) {
+    int fds[2];
+    posix_spawn_file_actions_t fa;
+    pid_t pid;
+    int rc;
+    if(pipe(fds)!=0)return 0;
+    fcntl(fds[0],F_SETFD,FD_CLOEXEC);
+    fcntl(fds[1],F_SETFD,FD_CLOEXEC);
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa,STDIN_FILENO,"/dev/null",O_RDONLY,0);
+    posix_spawn_file_actions_adddup2(&fa,fds[1],STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa,STDERR_FILENO,"/dev/null",O_WRONLY,0);
+    rc=posix_spawnp(&pid,prog,&fa,NULL,argv,environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if(rc!=0){close(fds[0]);return 0;}
+    fcntl(fds[0],F_SETFL,fcntl(fds[0],F_GETFL)|O_NONBLOCK);
+    pr->pid=pid;pr->fd=fds[0];
+    return 1;
+}
+
+static int proc_read_finish(ProcRead *pr) {
+    int st=0;
+    close(pr->fd);pr->fd=-1;
+    while(waitpid(pr->pid,&st,0)<0){if(errno!=EINTR)return 0;}
+    return WIFEXITED(st)&&WEXITSTATUS(st)==0;
+}
+
+static int pipe_read_program(const char *prog, char *const argv[], char *out, size_t cap) {
+    ProcRead pr;
+    size_t w=0;
+    struct timespec t0,t1;
+    int timed_out=0;
+    if(cap==0)return 0;
+    out[0]=0;
+    if(!proc_read_start(prog,argv,&pr))return 0;
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    while(w+1<cap){
+        struct pollfd pf={pr.fd,POLLIN,0};
+        long waited;
+        ssize_t n;
+        clock_gettime(CLOCK_MONOTONIC,&t1);
+        waited=(long)((t1.tv_sec-t0.tv_sec)*1000+(t1.tv_nsec-t0.tv_nsec)/1000000);
+        if(waited>=2000){timed_out=1;break;}
+        if(poll(&pf,1,(int)(2000-waited))<=0){if(errno==EINTR)continue;timed_out=1;break;}
+        n=read(pr.fd,out+w,cap-w-1);
+        if(n==0)break;
+        if(n<0){if(errno==EINTR||errno==EAGAIN)continue;break;}
+        w+=(size_t)n;
+    }
+    out[w]=0;
+    if(timed_out)kill(pr.pid,SIGKILL);
+    return proc_read_finish(&pr)&&w>0&&!timed_out;
+}
+
+/* The same, without waiting: the caller polls from its frame loop. */
+typedef struct { ProcRead pr; char *buf; size_t len, cap; int active; } AsyncRead;
+
+static int async_read_start(AsyncRead *a, const char *prog, char *const argv[]) {
+    memset(a,0,sizeof(*a));
+    if(!proc_read_start(prog,argv,&a->pr))return 0;
+    a->active=1;
+    return 1;
+}
+
+/* Returns 1 once the program has closed its output (or failed). */
+static int async_read_poll(AsyncRead *a) {
+    if(!a->active)return 1;
+    for(;;){
+        char chunk[4096];
+        ssize_t n=read(a->pr.fd,chunk,sizeof(chunk));
+        if(n>0){
+            if(a->len+(size_t)n+1>a->cap){
+                size_t cap=a->cap?a->cap*2:8192;
+                char *grown;
+                while(cap<a->len+(size_t)n+1)cap*=2;
+                if(cap>(1u<<20))break;           /* far more than any volume list */
+                grown=(char*)realloc(a->buf,cap);
+                if(!grown)break;
+                a->buf=grown;a->cap=cap;
+            }
+            memcpy(a->buf+a->len,chunk,(size_t)n);a->len+=(size_t)n;a->buf[a->len]=0;
+            continue;
+        }
+        if(n<0&&(errno==EAGAIN||errno==EINTR))return 0;
+        break;
+    }
+    if(!proc_read_finish(&a->pr)&&a->buf)a->buf[0]=0;
+    a->active=0;
+    return 1;
+}
+
 static int hex_nibble(char c) {
     if(c>='0'&&c<='9')return c-'0';
     if(c>='a'&&c<='f')return c-'a'+10;
@@ -2194,14 +2367,10 @@ static int add_volume_entry(const char *name, const char *device, const char *mo
     return 1;
 }
 
-static void collect_volumes_from_gio(void) {
-    char output[131072];
-    char *argv[]={"gio","mount","-l","-i",NULL};
+static void parse_volumes_gio(char *output) {
     char cur_name[256]="",cur_device[PATH_MAX]="",cur_uuid[128]="",cur_mount[PATH_MAX]="";
     int in_volume=0,can_mount=0,can_eject=0,can_unmount=0,drive_removable=0;
     char *line,*save=NULL;
-    if(!program_exists("gio"))return;
-    if(!pipe_read_program("gio",argv,output,sizeof(output)))return;
     for(line=strtok_r(output,"\n",&save);line;line=strtok_r(NULL,"\n",&save)){
         char *p=line;
         while(*p==' '||*p=='\t')p++;
@@ -2251,12 +2420,8 @@ static void collect_volumes_from_gio(void) {
         add_volume_entry(cur_name,cur_device,cur_mount,cur_uuid,can_mount,can_unmount,can_eject,drive_removable);
 }
 
-static void collect_volumes_from_lsblk_pairs(void) {
-    char output[65536];
-    char *argv[]={"lsblk","-P","-o","NAME,LABEL,UUID,FSTYPE,MOUNTPOINT,RM,HOTPLUG,TYPE",NULL};
+static void parse_volumes_lsblk(char *output) {
     char *line,*save=NULL;
-    if(!program_exists("lsblk"))return;
-    if(!pipe_read_program("lsblk",argv,output,sizeof(output)))return;
     for(line=strtok_r(output,"\n",&save);line;line=strtok_r(NULL,"\n",&save)){
         char name[128]="",label[256]="",uuid[128]="",fstype[64]="",mount[PATH_MAX]="",type[32]="";
         int rm=0,hotplug=0;
@@ -2324,7 +2489,7 @@ static void render_volumes(void) {
         }
         VolumeEntry *v=&g.volumes[i];
         snprintf(label,sizeof(label),"%s　%s",
-                 v->is_mounted?"▣":"◇",
+                 FA_DRIVE,
                  v->name[0]?v->name:(v->device[0]?v->device:"ボリューム"));
         luna_set_text(eid,label);
         luna_remove_class(eid,"hidden");
@@ -2336,14 +2501,38 @@ static void render_volumes(void) {
     request_redraw();
 }
 
-static void refresh_volumes(int force) {
-    double now=luna_platform_time();
-    if(!force && g.volumes_next_refresh>0 && now<g.volumes_next_refresh)return;
+/* Volume discovery runs lsblk and gio, both of which can take a long time (gio
+ * about half a second here, much longer when a network mount has gone away).
+ * It used to run on the UI thread every few seconds, which froze the dialog each
+ * time.  Now the programs are started and read from the frame loop. */
+static AsyncRead g_vol_job[2];
+static int g_vol_cycle;
+
+static void volumes_poll(void) {
+    int pending=0;
+    if(!g_vol_cycle)return;
+    for(int i=0;i<2;i++)
+        if(g_vol_job[i].active&&!async_read_poll(&g_vol_job[i]))pending=1;
+    if(pending)return;
+    g_vol_cycle=0;
     g.volume_count=0;
-    /* Prefer util-linux lsblk (no gvfs). Optional gio fills network mounts. */
-    collect_volumes_from_lsblk_pairs();
-    if(program_exists("gio"))collect_volumes_from_gio();
-    g.volumes_next_refresh=now+VOLUME_REFRESH_SEC;
+    if(g_vol_job[0].buf)parse_volumes_lsblk(g_vol_job[0].buf);
+    if(g_vol_job[1].buf)parse_volumes_gio(g_vol_job[1].buf);
+    for(int i=0;i<2;i++){free(g_vol_job[i].buf);g_vol_job[i].buf=NULL;}
+#ifdef __APPLE__
+    {   /* Mounted volumes show up under /Volumes; no helper program needed. */
+        DIR *d=opendir("/Volumes");
+        struct dirent *de;
+        while(d&&(de=readdir(d))){
+            char mount[PATH_MAX];struct stat st;
+            if(de->d_name[0]=='.')continue;
+            snprintf(mount,sizeof(mount),"/Volumes/%s",de->d_name);
+            if(lstat(mount,&st)!=0||!S_ISDIR(st.st_mode))continue;   /* the boot volume is a link */
+            add_volume_entry(de->d_name,"",mount,"",0,1,0,0);
+        }
+        if(d)closedir(d);
+    }
+#endif
     /* If the current folder vanished because a volume was unmounted, go home. */
     if(g.cwd[0] && !path_is_directory(g.cwd)){
         show_toast("マウントが解除されたためホームへ戻ります");
@@ -2351,6 +2540,27 @@ static void refresh_volumes(int force) {
         return;
     }
     render_volumes();
+}
+
+static void refresh_volumes(int force) {
+    static int have_lsblk=-1,have_gio=-1;
+    double now=luna_platform_time();
+    if(g_vol_cycle)return;
+    if(!force && g.volumes_next_refresh>0 && now<g.volumes_next_refresh)return;
+    g.volumes_next_refresh=now+VOLUME_REFRESH_SEC;
+    if(have_lsblk<0)have_lsblk=program_exists("lsblk");
+    if(have_gio<0)have_gio=program_exists("gio");
+    memset(g_vol_job,0,sizeof(g_vol_job));
+    if(have_lsblk){
+        char *argv[]={"lsblk","-P","-o","NAME,LABEL,UUID,FSTYPE,MOUNTPOINT,RM,HOTPLUG,TYPE",NULL};
+        async_read_start(&g_vol_job[0],"lsblk",argv);
+    }
+    if(have_gio){
+        char *argv[]={"gio","mount","-l","-i",NULL};
+        async_read_start(&g_vol_job[1],"gio",argv);
+    }
+    g_vol_cycle=1;
+    volumes_poll();   /* nothing started: finish at once */
 }
 
 static int mount_volume_index(int index) {
@@ -2634,21 +2844,6 @@ static int pipe_write_program(const char *prog, char *const argv[], const char *
     int st=0; waitpid(pid,&st,0);
     return WIFEXITED(st)&&WEXITSTATUS(st)==0;
 }
-
-static int pipe_read_program(const char *prog, char *const argv[], char *out, size_t cap) {
-    int fds[2]; if (pipe(fds)!=0) return 0;
-    pid_t pid=fork();
-    if (pid==0) {
-        dup2(fds[1],STDOUT_FILENO); close(fds[0]); close(fds[1]);
-        int dev=open("/dev/null",O_WRONLY); if(dev>=0){dup2(dev,STDERR_FILENO);close(dev);} 
-        execvp(prog,argv); _exit(127);
-    }
-    close(fds[1]); size_t w=0;
-    while (w+1<cap) { ssize_t n=read(fds[0],out+w,cap-w-1); if(n==0)break; if(n<0){if(errno==EINTR)continue;break;} w+=(size_t)n; }
-    out[w]=0; close(fds[0]); int st=0; waitpid(pid,&st,0);
-    return w>0 && WIFEXITED(st)&&WEXITSTATUS(st)==0;
-}
-
 
 static void trim_text(char *s) {
     if(!s)return;
@@ -3482,10 +3677,10 @@ static int path_in_clipboard(const char *path) {
 }
 
 static void apply_item_classes(int slot, int ei) {
-    char id[32], cls_remove[256], cls_add[256];
-    snprintf(id,sizeof(id),"lfd-item%03d",slot);
-    int idx=luna_get_element_by_id(id);
-    snprintf(cls_remove,sizeof(cls_remove),"hidden grid-item list-item type-folder type-file type-image type-audio type-video type-code type-archive selected cut");
+    char cls_add[256];
+    int idx=g.slot_item[slot];
+    static const char *cls_remove="hidden grid-item list-item type-folder type-file type-image type-audio type-video type-code type-archive type-apk type-pdf type-doc type-desktop selected cut";
+    if(idx<0)return;
     if(ei<0){luna_update_classes(idx,cls_remove,"file-item hidden"); return;}
     FileEntry *f=&g.entries[ei];
     snprintf(cls_add,sizeof(cls_add),"file-item %s %s%s%s",g.grid_view?"grid-item":"list-item",type_class(f),f->selected?" selected":"",(g.clip_cut&&path_in_clipboard(f->path))?" cut":"");
@@ -3496,8 +3691,8 @@ static void update_file_status(void) {
     char status[256], sz[32];
     int sel=selected_count();
     human_size(selected_size(),sz,sizeof(sz));
-    if(sel) snprintf(status,sizeof(status),"%d 個を選択中（%s）  •  %d 個表示 / %d 個%s",sel,sz,g.visible_count,g.entry_count,g.truncated?"（上限384件）":"");
-    else snprintf(status,sizeof(status),"%d 個表示 / %d 個%s  •  %s表示  •  Ctrl+C / Ctrl+X / Ctrl+V",g.visible_count,g.entry_count,g.truncated?"（上限384件）":"",g.grid_view?"アイコン":"リスト");
+    if(sel) snprintf(status,sizeof(status),"%d 個を選択中（%s）  •  %d 個表示 / %d 個%s",sel,sz,g.vis_count,g.entry_count,g.truncated?"（上限を超えた分は省略）":"");
+    else snprintf(status,sizeof(status),"%d 個表示 / %d 個%s  •  %s表示",g.vis_count,g.entry_count,g.truncated?"（上限を超えた分は省略）":"",g.grid_view?"アイコン":"リスト");
     luna_set_text(g.id_status,status);
     update_toolbar_state();
 }
@@ -3511,28 +3706,225 @@ static void refresh_file_visuals(void) {
     request_redraw();
 }
 
-static void render_files(void) {
-    int old_visible=g.visible_count;
-    int slot=0;
-    for(int i=0;i<g.entry_count && slot<MAX_ITEMS;i++) {
-        FileEntry *f=&g.entries[i];
-        if(!g.show_hidden && f->name[0]=='.') continue;
-        if(!starts_with_ci(f->name,g.search)) continue;
-        g.slot_entry[slot]=i;
-        char id[32], meta[96];
-        snprintf(id,sizeof(id),"lfd-icon%03d",slot);luna_set_text(luna_get_element_by_id(id),type_icon(f));
-        snprintf(id,sizeof(id),"lfd-name%03d",slot);luna_set_text(luna_get_element_by_id(id),f->name);
-        format_meta(f,meta,sizeof(meta));snprintf(id,sizeof(id),"lfd-meta%03d",slot);luna_set_text(luna_get_element_by_id(id),meta);
-        apply_item_classes(slot,i);
-        slot++;
+#ifdef __APPLE__
+/* The file system hands back decomposed names (か + U+3099 for が); drawn as is,
+ * the voiced mark lands beside the kana instead of on it.  Compose for display. */
+static void display_name(const char *in, char *out, size_t cap) {
+    int wide=0;
+    safe_copy(out,cap,in);
+    for(const unsigned char *p=(const unsigned char*)in;*p;p++) if(*p>=0x80){wide=1;break;}
+    if(!wide)return;
+    CFStringRef s0=CFStringCreateWithBytes(NULL,(const UInt8*)in,(CFIndex)strlen(in),kCFStringEncodingUTF8,false);
+    if(!s0)return;
+    CFMutableStringRef m=CFStringCreateMutableCopy(NULL,0,s0);
+    CFRelease(s0);
+    if(!m)return;
+    CFStringNormalize(m,kCFStringNormalizationFormC);
+    if(!CFStringGetCString(m,out,(CFIndex)cap,kCFStringEncodingUTF8)) safe_copy(out,cap,in);
+    CFRelease(m);
+}
+#else
+static void display_name(const char *in, char *out, size_t cap) { safe_copy(out,cap,in); }
+#endif
+
+static void free_entries(void) {
+    for(int i=0;i<g.entry_count;i++){free(g.entries[i].path);g.entries[i].path=NULL;}
+    g.entry_count=0;
+}
+
+static void release_entries(void) {
+    free_entries();
+    free(g.entries); g.entries=NULL; g.entry_cap=0;
+    free(g.vis); g.vis=NULL; g.vis_cap=0; g.vis_count=0;
+}
+
+/* ---- virtual list ---------------------------------------------------------
+ * Every row used to be an element, whether or not it was on screen: a few
+ * hundred of them, restyled and laid out on each directory change.  Now there
+ * are POOL_ITEMS slots, bound to the rows around the viewport, and two spacer
+ * elements stand in for the rows above and below so the scroll bar still spans
+ * the whole folder.  The grid's column count and row pitch are not assumed: they
+ * are read back from the laid-out slots, so density and window-size classes in
+ * the stylesheet keep working. */
+static void virt_set_spacer(int id, float height) {
+    LunaElement *e=luna_element_at(id);
+    if(!e)return;
+    if(height<=0.0f){luna_add_class(id,"hidden");return;}
+    snprintf(e->inline_style,sizeof(e->inline_style),"height:%.1fpx",height);
+    e->has_inline_style=1;
+    luna_remove_class(id,"hidden");
+    luna_update_element_style(id);
+}
+
+static float virt_gap(void) {
+    LunaElement *grid=luna_element_at(g.id_grid);
+    if(grid&&grid->flex_gap>0.0f)return grid->flex_gap;
+    return g.grid_view?6.0f:1.0f;
+}
+
+static void virt_bind(void) {
+    char shown[NAME_MAX+1],meta[96];
+    int total=g.vis_count,old_bound=g.visible_count,first=0,count;
+    int measured=g.view_cols>0&&g.view_stride>1.0f&&g.view_grid_mode==g.grid_view;
+    LunaElement *grid=luna_element_at(g.id_grid);
+    int cols=measured?g.view_cols:1;
+    float stride=measured?g.view_stride:0.0f,gap=virt_gap();
+    int total_rows=(total+cols-1)/cols,first_row=0,rows_bound=0;
+
+    if(!measured){
+        /* Geometry unknown (first show, or the view mode just changed): bind the
+         * whole pool from the top so the first layout can be measured. */
+        count=total<POOL_ITEMS?total:POOL_ITEMS;
+    }else{
+        float vh=grid?grid->h-grid->padding*2.0f:0.0f;
+        float scroll=grid?grid->scroll_top:0.0f;
+        int max_rows=POOL_ITEMS/cols;
+        if(vh<=1.0f)vh=480.0f;
+        if(max_rows<1)max_rows=1;
+        rows_bound=(int)(vh/stride)+6;
+        if(rows_bound>max_rows)rows_bound=max_rows;
+        first_row=(int)(scroll/stride)-2;
+        if(first_row+rows_bound>total_rows)first_row=total_rows-rows_bound;
+        if(first_row<0)first_row=0;
+        first=first_row*cols;
+        count=rows_bound*cols;
+        if(first+count>total)count=total-first;
+        if(count<0)count=0;
     }
-    for(int i=slot;i<old_visible;i++){g.slot_entry[i]=-1;apply_item_classes(i,-1);}
-    g.visible_count=slot;
-    if(slot==0)luna_remove_class(luna_get_element_by_id("lfd-empty"),"hidden");else luna_add_class(luna_get_element_by_id("lfd-empty"),"hidden");
-    if(g.grid_view)luna_update_classes(g.id_grid,"list","grid");else luna_update_classes(g.id_grid,"grid","list");
-    update_file_status();
+    if(!measured)first_row=0;
+    g.first_idx=first;
+    for(int slot=0;slot<count;slot++){
+        int ei=g.vis[first+slot];
+        FileEntry *f=&g.entries[ei];
+        g.slot_entry[slot]=ei;
+        display_name(f->name,shown,sizeof(shown));
+        luna_set_text(g.slot_icon[slot],type_icon(f));
+        luna_set_text(g.slot_name[slot],shown);
+        if(g.grid_view&&!g.show_grid_details)meta[0]=0; else format_meta(f,meta,sizeof(meta));
+        luna_set_text(g.slot_meta[slot],meta);
+        apply_item_classes(slot,ei);
+    }
+    for(int slot=count;slot<old_bound&&slot<POOL_ITEMS;slot++){g.slot_entry[slot]=-1;apply_item_classes(slot,-1);}
+    g.visible_count=count;
+    if(measured){
+        int bound_rows=(count+cols-1)/cols;
+        int rest=total_rows-first_row-bound_rows;
+        virt_set_spacer(g.id_vtop,first_row>0?first_row*stride-gap:0.0f);
+        virt_set_spacer(g.id_vbottom,rest>0?rest*stride-gap:0.0f);
+    }else{
+        virt_set_spacer(g.id_vtop,0.0f);
+        virt_set_spacer(g.id_vbottom,0.0f);
+    }
+    g.view_settle=2;
     luna_mark_layout_dirty();
     request_redraw();
+}
+
+/* Read the row pitch and column count off the laid-out slots.  Returns 1 when the
+ * measurement changed what virt_bind() assumes. */
+static int virt_measure(void) {
+    LunaElement *a;
+    int cols=1;
+    float stride;
+    if(g.visible_count<1)return 0;
+    a=luna_element_at(g.slot_item[0]);
+    if(!a||a->h<=1.0f||!luna_element_visible(g.slot_item[0]))return 0;
+    for(int slot=1;slot<g.visible_count;slot++){
+        LunaElement *b=luna_element_at(g.slot_item[slot]);
+        if(!b||fabsf(b->y-a->y)>0.5f)break;
+        cols++;
+    }
+    if(cols<g.visible_count){
+        LunaElement *b=luna_element_at(g.slot_item[cols]);
+        stride=b?b->y-a->y:0.0f;
+    }else stride=a->h+virt_gap();
+    if(stride<=1.0f)return 0;
+    if(g.view_cols==cols&&fabsf(g.view_stride-stride)<0.5f&&g.view_grid_mode==g.grid_view)return 0;
+    g.view_cols=cols;g.view_stride=stride;g.view_item_h=a->h;g.view_grid_mode=g.grid_view;
+    return 1;
+}
+
+/* Once per frame, before the document is laid out.  Rebinds when the viewport
+ * has moved off the bound rows, or the measured geometry changed. */
+static void virt_sync(void) {
+    LunaElement *grid;
+    int cols,total_rows,bound_first_row,bound_rows,top_row,bottom_row;
+    float vh;
+    if(g.id_grid<0||g.vis_count<=0)return;
+    grid=luna_element_at(g.id_grid);
+    if(!grid||grid->h<=1.0f)return;
+    /* Geometry is read back only once the last rebind has been laid out; the
+     * scroll position is acted on every frame. */
+    if(g.view_settle>0)g.view_settle--;
+    else if(virt_measure()){virt_bind();return;}
+    if(g.view_cols<=0)return;
+    cols=g.view_cols;
+    vh=grid->h-grid->padding*2.0f;
+    total_rows=(g.vis_count+cols-1)/cols;
+    bound_first_row=g.first_idx/cols;
+    bound_rows=(g.visible_count+cols-1)/cols;
+    {
+        /* Look at where the scroll is going, not just where it is: wheel scrolling
+         * is animated, and a frame that lags behind it shows empty rows. */
+        float lo=grid->scroll_top<grid->scroll_dest_top?grid->scroll_top:grid->scroll_dest_top;
+        float hi=grid->scroll_top>grid->scroll_dest_top?grid->scroll_top:grid->scroll_dest_top;
+        top_row=(int)(lo/g.view_stride);
+        bottom_row=(int)((hi+vh)/g.view_stride);
+    }
+    if(top_row<bound_first_row+1&&bound_first_row>0){virt_bind();return;}
+    if(bottom_row>=bound_first_row+bound_rows-2&&bound_first_row+bound_rows<total_rows){virt_bind();return;}
+    /* The window grew: rows that now fit were not bound. */
+    if(g.first_idx+g.visible_count<g.vis_count&&bound_rows<(int)(vh/g.view_stride)+3&&
+       bound_rows<POOL_ITEMS/cols){virt_bind();return;}
+}
+
+/* Scroll so the vis[] position is on screen. */
+static void virt_reveal(int pos) {
+    LunaElement *grid=luna_element_at(g.id_grid);
+    int cols=g.view_cols>0?g.view_cols:1;
+    float top,bottom,vh,cur,target;
+    if(!grid||g.view_stride<=1.0f)return;
+    top=(float)(pos/cols)*g.view_stride;
+    bottom=top+g.view_item_h+grid->padding*2.0f;
+    vh=grid->h-grid->padding*2.0f;
+    cur=grid->scroll_top;
+    target=cur;
+    if(top<cur)target=top;
+    else if(bottom>cur+vh)target=bottom-vh;
+    if(target==cur)return;
+    g.grid_scroll_top=g.grid_scroll_dest_top=target;
+    apply_grid_scroll();
+    virt_bind();
+}
+
+static int *vis_reserve(int n) {
+    if(n>g.vis_cap){
+        int cap=g.vis_cap?g.vis_cap:512;
+        int *grown;
+        while(cap<n)cap*=2;
+        grown=(int*)realloc(g.vis,(size_t)cap*sizeof(int));
+        if(!grown)return NULL;
+        g.vis=grown;g.vis_cap=cap;
+    }
+    return g.vis;
+}
+
+static void render_files(void) {
+    g.vis_count=0;
+    if(vis_reserve(g.entry_count)){
+        for(int i=0;i<g.entry_count;i++) {
+            FileEntry *f=&g.entries[i];
+            if(!g.show_hidden && f->name[0]=='.') continue;
+            if(!starts_with_ci(f->name,g.search)) continue;
+            g.vis[g.vis_count++]=i;
+        }
+    }
+    /* A different row layout (icons <-> list) invalidates what was measured. */
+    if(g.view_grid_mode!=g.grid_view)g.view_cols=0;
+    if(g.grid_view)luna_update_classes(g.id_grid,"list","grid");else luna_update_classes(g.id_grid,"grid","list");
+    virt_bind();
+    if(g.vis_count==0)luna_remove_class(luna_get_element_by_id("lfd-empty"),"hidden");else luna_add_class(luna_get_element_by_id("lfd-empty"),"hidden");
+    update_file_status();
 }
 
 static int file_dialog_filter_matches(const char *name) {
@@ -3560,31 +3952,55 @@ static int file_dialog_filter_matches(const char *name) {
 }
 
 static int load_directory(const char *path) {
-    char resolved[PATH_MAX];
+    char resolved[PATH_MAX],shown[PATH_MAX];
     if(!realpath(path,resolved)) { show_toast("開けません: %s",strerror(errno)); return 0; }
-    struct stat st; if(stat(resolved,&st)!=0 || !S_ISDIR(st.st_mode)){show_toast("フォルダーではありません");return 0;}
-    DIR *d=opendir(resolved); if(!d){show_toast("開けません: %s",strerror(errno));return 0;}
-    g.entry_count=0; g.truncated=0;
+    DIR *d=opendir(resolved);
+    if(!d){show_toast(errno==ENOTDIR?"フォルダーではありません":"開けません: %s",strerror(errno));return 0;}
+    free_entries();
+    g.truncated=0;
     struct dirent *de;
+    size_t dirlen=strlen(resolved);
     while((de=readdir(d))){
         if(!strcmp(de->d_name,".")||!strcmp(de->d_name,".."))continue;
-        if (g.entry_count >= MAX_ITEMS) { g.truncated = 1; continue; }
+        if(g.entry_count>=MAX_ENTRIES){g.truncated=1;break;}
+        if(g.entry_count>=g.entry_cap){
+            int cap=g.entry_cap?g.entry_cap*2:1024;
+            FileEntry *grown=(FileEntry*)realloc(g.entries,(size_t)cap*sizeof(FileEntry));
+            if(!grown){g.truncated=1;break;}
+            g.entries=grown;g.entry_cap=cap;
+        }
         FileEntry *f=&g.entries[g.entry_count]; memset(f,0,sizeof(*f));
         safe_copy(f->name,sizeof(f->name),de->d_name);
-        if(!path_join(f->path,sizeof(f->path),resolved,de->d_name))continue;
-        struct stat fs; if(lstat(f->path,&fs)!=0)continue;
-        f->mode=fs.st_mode; f->is_link=S_ISLNK(fs.st_mode); f->is_dir=S_ISDIR(fs.st_mode);
-        if(f->is_link){struct stat target;if(stat(f->path,&target)==0&&S_ISDIR(target.st_mode))f->is_dir=1;}
+        size_t need=dirlen+1+strlen(de->d_name)+2;
+        f->path=(char*)malloc(need);
+        if(!f->path)continue;
+        snprintf(f->path,need,"%s%s%s",resolved,(dirlen==1&&resolved[0]=='/')?"":"/",de->d_name);
+        /* The directory entry usually says what it is.  Only an unknown type or a
+         * symbolic link (which may point at a folder) costs a system call. */
+        int known=0;
+#ifdef DT_DIR
+        if(de->d_type==DT_DIR){f->is_dir=1;known=1;}
+        else if(de->d_type==DT_REG){known=1;}
+        else if(de->d_type==DT_LNK){f->is_link=1;}
+#endif
+        if(!known){
+            struct stat fs;
+            if(lstat(f->path,&fs)!=0){free(f->path);f->path=NULL;continue;}
+            f->mode=fs.st_mode;f->size=fs.st_size;f->mtime=fs.st_mtime;f->stat_done=1;
+            f->is_link=S_ISLNK(fs.st_mode);f->is_dir=S_ISDIR(fs.st_mode);
+            if(f->is_link){struct stat target;if(stat(f->path,&target)==0&&S_ISDIR(target.st_mode))f->is_dir=1;}
+        }
         if(!f->is_dir && g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER &&
-           !file_dialog_filter_matches(f->name)) continue;
-        f->size=fs.st_size; f->mtime=fs.st_mtime; g.entry_count++;
+           !file_dialog_filter_matches(f->name)){free(f->path);f->path=NULL;continue;}
+        g.entry_count++;
     }
     closedir(d);
-    qsort(g.entries,(size_t)g.entry_count,sizeof(g.entries[0]),compare_entries);
+    sort_entries();
     safe_copy(g.cwd,sizeof(g.cwd),resolved);
     clear_selection(); g.context_entry=-1;
-    luna_set_value(g.id_path,g.cwd);
-    luna_set_text(g.id_title,base_name(g.cwd));
+    display_name(g.cwd,shown,sizeof(shown));
+    luna_set_value(g.id_path,shown);
+    {char title[NAME_MAX+1];display_name(base_name(g.cwd),title,sizeof(title));luna_set_text(g.id_title,title);}
     reset_grid_scroll();
     update_sidebar_active(); render_files();
     return 1;
@@ -3749,7 +4165,7 @@ static void complete_path_input(void) {
         } else {
             common[common_name_prefix(common, name)] = 0;
         }
-        if (stored < MAX_ITEMS) {
+        if (stored < MAX_COMPLETIONS) {
             safe_copy(g.completion_names[stored],
                       sizeof(g.completion_names[stored]), name);
             stored++;
@@ -3881,7 +4297,7 @@ static int parse_slot(const char *id) {
     const char *p=id;
     while(*p && (*p<'0'||*p>'9'))p++;
     if(!*p)return -1;
-    int s=atoi(p); return (s>=0&&s<MAX_ITEMS)?s:-1;
+    int s=atoi(p); return (s>=0&&s<POOL_ITEMS)?s:-1;
 }
 
 static void select_entry_click(int ei, int mods, int right_click) {
@@ -4145,7 +4561,7 @@ static void on_home(LunaElement *e){(void)e;navigate(home_dir(),1);}
 static void on_grid(LunaElement *e){(void)e;g.grid_view=1;render_files();}
 static void on_list(LunaElement *e){(void)e;g.grid_view=0;render_files();}
 static void on_hidden(LunaElement *e){(void)e;g.show_hidden=!g.show_hidden;render_files();}
-static void on_sort(LunaElement *e){(void)e;if(g.sort_mode==SORT_NAME)g.sort_mode=SORT_DATE;else if(g.sort_mode==SORT_DATE)g.sort_mode=SORT_SIZE;else{g.sort_mode=SORT_NAME;g.sort_desc=!g.sort_desc;}qsort(g.entries,g.entry_count,sizeof(g.entries[0]),compare_entries);clear_selection();render_files();}
+static void on_sort(LunaElement *e){(void)e;if(g.sort_mode==SORT_NAME)g.sort_mode=SORT_DATE;else if(g.sort_mode==SORT_DATE)g.sort_mode=SORT_SIZE;else{g.sort_mode=SORT_NAME;g.sort_desc=!g.sort_desc;}sort_entries();clear_selection();render_files();}
 static void on_new_folder(LunaElement *e){(void)e;hide_context();open_modal(1,-1);}
 static void on_copy(LunaElement *e){(void)e;hide_context();clipboard_take_selection(0);}
 static void on_cut(LunaElement *e){(void)e;hide_context();clipboard_take_selection(1);}
@@ -4210,7 +4626,7 @@ static void file_dialog_finish(int accepted) {
         luna_platform_request_redraw();
         return;
     }
-    luna_app_quit();
+    luna_platform_request_close();
 }
 static void file_dialog_overwrite_result(LunaWindowDialogResult result,const char*input,void*userdata){
     (void)input;(void)userdata;
@@ -4264,7 +4680,7 @@ static void on_file_dialog_cancel(LunaElement*e){(void)e;file_dialog_finish(0);}
 static void on_close(LunaElement *e){
     (void)e;
     if(g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER) file_dialog_finish(0);
-    else luna_app_quit();
+    else luna_platform_request_close();
 }
 
 static void side_navigate_index(int index) {
@@ -4372,7 +4788,7 @@ static void sync_settings_dialog(void) {
 
 static void apply_basic_preferences(void) {
     refresh_sidebar_visibility();
-    qsort(g.entries,(size_t)g.entry_count,sizeof(g.entries[0]),compare_entries);
+    sort_entries();
     render_files();
 }
 
@@ -4485,32 +4901,34 @@ static int append_file_dialog_body(char *h, size_t cap, size_t *n, int standalon
     APPEND("<div id=\"lfd-app\" class=\"lfd-shell\">");
     if(standalone && g_file_dialog_config.client_chrome) APPEND("%s",luna_window_standard_titlebar_html());
     APPEND("<div id=\"lfd-toolbar\" class=\"toolbar\">"
-      "<div class=\"navgroup\"><div id=\"lfd-btn-back\" class=\"tool\" onclick=\"onBack()\">‹</div><div id=\"lfd-btn-forward\" class=\"tool\" onclick=\"onForward()\">›</div><div class=\"tool\" onclick=\"onUp()\">⌃</div></div>"
-      "<div class=\"tool responsive-hide-tiny\" onclick=\"onHome()\">⌂</div><div class=\"tool responsive-hide-narrow\" onclick=\"onReload()\">↻</div>"
+      "<div class=\"navgroup\"><div id=\"lfd-btn-back\" class=\"tool\" onclick=\"onBack()\">" FA_BACK "</div><div id=\"lfd-btn-forward\" class=\"tool\" onclick=\"onForward()\">" FA_FWD "</div><div class=\"tool\" onclick=\"onUp()\">" FA_UP "</div></div>"
+      "<div class=\"tool responsive-hide-tiny\" onclick=\"onHome()\">" FA_HOME "</div><div class=\"tool responsive-hide-narrow\" onclick=\"onReload()\">" FA_RELOAD "</div>"
       "<input id=\"lfd-path\" class=\"location\" type=\"text\" placeholder=\"場所を入力\">"
       "<input id=\"lfd-search\" class=\"search\" type=\"text\" placeholder=\"このフォルダーを検索\">"
-      "<div class=\"viewgroup\"><div class=\"tool\" onclick=\"onGrid()\">▦</div><div class=\"tool\" onclick=\"onList()\">☰</div></div>"
-      "<div id=\"lfd-btn-hidden\" class=\"tool responsive-hide-tiny\" onclick=\"onHidden()\">◌</div><div id=\"lfd-btn-sort\" class=\"tool responsive-hide-tiny\" onclick=\"onSort()\">A↓</div>"
-      "<div class=\"tool\" onclick=\"onNewFolder()\">＋</div><div id=\"lfd-btn-paste\" class=\"tool\" onclick=\"onPaste()\">▣</div>"
-      "<div id=\"lfd-btn-settings\" class=\"tool\" onclick=\"onSettingsOpen()\">⚙</div>"
+      "<div class=\"viewgroup\"><div class=\"tool\" onclick=\"onGrid()\">" FA_GRID "</div><div class=\"tool\" onclick=\"onList()\">" FA_LIST "</div></div>"
+      "<div id=\"lfd-btn-hidden\" class=\"tool responsive-hide-tiny\" onclick=\"onHidden()\">" FA_HIDDEN "</div><div id=\"lfd-btn-sort\" class=\"tool responsive-hide-tiny\" onclick=\"onSort()\">A↓</div>"
+      "<div class=\"tool\" onclick=\"onNewFolder()\">" FA_NEWDIR "</div><div id=\"lfd-btn-paste\" class=\"tool\" onclick=\"onPaste()\">" FA_PASTE "</div>"
+      "<div id=\"lfd-btn-settings\" class=\"tool\" onclick=\"onSettingsOpen()\">" FA_GEAR "</div>"
       "</div><div class=\"workbench\"><div id=\"lfd-sidebar\" class=\"sidebar\">"
       "<div class=\"side-label\">お気に入り</div>"
-      "<div id=\"lfd-side-home\" class=\"side-item\" onclick=\"onSideHome()\">⌂　ホーム</div>"
-      "<div id=\"lfd-side-desktop\" class=\"side-item\" onclick=\"onSideDesktop()\">▧　デスクトップ</div>"
-      "<div id=\"lfd-side-documents\" class=\"side-item\" onclick=\"onSideDocuments()\">◇　書類</div>"
-      "<div id=\"lfd-side-downloads\" class=\"side-item\" onclick=\"onSideDownloads()\">⇩　ダウンロード</div>"
-      "<div id=\"lfd-side-pictures\" class=\"side-item\" onclick=\"onSidePictures()\">▧　ピクチャ</div>"
-      "<div id=\"lfd-side-music\" class=\"side-item\" onclick=\"onSideMusic()\">♫　ミュージック</div>"
-      "<div id=\"lfd-side-videos\" class=\"side-item\" onclick=\"onSideVideos()\">▶　ビデオ</div>"
+      "<div id=\"lfd-side-home\" class=\"side-item\" onclick=\"onSideHome()\">" FA_HOME "　ホーム</div>"
+      "<div id=\"lfd-side-desktop\" class=\"side-item\" onclick=\"onSideDesktop()\">" FA_DESKTOP2 "　デスクトップ</div>"
+      "<div id=\"lfd-side-documents\" class=\"side-item\" onclick=\"onSideDocuments()\">" FA_DOCS "　書類</div>"
+      "<div id=\"lfd-side-downloads\" class=\"side-item\" onclick=\"onSideDownloads()\">" FA_DOWNLOAD "　ダウンロード</div>"
+      "<div id=\"lfd-side-pictures\" class=\"side-item\" onclick=\"onSidePictures()\">" FA_PICTURES "　ピクチャ</div>"
+      "<div id=\"lfd-side-music\" class=\"side-item\" onclick=\"onSideMusic()\">" FA_MUSIC "　ミュージック</div>"
+      "<div id=\"lfd-side-videos\" class=\"side-item\" onclick=\"onSideVideos()\">" FA_MOVIES "　ビデオ</div>"
       "<div class=\"side-label\">場所</div>"
-      "<div id=\"lfd-side-trash\" class=\"side-item\" onclick=\"onSideTrash()\">♲　ごみ箱</div>"
-      "<div id=\"lfd-side-root\" class=\"side-item\" onclick=\"onSideRoot()\">◈　ファイルシステム</div>"
+      "<div id=\"lfd-side-trash\" class=\"side-item\" onclick=\"onSideTrash()\">" FA_TRASH "　ごみ箱</div>"
+      "<div id=\"lfd-side-root\" class=\"side-item\" onclick=\"onSideRoot()\">" FA_DRIVE "　ファイルシステム</div>"
       "<div id=\"lfd-side-devices-label\" class=\"side-label hidden\">デバイス</div>");
     for(int i=0;i<MAX_VOLUMES;i++)
         APPEND("<div id=\"lfd-vol%02d\" class=\"side-item volume-item hidden\" onclick=\"onVolume()\"></div>",i);
     APPEND("</div><div class=\"main\"><div class=\"subbar\"><div id=\"lfd-folder-title\" class=\"folder-title\">ホーム</div><div class=\"hint\">右クリックで操作メニュー　F4: ターミナル</div></div>"
       "<div id=\"lfd-file-grid\" class=\"file-grid grid\" onclick=\"onBlank()\">");
-    for(int i=0;i<MAX_ITEMS;i++) APPEND("<div id=\"lfd-item%03d\" class=\"file-item grid-item hidden\" onclick=\"onItem()\"><div id=\"lfd-icon%03d\" class=\"file-icon\">◇</div><div id=\"lfd-name%03d\" class=\"file-name\"></div><div id=\"lfd-meta%03d\" class=\"file-meta\"></div></div>",i,i,i,i);
+    APPEND("<div id=\"lfd-vtop\" class=\"vspacer hidden\"></div>");
+    for(int i=0;i<POOL_ITEMS;i++) APPEND("<div id=\"lfd-item%03d\" class=\"file-item hidden\" onclick=\"onItem()\"><div id=\"lfd-icon%03d\" class=\"file-icon\"></div><div id=\"lfd-name%03d\" class=\"file-name\"></div><div id=\"lfd-meta%03d\" class=\"file-meta\"></div></div>",i,i,i,i);
+    APPEND("<div id=\"lfd-vbottom\" class=\"vspacer hidden\"></div>");
     APPEND("<div id=\"lfd-empty\" class=\"empty hidden\">このフォルダーは空です</div></div><div id=\"lfd-status\" class=\"status\"></div></div></div>");
     if((standalone && g_file_dialog_config.mode!=LUNA_FILE_DIALOG_MANAGER) || !standalone){
         APPEND("<div class=\"file-dialog-actions\">");
@@ -4590,6 +5008,15 @@ static char *build_html(void) {
 }
 
 static void cache_ids(void) {
+    g.id_vtop=luna_get_element_by_id("lfd-vtop");g.id_vbottom=luna_get_element_by_id("lfd-vbottom");
+    for(int i=0;i<POOL_ITEMS;i++){
+        char id[32];
+        snprintf(id,sizeof(id),"lfd-item%03d",i);g.slot_item[i]=luna_get_element_by_id(id);
+        snprintf(id,sizeof(id),"lfd-icon%03d",i);g.slot_icon[i]=luna_get_element_by_id(id);
+        snprintf(id,sizeof(id),"lfd-name%03d",i);g.slot_name[i]=luna_get_element_by_id(id);
+        snprintf(id,sizeof(id),"lfd-meta%03d",i);g.slot_meta[i]=luna_get_element_by_id(id);
+        g.slot_entry[i]=-1;
+    }
     g.id_overlay=luna_get_element_by_id("lfd-overlay");
     g.id_app=luna_get_element_by_id("lfd-app");g.id_toolbar=luna_get_element_by_id("lfd-toolbar");g.id_sidebar=luna_get_element_by_id("lfd-sidebar");
     g.id_path=luna_get_element_by_id("lfd-path");g.id_search=luna_get_element_by_id("lfd-search");g.id_grid=luna_get_element_by_id("lfd-file-grid");
@@ -4630,7 +5057,7 @@ static void cache_ids(void) {
 }
 
 static int validate_ui_ids(void) {
-    int ids[]={g.id_app,g.id_toolbar,g.id_sidebar,g.id_path,g.id_search,g.id_grid,g.id_status,g.id_title,g.id_context,g.id_side_devices_label,g.id_volume_context,g.id_modal,g.id_modal_cancel,g.id_modal_ok,g.id_open_with,g.id_open_with_info,g.id_open_app_list,g.id_desktop_edit,g.id_desktop_edit_title,g.id_desktop_edit_hint,g.id_desktop_edit_type,g.id_desktop_edit_name,g.id_desktop_edit_comment,g.id_desktop_edit_exec_label,g.id_desktop_edit_exec,g.id_desktop_edit_icon,g.id_desktop_edit_workdir_row,g.id_desktop_edit_workdir,g.id_desktop_edit_terminal_row,g.id_desktop_edit_terminal,g.id_desktop_edit_filename_row,g.id_desktop_edit_filename,g.id_toast,g.id_settings,g.id_settings_scroll,
+    int ids[]={g.id_vtop,g.id_vbottom,g.id_app,g.id_toolbar,g.id_sidebar,g.id_path,g.id_search,g.id_grid,g.id_status,g.id_title,g.id_context,g.id_side_devices_label,g.id_volume_context,g.id_modal,g.id_modal_cancel,g.id_modal_ok,g.id_open_with,g.id_open_with_info,g.id_open_app_list,g.id_desktop_edit,g.id_desktop_edit_title,g.id_desktop_edit_hint,g.id_desktop_edit_type,g.id_desktop_edit_name,g.id_desktop_edit_comment,g.id_desktop_edit_exec_label,g.id_desktop_edit_exec,g.id_desktop_edit_icon,g.id_desktop_edit_workdir_row,g.id_desktop_edit_workdir,g.id_desktop_edit_terminal_row,g.id_desktop_edit_terminal,g.id_desktop_edit_filename_row,g.id_desktop_edit_filename,g.id_toast,g.id_settings,g.id_settings_scroll,
                g.id_set_font_size,g.id_set_font_family,g.id_set_custom_font,g.id_set_density,g.id_set_theme,g.id_set_accent,g.id_set_status,g.id_set_grid_details,g.id_set_animations,g.id_set_startup,g.id_set_terminal};
     for(size_t i=0;i<sizeof(ids)/sizeof(ids[0]);i++){
         if(ids[i]<0){log_error("UI element lookup failed at index %zu",i);return 0;}
@@ -4705,32 +5132,30 @@ static void apply_pending_resize(void) {
     request_redraw();
 }
 
-static void move_selection(int delta) {
-    if(g.visible_count<=0)return;
-
-    int current_slot=-1;
-    for(int slot=0;slot<g.visible_count;slot++){
-        int entry=g.slot_entry[slot];
-        if(entry>=0&&entry<g.entry_count&&g.entries[entry].selected){current_slot=slot;break;}
-    }
-
-    int next_slot;
-    if(current_slot<0)next_slot=delta<0?g.visible_count-1:0;
-    else next_slot=current_slot+delta;
-    if(next_slot<0)next_slot=0;
-    if(next_slot>=g.visible_count)next_slot=g.visible_count-1;
-
-    int entry=g.slot_entry[next_slot];
-    if(entry<0||entry>=g.entry_count)return;
+/* Move the selection by `step` positions in the filtered list.  The list is
+ * virtual, so this walks vis[] (not the slots) and scrolls the target into the
+ * viewport itself. */
+static void move_selection_by(int step) {
+    int current=-1,next;
+    if(g.vis_count<=0)return;
+    for(int k=0;k<g.vis_count;k++)
+        if(g.entries[g.vis[k]].selected){current=k;break;}
+    if(current<0)next=step<0?g.vis_count-1:0;
+    else next=current+step;
+    if(next<0)next=0;
+    if(next>=g.vis_count)next=g.vis_count-1;
     clear_selection();
-    g.entries[entry].selected=1;
-    g.anchor_entry=entry;
+    g.entries[g.vis[next]].selected=1;
+    g.anchor_entry=g.vis[next];
+    virt_reveal(next);
     refresh_file_visuals();
-
-    char id[32];snprintf(id,sizeof(id),"lfd-item%03d",next_slot);
-    int item=luna_get_element_by_id(id);
-    scroll_into_view(item);
     request_redraw();
+}
+
+/* Up/Down move a row, which is a whole line of icons in the icon view. */
+static void move_selection(int delta) {
+    int cols=(g.grid_view&&g.view_cols>1)?g.view_cols:1;
+    move_selection_by(delta*cols);
 }
 
 static void file_dialog_configure_actions(void) {
@@ -4759,6 +5184,7 @@ static void file_dialog_reset_session(void) {
     void *keep_window = g.window;
     g_file_dialog_pending_save[0] = 0;
     g_file_dialog_search_prev[0] = 0;
+    release_entries();
     memset(&g, 0, sizeof(g));
     g.window = keep_window;
     g.anchor_entry = -1;
@@ -4860,8 +5286,10 @@ void luna_file_dialog_render(int fbw, int fbh) {
 void luna_file_dialog_tick(double dt) {
     if (!g_file_dialog_open) return;
     double now = luna_platform_time();
+    volumes_poll();
     if (g.volumes_next_refresh <= 0.0 || now >= g.volumes_next_refresh)
         refresh_volumes(0);
+    virt_sync();
     const char *sv = luna_get_value(g.id_search);
     if (sv && strcmp(sv, g_file_dialog_search_prev)) {
         safe_copy(g_file_dialog_search_prev, sizeof(g_file_dialog_search_prev), sv);
@@ -4912,7 +5340,7 @@ static int file_dialog_handle_key(int key, int scancode, int action, int mods) {
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_C&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(0);
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_X&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(1);
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_V&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)paste_clipboard();
-        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_A&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input){for(int i=0;i<g.entry_count;i++)g.entries[i].selected=1;refresh_file_visuals();}
+        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_A&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input){for(int k=0;k<g.vis_count;k++)g.entries[g.vis[k]].selected=1;refresh_file_visuals();}
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_L){reset_path_completion();luna_set_value(g.id_path,g.cwd);luna_focus_element(g.id_path);show_toast("場所バーを選択しました");}
         else if(key==LUNA_KEY_F2){int i=first_selected();if(i>=0)open_modal(2,i);}
         else if(action==LUNA_PRESS&&key==LUNA_KEY_F4)open_terminal_here();
@@ -4920,6 +5348,8 @@ static int file_dialog_handle_key(int key, int scancode, int action, int mods) {
         else if(key==LUNA_KEY_BACKSPACE&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)on_back(NULL);
         else if(key==LUNA_KEY_UP&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)move_selection(-1);
         else if(key==LUNA_KEY_DOWN&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)move_selection(1);
+        else if(g.grid_view&&key==LUNA_KEY_LEFT&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)move_selection_by(-1);
+        else if(g.grid_view&&key==LUNA_KEY_RIGHT&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)move_selection_by(1);
     }
     if(!consumed) luna_key(key,scancode,action,mods);
 
@@ -4938,6 +5368,8 @@ int luna_file_dialog_handle_key(int key, int scancode, int action, int mods) {
     return 1;
 }
 
+/* Embedded engines use show/tick/render; they have no application host loop. */
+#ifndef LUNA_UI_NO_PLATFORM
 static void file_dialog_app_init(void *userdata) {
     (void)userdata;
     register_handlers();
@@ -4978,8 +5410,56 @@ static void file_dialog_app_frame(double dt, void *userdata) {
     (void)userdata;
     apply_pending_resize();
     luna_window_tick(dt);
+#ifdef LUNA_FM_BENCH_BUILD
+    {   /* LUNA_FM_BENCH=dirA:dirB — navigate between two folders every frame and
+         * report the cost of the scan/DOM update and of the frame that follows. */
+        static const char *bench; static int bench_init, bench_n, bench_max = 12; static double t_nav;
+        if (!bench_init) { const char *n = getenv("LUNA_FM_BENCH_N"); bench_init = 1; bench = getenv("LUNA_FM_BENCH"); if (n) bench_max = atoi(n); }
+        if (bench && *bench) {
+            double t = luna_platform_time();
+            if (bench_n == 0 && t_nav == 0) fprintf(stderr, "[fm-bench] first frame at %.0f ms since platform start\n", t * 1000.0);
+            if (t_nav > 0) fprintf(stderr, "[fm-bench] frame after navigate: %.1f ms\n", (t - t_nav) * 1000.0);
+            if (bench_n < bench_max) {
+                char a[PATH_MAX], *b = NULL;
+                safe_copy(a, sizeof a, bench);
+                if ((b = strchr(a, ':'))) *b++ = 0;
+                double t0 = luna_platform_time();
+                navigate((bench_n & 1) && b ? b : a, 0);
+                t_nav = luna_platform_time();
+                fprintf(stderr, "[fm-bench] navigate #%d %s: %.1f ms (%d entries)\n", bench_n,
+                        g.cwd, (t_nav - t0) * 1000.0, g.entry_count);
+                bench_n++;
+            } else {
+                /* Then scroll the long folder down a few hundred frames, checking after each
+                 * layout that the bound rows still cover what the viewport shows. */
+                static int sc_frame;
+                if (getenv("LUNA_FM_BENCH_SCROLL") && sc_frame < 400) {
+                    g.grid_scroll_top = g.grid_scroll_dest_top = (sc_frame < 300 ? sc_frame : 600 - sc_frame) * 40.0f;
+                    apply_grid_scroll();
+                    request_redraw();
+                    sc_frame++;
+                } else exit(0);
+            }
+        }
+    }
+    volumes_poll();
+#endif
     if (g.volumes_next_refresh <= 0.0 || now >= g.volumes_next_refresh)
         refresh_volumes(0);
+    virt_sync();
+#ifdef LUNA_FM_BENCH_BUILD
+    if (getenv("LUNA_FM_BENCH_SCROLL")) {   /* after the sync: what this frame will draw */
+        static int n; LunaElement *gr = luna_element_at(g.id_grid);
+        if (gr && g.view_stride > 1) {
+            int cols = g.view_cols > 0 ? g.view_cols : 1;
+            int top = (int)(gr->scroll_top / g.view_stride), bot = (int)((gr->scroll_top + gr->h) / g.view_stride);
+            int bf = g.first_idx / cols, bn = (g.visible_count + cols - 1) / cols, tr = (g.vis_count + cols - 1) / cols;
+            int ok = top >= bf && (bot < bf + bn || bf + bn >= tr);
+            if (n++ % 50 == 0 || !ok)
+                fprintf(stderr, "[fm-bench] scroll top=%.0f rows %d..%d bound %d..%d of %d cols=%d stride=%.1f h=%.0f %s\n", gr->scroll_top, top, bot, bf, bf + bn - 1, tr, cols, g.view_stride, gr->h, ok ? "ok" : "UNCOVERED");
+        }
+    }
+#endif
     sv = luna_get_value(g.id_search);
     if (sv && strcmp(sv, old_search)) {
         safe_copy(old_search, sizeof(old_search), sv);
@@ -5037,8 +5517,11 @@ int luna_file_dialog_run(const LunaFileDialogConfig* config, LunaFileDialogResul
     rc=luna_app_run(&app);
     return rc;
 }
+#endif
 
-#undef MAX_ITEMS
+#undef MAX_COMPLETIONS
+#undef POOL_ITEMS
+#undef MAX_ENTRIES
 #undef MAX_CLIP_ITEMS
 #undef MAX_HISTORY
 #undef MAX_SEARCH
