@@ -856,6 +856,8 @@ void luna_focus_element(int idx);
 void luna_set_text(int idx, const char* text);
 /* Drop a cached GL texture so the next paint reloads it from disk. */
 void luna_invalidate_texture(const char* path);
+/* Presenting thread only. RGBA rows are bottom-up, like decoded textures. */
+int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char* pixels);
 /* Set or clear element background-image via inline style (empty path clears). */
 void luna_set_background_image(int idx, const char* path);
 /* Update only the painted text, preserving the element's current geometry.
@@ -3178,6 +3180,7 @@ static float g_text_css_px = 0.0f;
 static stbtt_fontinfo g_font_info;
 static unsigned char* g_font_ttf = NULL;
 static long           g_font_ttf_sz = 0;
+static long g_font_blob_sizes[6]; /* regular, bold, CJK, mono, symbols, brands */
 static int            g_font_info_ok = 0;
 static stbtt_fontinfo g_bold_font_info;
 static unsigned char* g_bold_font_ttf = NULL;
@@ -15879,6 +15882,9 @@ int luna_prepare_font_metrics(void) {
     if (!g_brand_font_ttf)
         g_brand_font_ttf = try_load_font_list(&reg, font_path_score_brands, &brand_sz);
 
+    const long blob_sizes[]={g_font_ttf_sz,bold_sz,cjk_sz,mono_sz,icon_sz,brand_sz};
+    memcpy(g_font_blob_sizes,blob_sizes,sizeof blob_sizes);
+
     if (reg_buf) {
         g_font_ttf = reg_buf;
         int off = stbtt_GetFontOffsetForIndex(g_font_ttf, 0);
@@ -16091,6 +16097,8 @@ static int luna_bytes_look_like_svg(const unsigned char* data, long n) {
            (data[i + 3] == 'g' || data[i + 3] == 'G');
 }
 
+#endif /* LUNA_UI_NANOSVG */
+
 /* Flip RGBA rows so UV matches FragPos/uSize (same as stbi flip_vertically). */
 static void luna_flip_rgba_vertical(unsigned char* pixels, int w, int h) {
     int stride = w * 4;
@@ -16108,6 +16116,8 @@ static void luna_flip_rgba_vertical(unsigned char* pixels, int w, int h) {
     }
     free(tmp);
 }
+
+#if defined(LUNA_UI_NANOSVG)
 
 /* Rasterize SVG bytes to a malloc'd RGBA bitmap (caller frees with free()). */
 static unsigned char* luna_rasterize_svg(unsigned char* encoded, long encoded_sz,
@@ -19504,6 +19514,43 @@ int luna_element_bounds(int idx, float* x, float* y, float* w, float* h) {
 }
 
 void luna_set_text(int i, const char* t) { g_probe_prepared = 0; set_text(i, t); }
+int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char* pixels) {
+    if (!key || !*key || strlen(key) >= sizeof(g_tex_cache[0].path) || !pixels || w <= 0 || h <= 0) return 0;
+    int slot = 0;
+    while (slot < g_tex_count && strcmp(g_tex_cache[slot].path, key) != 0) slot++;
+    if (slot == g_tex_count) {
+        if (g_tex_count == g_tex_cap) {
+            int cap = g_tex_cap ? g_tex_cap * 2 : 64;
+            TexEntry* grown = (TexEntry*)realloc(g_tex_cache, sizeof(*grown) * (size_t)cap);
+            if (!grown) return 0;
+            g_tex_cache = grown; g_tex_cap = cap;
+        }
+        memset(&g_tex_cache[slot], 0, sizeof(g_tex_cache[slot]));
+        strcpy(g_tex_cache[slot].path, key);
+        glGenTextures(1, &g_tex_cache[slot].tex);
+        g_tex_count++;
+    }
+    TexEntry* entry = &g_tex_cache[slot];
+    glBindTexture(GL_TEXTURE_2D, entry->tex);
+    if (entry->tw == w && entry->th == h)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    else {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        entry->tw = w; entry->th = h;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    g_probe_prepared = 0;
+    for (int i = 0; i < elem_count; i++)
+        if (strcmp(elements[i].bg_image_path, key) == 0) {
+            elements[i].has_bg_image = 1;
+            elements[i].bg_image_tex = entry->tex;
+        }
+    return 1;
+}
 void luna_invalidate_texture(const char* path) {
     if (!path || !*path) return;
     g_probe_prepared = 0;
