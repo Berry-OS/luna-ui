@@ -3750,8 +3750,7 @@ static void virt_set_spacer(int id, float height) {
     LunaElement *e=luna_element_at(id);
     if(!e)return;
     if(height<=0.0f){luna_add_class(id,"hidden");return;}
-    snprintf(e->inline_style,sizeof(e->inline_style),"height:%.1fpx",height);
-    e->has_inline_style=1;
+    {char st[48]; snprintf(st,sizeof st,"height:%.1fpx",height); element_set_inline_style(e,st);}
     luna_remove_class(id,"hidden");
     luna_update_element_style(id);
 }

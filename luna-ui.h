@@ -876,6 +876,8 @@ void luna_mark_visual_dirty(int idx);
 void luna_update_element_style(int idx);
 void luna_register_js_handler(const char* name, LunaEventHandler fn);
 void luna_set_on_click(int idx, LunaEventHandler fn);
+/* Flex `order` for a child of a flex container (default 0, lower first). */
+void luna_set_flex_order(int idx, int order);
 void luna_mouse_move(double x, double y);
 /* Forward pointer motion and return 1 only when hover/drag visuals changed.
  * Hosts can use this to avoid repainting the whole surface for every raw
@@ -1979,6 +1981,7 @@ struct LunaElement {
     float rel_x, rel_y;
     float x, y, w, h;
     char text[LUNA_UI_TEXT_CAP], type[32], class_name[LUNA_CLASS_CAP], id[64];
+    uint64_t class_bloom;           /* one bit per class token of class_name; see element_class_updated */
     int is_hovered, is_active, is_draggable;
     /* Text controls (<input>/<textarea>) — value lives in text[] */
     int is_input;
@@ -2206,6 +2209,8 @@ struct LunaElement {
      * erase host-managed front/back ordering. */
     int z_override_valid;
     int z_override;
+    /* Host-managed flex `order` (see luna_set_flex_order); style resets keep it. */
+    int flex_order;
     int visibility_hidden;
     float transform_scale;
     float tf_ox, tf_oy;             /* transform-origin as a fraction of the box (0.5: centre) */
@@ -2223,6 +2228,7 @@ struct LunaElement {
     char onclick[64];
     char data_tab[32];
     char inline_style[256];
+    char* inline_style_ext;         /* the whole style="" when it does not fit inline_style; owned */
     int has_inline_style;
 
     /* CSS filter */
@@ -2244,7 +2250,8 @@ struct LunaElement {
     int bg_size_mode;   /* 0=auto 1=cover 2=contain 3=explicit */
     float bg_size_w, bg_size_h;
     unsigned char bg_size_wu, bg_size_hu;   /* LUNA_BG_SIZE_AUTO/PX/PCT */
-    float bg_pos_x, bg_pos_y;
+    float bg_pos_x, bg_pos_y;        /* a fraction of the free space, or px when bg_pos_*_px */
+    char bg_pos_x_px, bg_pos_y_px;
 
     /* CSS @keyframes animation state */
     char anim_name[64];
@@ -2344,6 +2351,8 @@ typedef struct {
     char sel_id[64];
     char sel_classes[MAX_SEL_CLASSES][64];
     int  sel_class_count;
+    uint64_t sel_class_mask;      /* class_bloom bits of sel_classes, once sel_class_mask_ready */
+    int  sel_class_mask_ready;
     int  is_universal;
     int  rel;                       /* ancestors only: LUNA_REL_* */
     int  is_first_child, is_last_child;
@@ -2593,7 +2602,7 @@ typedef struct {
     int has_bg_size; int bg_size_mode;
     float bg_size_w, bg_size_h;
     unsigned char bg_size_wu, bg_size_hu;
-    int has_bg_pos; float bg_pos_x, bg_pos_y;
+    int has_bg_pos; float bg_pos_x, bg_pos_y; char bg_pos_x_px, bg_pos_y_px;
 
     /* background-clip: text */
     int has_bg_clip_text;
@@ -2853,16 +2862,18 @@ static int element_bg_layers_ensure(LunaElement* e) {
 /* CSS target prefilter. Rules are still applied in normal cascade order, but
  * expensive selector-chain matching is skipped when the target's required
  * id/type/first-class cannot match. Hash collisions only add false positives. */
-#define LUNA_RULE_BUCKETS 64u
-/* One block of bit sets, a word per 64 rules: [any][id x64][type x64][class x64]. */
+#define LUNA_RULE_BUCKETS 16384u
+/* The rules with no usable key as one bit set (a word per 64 rules), and the
+ * keyed rules as sparse lists per [id|type|class][bucket], in cascade order.
+ * A dense bit set per bucket costs rules/8 bytes each, and with few buckets a
+ * large stylesheet's every bucket held hundreds of rules, nearly all of which
+ * an element then had to test. */
 static int g_rule_words;
 static uint64_t* g_rule_bits;
+static int* g_rule_lists;        /* rule orders, grouped by bucket */
+static int* g_rule_list_off;     /* 3 * BUCKETS + 1 offsets into g_rule_lists */
 #define LUNA_RULE_WORDS g_rule_words
 #define g_rule_any    (g_rule_bits)
-#define LUNA_RULE_SET(kind, b)  (g_rule_bits + ((size_t)(1 + (kind) * (int)LUNA_RULE_BUCKETS + (int)(b))) * (size_t)g_rule_words)
-#define g_rule_id(b)    LUNA_RULE_SET(0, b)
-#define g_rule_type(b)  LUNA_RULE_SET(1, b)
-#define g_rule_class(b) LUNA_RULE_SET(2, b)
 static int g_rule_index_ready = 0;
 
 static unsigned rule_hash_span(const char* s, size_t n) {
@@ -2871,6 +2882,7 @@ static unsigned rule_hash_span(const char* s, size_t n) {
         h ^= (unsigned char)s[i];
         h *= 16777619u;
     }
+    h ^= h >> 15;
     return h & (LUNA_RULE_BUCKETS - 1u);
 }
 
@@ -2882,30 +2894,62 @@ static void rule_bit_set(uint64_t* bits, int rule) {
     bits[(unsigned)rule >> 6] |= UINT64_C(1) << ((unsigned)rule & 63u);
 }
 
+/* A selector's class can only match an element whose bloom has the class's bit.
+ * class_name must be followed by element_class_updated() whenever it is written. */
+static uint64_t class_bit(const char* s, size_t n) {
+    return UINT64_C(1) << (rule_hash_span(s, n) & 63u);
+}
+
+static void element_class_updated(LunaElement* e) {
+    uint64_t b = 0;
+    const char* q = e->class_name;
+    while (*q) {
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        const char* start = q;
+        while (*q && *q != ' ' && *q != '\t' && *q != '\r' && *q != '\n') q++;
+        if (q > start) b |= class_bit(start, (size_t)(q - start));
+    }
+    e->class_bloom = b;
+}
+
+/* The bucket (kind * BUCKETS + hash) a rule is filed under, or -1 for "any". */
+static int rule_bucket_of(const SimpleSelector* t) {
+    if (t->sel_id[0]) return (int)rule_hash_str(t->sel_id);
+    if (t->sel_type[0]) return (int)(LUNA_RULE_BUCKETS + rule_hash_str(t->sel_type));
+    if (t->sel_class_count > 0) return (int)(2 * LUNA_RULE_BUCKETS + rule_hash_str(t->sel_classes[0]));
+    return -1;
+}
+
 static void rebuild_rule_index(void) {
     int words = (rule_count + 63) / 64 + 1;
-    size_t n = (size_t)(1 + 3 * (int)LUNA_RULE_BUCKETS) * (size_t)words;
-    uint64_t* bits = (uint64_t*)realloc(g_rule_bits, n * sizeof(uint64_t));
-    if (!bits) abort();
-    g_rule_bits = bits;
+    const size_t nb = 3 * (size_t)LUNA_RULE_BUCKETS;
+    uint64_t* bits = (uint64_t*)realloc(g_rule_bits, (size_t)words * sizeof(uint64_t));
+    int* off = (int*)realloc(g_rule_list_off, (nb + 1) * sizeof(int));
+    int* lists = (int*)realloc(g_rule_lists, ((size_t)rule_count + 1) * sizeof(int));
+    if (!bits || !off || !lists) abort();
+    g_rule_bits = bits; g_rule_list_off = off; g_rule_lists = lists;
     g_rule_words = words;
-    memset(g_rule_bits, 0, n * sizeof(uint64_t));
+    memset(g_rule_bits, 0, (size_t)words * sizeof(uint64_t));
+    memset(off, 0, (nb + 1) * sizeof(int));
     for (int order = 0; order < rule_count; order++) {
-        const SimpleSelector* t = &css_rules[g_rule_order[order]].target;
-        if (t->sel_id[0])
-            rule_bit_set(g_rule_id(rule_hash_str(t->sel_id)), order);
-        else if (t->sel_type[0])
-            rule_bit_set(g_rule_type(rule_hash_str(t->sel_type)), order);
-        else if (t->sel_class_count > 0)
-            rule_bit_set(g_rule_class(rule_hash_str(t->sel_classes[0])), order);
-        else
-            rule_bit_set(g_rule_any, order);
+        int k = rule_bucket_of(&css_rules[g_rule_order[order]].target);
+        if (k < 0) rule_bit_set(g_rule_any, order); else off[k + 1]++;
     }
+    for (size_t i = 0; i < nb; i++) off[i + 1] += off[i];
+    int* fill = (int*)malloc(nb * sizeof(int));
+    if (!fill) abort();
+    memcpy(fill, off, nb * sizeof(int));
+    for (int order = 0; order < rule_count; order++) {
+        int k = rule_bucket_of(&css_rules[g_rule_order[order]].target);
+        if (k >= 0) lists[fill[k]++] = order;
+    }
+    free(fill);
     g_rule_index_ready = 1;
 }
 
-static void rule_mask_or(uint64_t* dst, const uint64_t* src) {
-    for (int i = 0; i < LUNA_RULE_WORDS; i++) dst[i] |= src[i];
+static void rule_bucket_or(uint64_t* dst, int bucket) {
+    for (int i = g_rule_list_off[bucket]; i < g_rule_list_off[bucket + 1]; i++)
+        rule_bit_set(dst, g_rule_lists[i]);
 }
 
 static int rule_ws(unsigned char c) {
@@ -2922,11 +2966,11 @@ static void build_rule_candidates(const LunaElement* e, uint64_t* out) {
         key = &elements[e->parent_idx];
 
     if (key->id[0])
-        rule_mask_or(out, g_rule_id(rule_hash_str(key->id)));
+        rule_bucket_or(out, (int)rule_hash_str(key->id));
     if (key->type[0])
-        rule_mask_or(out, g_rule_type(rule_hash_str(key->type)));
+        rule_bucket_or(out, (int)(LUNA_RULE_BUCKETS + rule_hash_str(key->type)));
     if (key->parent_idx == -1 && strcmp(key->type, "body") == 0)
-        rule_mask_or(out, g_rule_type(rule_hash_str("html")));
+        rule_bucket_or(out, (int)(LUNA_RULE_BUCKETS + rule_hash_str("html")));
 
     const char* q = key->class_name;
     while (*q) {
@@ -2934,7 +2978,7 @@ static void build_rule_candidates(const LunaElement* e, uint64_t* out) {
         const char* start = q;
         while (*q && !rule_ws((unsigned char)*q)) q++;
         if (q > start)
-            rule_mask_or(out, g_rule_class(rule_hash_span(start, (size_t)(q - start))));
+            rule_bucket_or(out, (int)(2 * LUNA_RULE_BUCKETS + rule_hash_span(start, (size_t)(q - start))));
     }
 }
 
@@ -4950,7 +4994,8 @@ static int parse_url(const char* val, char* out_path, int max_len) {
     const char* ue = quote ? strchr(up, quote) : strpbrk(up, ") ");
     if (!ue) ue = up + strlen(up);
     int ulen = (int)(ue - up);
-    if (ulen >= max_len && strncmp(up, "data:", 5) == 0 && max_len >= 16)
+    /* A URL too long for the fixed path field is kept once and referenced by key. */
+    if (ulen >= max_len && max_len >= 16)
         return luna_intern_path(up, (size_t)ulen, out_path, max_len);
     if (ulen <= 0 || ulen >= max_len) return 0;
     strncpy(out_path, up, (size_t)ulen);
@@ -5859,14 +5904,34 @@ static size_t css_var_subst(const LunaElement* e, const char* src, size_t sn,
 
 /* style="": parsed like a rule and applied through the same cascade step,
  * last, so every property a stylesheet may set works here too. */
+/* An element's style="" text: any length (inline_style holds the short ones). */
+static const char* element_inline_style(const LunaElement* e) {
+    return e->inline_style_ext ? e->inline_style_ext : e->inline_style;
+}
+
+static void element_set_inline_style(LunaElement* e, const char* s) {
+    free(e->inline_style_ext);
+    e->inline_style_ext = NULL;
+    if (!s) s = "";
+    size_t n = strlen(s);
+    if (n >= sizeof e->inline_style) e->inline_style_ext = (char*)malloc(n + 1);
+    if (e->inline_style_ext) memcpy(e->inline_style_ext, s, n + 1);
+    snprintf(e->inline_style, sizeof e->inline_style, "%s", s);
+    e->has_inline_style = s[0] != '\0';
+}
+
 static void apply_element_inline_style(LunaElement* e, int* am) {
-    if (!e || !e->has_inline_style || !e->inline_style[0]) return;
+    if (!e || !e->has_inline_style || !element_inline_style(e)[0]) return;
     StyleRule rule;
     memset(&rule, 0, sizeof(rule));
-    char buf[CSS_MAX_VALUE];
+    const char* st = element_inline_style(e);
+    size_t cap = strlen(st) * 2 + 1024;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return;
     int missing = 0;
-    css_var_subst(e, e->inline_style, strlen(e->inline_style), buf, sizeof buf, 0, &missing);
+    css_var_subst(e, st, strlen(st), buf, cap, 0, &missing);
     parse_declarations(buf, &rule);
+    free(buf);
     apply_style_rule(e, &rule, am);
     rule_bg_layers_release(rule.bg_layers);
     LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
@@ -5955,6 +6020,7 @@ static int add_class_no_restyle(LunaElement* e, const char* cls) {
     if (used + add + (used ? 1u : 0u) + 1u > sizeof(e->class_name)) return 0;
     if (used) e->class_name[used++] = ' ';
     memcpy(e->class_name + used, cls, add + 1);
+    element_class_updated(e);
     return 1;
 }
 
@@ -5972,6 +6038,7 @@ static int remove_class_no_restyle(LunaElement* e, const char* cls) {
         }
     }
     snprintf(e->class_name, sizeof(e->class_name), "%s", result);
+    element_class_updated(e);
     return 1;
 }
 
@@ -6381,6 +6448,15 @@ int simple_selector_matches(SimpleSelector* s, LunaElement* e) {
     if (s->sel_type[0] && strcmp(s->sel_type, e->type) != 0 &&
         !(is_document_root(e) && html_compound(s))) return 0;
     if (s->sel_id[0]   && strcmp(s->sel_id,   e->id)   != 0) return 0;
+    if (s->sel_class_count) {
+        if (!s->sel_class_mask_ready) {
+            uint64_t m = 0;
+            for (int i = 0; i < s->sel_class_count; i++) m |= class_bit(s->sel_classes[i], strlen(s->sel_classes[i]));
+            s->sel_class_mask = m;
+            s->sel_class_mask_ready = 1;
+        }
+        if (s->sel_class_mask & ~e->class_bloom) return 0;
+    }
     for (int i = 0; i < s->sel_class_count; i++)
         if (!element_has_class(e, s->sel_classes[i])) return 0;
     if (s->is_first_child || s->is_last_child || s->has_nth) {
@@ -6576,6 +6652,20 @@ static void apply_one_declaration(const char* key, const char* val, StyleRule* r
     /* Skip CSS custom properties (--name: value) — resolved by cssparser.h */
     if (!key || !val || strncmp(key, "--", 2) == 0) return;
     if (apply_logical_property(key, val, rule)) return;
+    /* `all: unset | initial | revert` — back to the box a bare element has: the boxes a
+     * UI stylesheet gives controls (background, border, padding) go, later declarations
+     * of the same rule apply on top.  (Inherited text properties already inherit.) */
+    if (!strcmp(key, "all")) {
+        if (!strcmp(val, "unset") || !strcmp(val, "initial") || !strcmp(val, "revert") ||
+            !strcmp(val, "revert-layer")) {
+            apply_one_declaration("background", "none", rule);
+            apply_one_declaration("border", "0 none", rule);
+            apply_one_declaration("padding", "0", rule);
+            apply_one_declaration("margin", "0", rule);
+            apply_one_declaration("border-radius", "0", rule);
+        }
+        return;
+    }
     /* CSS-wide keywords: inherited properties already inherit; `inherit` and
      * `currentcolor` on the rest cannot be resolved here, so they leave the value alone. */
     if ((!strcmp(key, "background-color") || !strcmp(key, "color") || !strcmp(key, "border-color") ||
@@ -8048,6 +8138,14 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 char* tok1 = strtok(posbuf, " \t");
                 char* tok2 = tok1 ? strtok(NULL, " \t") : NULL;
                 float px = 0.5f, py = 0.5f;
+                int px_abs = 0, py_abs = 0;
+                /* A length (30px, -128px) is an offset from the edge; a percentage or keyword is
+                 * a fraction of the free space. */
+                #define BGPOS_VALUE(tok, out, abs_flag) do { \
+                    float v_ = parse_float_val(tok); size_t n_ = strlen(tok); \
+                    if (n_ && tok[n_ - 1] == '%') (out) = v_ / 100.0f; \
+                    else if (v_ == 0.0f) (out) = 0.0f; \
+                    else { (out) = (n_ > 2 && !strcmp(tok + n_ - 2, "em")) ? v_ * g_rem_px : v_; (abs_flag) = 1; } } while (0)
                 if (tok1) {
                     if (!strcmp(tok1, "left"))   px = 0.0f;
                     else if (!strcmp(tok1, "center")) px = 0.5f;
@@ -8055,14 +8153,17 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                     else if (!strcmp(tok1, "top") || !strcmp(tok1, "bottom")) {
                         py = !strcmp(tok1, "top") ? 0.0f : 1.0f;
                         px = 0.5f;
-                    } else px = parse_float_val(tok1) / 100.0f;
+                    } else BGPOS_VALUE(tok1, px, px_abs);
                 }
                 if (tok2) {
                     if (!strcmp(tok2, "top"))    py = 0.0f;
                     else if (!strcmp(tok2, "center")) py = 0.5f;
                     else if (!strcmp(tok2, "bottom")) py = 1.0f;
-                    else py = parse_float_val(tok2) / 100.0f;
+                    else BGPOS_VALUE(tok2, py, py_abs);
                 }
+                #undef BGPOS_VALUE
+                rule->bg_pos_x_px = (char)px_abs;
+                rule->bg_pos_y_px = (char)py_abs;
                 rule->bg_pos_x = px;
                 rule->bg_pos_y = py;
             }
@@ -9534,12 +9635,15 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
     if (r->has_bg_pos) {
         e->bg_pos_x = r->bg_pos_x;
         e->bg_pos_y = r->bg_pos_y;
+        e->bg_pos_x_px = r->bg_pos_x_px;
+        e->bg_pos_y_px = r->bg_pos_y_px;
     }
 }
 
 /* Web-document mode: HTML's default inline boxes and materialized text runs.
  * Off by default so existing Luna UIs keep their all-block layout. */
 static int g_luna_web_compat = 0;
+static int g_luna_quirks = 0;       /* the document has no <!doctype html>: browsers' quirks mode */
 
 static void luna_ua_inline_defaults(LunaElement* e) {
     static const char* inl[] = {
@@ -9890,6 +9994,13 @@ void update_element_style(LunaElement* e) {
         e->letter_spacing_em = 0;
         e->text_transform = parent->text_transform;
         e->text_decoration = parent->text_decoration;
+        /* text-align inherits in documents; the engine's own UIs keep the old default. */
+        /* In quirks mode a table starts from its own alignment, not its parent's. */
+        if (g_luna_web_compat && parent->has_text_align && !el_is_button_like(e) &&
+            !(g_luna_quirks && !strcmp(e->type, "table"))) {
+            e->text_align = parent->text_align;
+            e->has_text_align = 1;
+        }
         if (!e->has_custom_color) {
             e->t_r = parent->t_r; e->t_g = parent->t_g;
             e->t_b = parent->t_b; e->t_a = parent->t_a;
@@ -9978,6 +10089,7 @@ void update_element_style(LunaElement* e) {
     e->bg_size_w = e->bg_size_h = 0.0f;
     e->bg_pos_x = 0.5f;
     e->bg_pos_y = 0.5f;
+    e->bg_pos_x_px = e->bg_pos_y_px = 0;
     e->has_backdrop_blur = 0;
     e->backdrop_blur_radius = 0.0f;
     e->backdrop_saturate = 1.0f;
@@ -10016,8 +10128,8 @@ void update_element_style(LunaElement* e) {
                                  g_api_variables.custom_props[i].value);
                 if (n > 0 && (size_t)n < sizeof decl) css_vars_append(&raw, &rn, decl, (size_t)n);
             }
-        if (e->has_inline_style && strstr(e->inline_style, "--"))
-            css_vars_from_inline(&raw, &rn, e->inline_style);
+        if (e->has_inline_style && strstr(element_inline_style(e), "--"))
+            css_vars_from_inline(&raw, &rn, element_inline_style(e));
         e->css_vars = raw;
         css_vars_reset(e);
         if (raw && strstr(raw, "var(")) {
@@ -10055,11 +10167,14 @@ void update_element_style(LunaElement* e) {
 
     if (g_luna_web_compat) luna_apply_hints(e, am);
     if (g_luna_web_compat && e->dom_attrs && !strcmp(e->type, "img")) {   /* <img src> is the box's image */
-        char src[sizeof e->bg_image_path];
+        char src[4096], key[sizeof e->bg_image_path];
         if (extract_html_attr(e->dom_attrs, "src", src, sizeof src) && src[0]) {
-            if (strcmp(e->bg_image_path, src)) e->bg_image_tex = 0;
+            const char* path = src;
+            size_t sl = strlen(src);
+            if (sl >= sizeof e->bg_image_path && luna_intern_path(src, sl, key, (int)sizeof key)) path = key;
+            if (strcmp(e->bg_image_path, path)) e->bg_image_tex = 0;
             e->has_bg_image = 1;
-            snprintf(e->bg_image_path, sizeof e->bg_image_path, "%s", src);
+            snprintf(e->bg_image_path, sizeof e->bg_image_path, "%s", path);
         }
     }
 
@@ -10438,7 +10553,7 @@ static int tag_is_stylesheet_link(const char* tag_buf) {
 
 static void load_stylesheet_href(const char* href) {
     if (!href || !href[0]) return;
-    char path[512];
+    char path[2048];
     resolve_resource_path(href, path, sizeof(path));
     char* css = read_file(path);
     if (css) {
@@ -10635,6 +10750,15 @@ static void parse_html_markup(const char* html, int root_parent) {
     const char* p = html;
     int pending_ws = 0;
     g_dom_uid_dirty = 1;
+    if (root_parent == -1) {            /* quirks mode = no doctype before the first element */
+        const char* q = html;
+        for (;;) {
+            while (isspace((unsigned char)*q)) q++;
+            if (!strncmp(q, "<!--", 4)) { const char* c = strstr(q, "-->"); if (!c) break; q = c + 3; }
+            else break;
+        }
+        g_luna_quirks = luna_strncasecmp(q, "<!doctype", 9) != 0;
+    }
 
     while (*p && elem_count < MAX_ELEMENTS) {
         const char* tag_start = strchr(p, '<');
@@ -10755,7 +10879,7 @@ static void parse_html_markup(const char* html, int root_parent) {
 
         if (luna_strcasecmp(type, "link") == 0) {
             if (tag_is_stylesheet_link(tag_buf)) {
-                char href[256] = {0};
+                char href[1536] = {0};
                 extract_html_attr(tag_buf, "href", href, sizeof(href));
                 load_stylesheet_href(href);
             }
@@ -10827,10 +10951,13 @@ static void parse_html_markup(const char* html, int root_parent) {
                 char bcls[LUNA_CLASS_CAP] = {0};
                 extract_html_attr(tag_buf, "class", bcls, sizeof(bcls));
                 snprintf(elements[bi].class_name, sizeof(elements[bi].class_name), "%s", bcls);
+                element_class_updated(&elements[bi]);
                 extract_html_attr(tag_buf, "id", elements[bi].id, sizeof(elements[bi].id));
-                if (extract_html_attr(tag_buf, "style", elements[bi].inline_style,
-                                      sizeof(elements[bi].inline_style)))
-                    elements[bi].has_inline_style = elements[bi].inline_style[0] != '\0';
+                {
+                    char bstyle[4096];
+                    if (extract_html_attr(tag_buf, "style", bstyle, sizeof bstyle))
+                        element_set_inline_style(&elements[bi], bstyle);
+                }
                 elements[bi].id_idx = bi;
                 elements[bi].parent_idx = -1; g_dom_struct_ver++;
                 elements[bi].opacity = 1.0f;
@@ -10895,7 +11022,7 @@ static void parse_html_markup(const char* html, int root_parent) {
         char id[64] = {0}, class_name[LUNA_CLASS_CAP] = {0};
         int draggable = 0;
         char onclick_expr[96] = {0};
-        char style_attr[256] = {0};
+        char style_attr[4096] = {0};
         char data_tab[32] = {0};
         char attr_value[32] = {0};
         extract_html_attr(tag_buf, "id", id, sizeof(id));
@@ -10922,7 +11049,7 @@ static void parse_html_markup(const char* html, int root_parent) {
                 snprintf(sized + strlen(sized), sizeof sized - strlen(sized), "height:%s%s;", sh, unit);
             }
             if (sized[0]) {
-                char merged[256];
+                char merged[sizeof style_attr];
                 snprintf(merged, sizeof merged, "%s%s", sized, style_attr);
                 snprintf(style_attr, sizeof style_attr, "%s", merged);
             }
@@ -11001,15 +11128,13 @@ static void parse_html_markup(const char* html, int root_parent) {
         snprintf(e.type, sizeof(e.type), "%s", type);
         e.svg_src = svg_src_idx;
         snprintf(e.class_name, sizeof(e.class_name), "%s", class_name);
+        element_class_updated(&e);
         snprintf(e.id, sizeof(e.id), "%s", id);
         snprintf(e.text, sizeof(e.text), "%s", text);
         e.direct_text_before_children = text[0] != '\0';
         if (onclick_expr[0]) parse_onclick_expr(onclick_expr, e.onclick, (int)sizeof(e.onclick));
         if (data_tab[0]) snprintf(e.data_tab, sizeof(e.data_tab), "%s", data_tab);
-        if (style_attr[0]) {
-            snprintf(e.inline_style, sizeof(e.inline_style), "%s", style_attr);
-            e.has_inline_style = 1;
-        }
+        if (style_attr[0]) element_set_inline_style(&e, style_attr);
         e.cur_scale = 1.0f;
         e.anim_start_time = -1.0;
         e.dom_uid = ++g_dom_uid_seq;
@@ -12882,7 +13007,16 @@ static void layout_flex_container(int container_idx) {
         kids[n++] = c;
     }
     if (n == 0) return;
-
+    /* `order`: stable insertion sort, skipped in the common all-zero case. */
+    {
+        int any = 0;
+        for (int k = 0; k < n; k++) if (elements[kids[k]].flex_order) { any = 1; break; }
+        for (int k = 1; any && k < n; k++) {
+            int c = kids[k], o = elements[c].flex_order, j = k - 1;
+            while (j >= 0 && elements[kids[j]].flex_order > o) { kids[j + 1] = kids[j]; j--; }
+            kids[j + 1] = c;
+        }
+    }
 
     int row_mode = (cont->flex_direction == FLEX_DIR_ROW);
     float gap = cont->flex_gap;
@@ -14076,6 +14210,7 @@ static int ensure_overlay_element(const char* id, const char* classes, int host,
         elements[idx].aria_expanded = -1;
         strncpy(elements[idx].id, id, sizeof(elements[idx].id) - 1);
         strncpy(elements[idx].class_name, classes, sizeof(elements[idx].class_name) - 1);
+        element_class_updated(&elements[idx]);
         strncpy(elements[idx].type, "div", sizeof(elements[idx].type) - 1);
         elements[idx].parent_idx = -1; g_dom_struct_ver++;
         elements[idx].luna_internal = 1;
@@ -14166,7 +14301,7 @@ static void sync_css_overlay_elements(void) {
         elements[a11y].tabindex = -2;
         elements[a11y].aria_expanded = -1;
         strncpy(elements[a11y].id, "luna_a11y_bar", sizeof(elements[a11y].id) - 1);
-        strncpy(elements[a11y].class_name, "luna_a11y hidden", sizeof(elements[a11y].class_name) - 1);
+        strncpy(elements[a11y].class_name, "luna_a11y hidden", sizeof(elements[a11y].class_name) - 1); element_class_updated(&elements[a11y]);
         strncpy(elements[a11y].type, "div", sizeof(elements[a11y].type) - 1);
         elements[a11y].parent_idx = -1; g_dom_struct_ver++;
         elements[a11y].luna_internal = 1;
@@ -14188,6 +14323,7 @@ static void sync_css_overlay_elements(void) {
                 strncpy(elements[a11y].class_name, "luna_a11y luna_a11y_assertive", sizeof(elements[a11y].class_name) - 1);
             else
                 strncpy(elements[a11y].class_name, "luna_a11y", sizeof(elements[a11y].class_name) - 1);
+            element_class_updated(&elements[a11y]);
         } else if (g_focus_via_keyboard && g_focused_element_idx != -1 &&
                    !element_aria_hidden(g_focused_element_idx)) {
             LunaElement* fe = &elements[g_focused_element_idx];
@@ -14198,7 +14334,7 @@ static void sync_css_overlay_elements(void) {
             else if (fe->text[0])
                 snprintf(buf, sizeof(buf), "%.*s", (int)sizeof(buf) - 1, fe->text);
             if (buf[0]) show = 1;
-            strncpy(elements[a11y].class_name, "luna_a11y", sizeof(elements[a11y].class_name) - 1);
+            strncpy(elements[a11y].class_name, "luna_a11y", sizeof(elements[a11y].class_name) - 1); element_class_updated(&elements[a11y]);
         }
         if (show) {
             remove_class(&elements[a11y], "hidden");
@@ -16319,8 +16455,8 @@ static void bg_image_dest_rect(const LunaElement* e, float box_w, float box_h,
     }
     float px = e->bg_pos_x;
     float py = e->bg_pos_y;
-    float off_x = (box_w - draw_w) * px;
-    float off_y_top = (box_h - draw_h) * py;
+    float off_x = e->bg_pos_x_px ? px : (box_w - draw_w) * px;
+    float off_y_top = e->bg_pos_y_px ? py : (box_h - draw_h) * py;
     if (ox) *ox = off_x;
     if (oy) *oy = box_h - off_y_top - draw_h;
     if (iw) *iw = draw_w;
@@ -19573,17 +19709,18 @@ void luna_set_background_image(int idx, const char* path) {
     g_probe_prepared = 0;
     LunaElement* e = &elements[idx];
     if (!path || !*path) {
-        e->has_inline_style = 0;
-        e->inline_style[0] = 0;
+        element_set_inline_style(e, NULL);
         e->has_bg_image = 0;
         e->bg_image_path[0] = 0;
         e->bg_image_tex = 0;
         (void)restyle_element_checked(e);
         return;
     }
-    snprintf(e->inline_style, sizeof(e->inline_style),
-             "background-image:url('%s')", path);
-    e->has_inline_style = 1;
+    {
+        size_t n = strlen(path) + 32;
+        char* st = (char*)malloc(n);
+        if (st) { snprintf(st, n, "background-image:url('%s')", path); element_set_inline_style(e, st); free(st); }
+    }
     (void)restyle_element_checked(e);
 }
 void luna_set_text_paint_only(int i, const char* t) {
@@ -19605,6 +19742,11 @@ void luna_mark_visual_dirty(int i) {
 void luna_update_element_style(int i) { g_probe_prepared = 0; if (i >= 0 && i < elem_count) (void)restyle_element_checked(&elements[i]); }
 void luna_register_js_handler(const char* n, LunaEventHandler fn) { register_js_handler(n, fn); }
 void luna_set_on_click(int i, LunaEventHandler fn) { set_on_click(i, fn); }
+void luna_set_flex_order(int i, int order) {
+    if (i < 0 || i >= elem_count || elements[i].flex_order == order) return;
+    elements[i].flex_order = order;
+    LUNA_LAYOUT_DIRTY();
+}
 void luna_set_html_base_dir(const char* p) { set_html_base_dir(p); }
 int luna_load_html_file(const char* p) { char* s = read_file(p); if (!s) return 0; parse_html(s); free(s); return 1; }
 int luna_load_css_file(const char* p) {
@@ -19648,6 +19790,8 @@ void luna_reset_document(void) {
         free(elements[i].bg_layers);
         elements[i].bg_layers = NULL;
         elements[i].bg_layer_count = 0;
+        free(elements[i].inline_style_ext);
+        elements[i].inline_style_ext = NULL;
         free(elements[i].dom_attrs);
         elements[i].dom_attrs = NULL;
         free(elements[i].dom_raw_text);
@@ -20157,9 +20301,9 @@ static void dom_attr_apply(int idx, const char* name, const char* value) {
         g_id_map_ready = 0; g_id_map_built = 0;
     } else if (!luna_strcasecmp(name, "class")) {
         snprintf(e->class_name, sizeof(e->class_name), "%s", v);
+        element_class_updated(e);
     } else if (!luna_strcasecmp(name, "style")) {
-        snprintf(e->inline_style, sizeof(e->inline_style), "%s", v);
-        e->has_inline_style = v[0] != '\0';
+        element_set_inline_style(e, v);
     } else if (!luna_strcasecmp(name, "src") && !luna_strcasecmp(e->type, "img")) {
         e->has_bg_image = v[0] != '\0';
         snprintf(e->bg_image_path, sizeof(e->bg_image_path), "%s", v);
