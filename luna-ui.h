@@ -56,8 +56,21 @@
 #  undef LUNA_UI_PLATFORM_PRELUDE
 #endif
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* HTML to attributed text: UTF-16 text plus style ranges, with the paragraph,
+ * whitespace and style-mark behaviour of Android's Html.fromHtml()
+ * (HtmlToSpannedConverter, AOSP frameworks/base/core/java/android/text/Html.java).
+ * No layout or renderer is involved; a host maps each lh_span onto its own text
+ * model's span.  Ranges are UTF-16 offsets. */
+enum lh_style {LH_BOLD,LH_ITALIC,LH_UNDERLINE,LH_STRIKE,LH_SUPER,LH_SUB,
+ LH_SIZE,LH_FACE,LH_URL,LH_FOREGROUND,LH_BACKGROUND,LH_BULLET,LH_QUOTE,LH_ALIGNMENT,LH_IMAGE};
+struct lh_span {enum lh_style kind;int32_t start,end;uint32_t value;char *text;};
+struct lh_document {uint16_t *text;size_t length,capacity;struct lh_span *spans;size_t count,span_capacity;};
+bool luna_html_parse(const char *source,unsigned flags,struct lh_document *out);
+void luna_html_document_free(struct lh_document *doc);
 
 /* A custom host may include its GL headers before this file. Native Luna
  * platform preludes do that automatically. */
@@ -874,6 +887,8 @@ int  luna_update_classes(int idx, const char* remove_classes, const char* add_cl
 /* Mark an element whose visual target fields were changed directly by a host. */
 void luna_mark_visual_dirty(int idx);
 void luna_update_element_style(int idx);
+/* Refresh a newly available image's intrinsic dimensions without a CSS sweep. */
+void luna_image_arrived(int idx);
 void luna_register_js_handler(const char* name, LunaEventHandler fn);
 void luna_set_on_click(int idx, LunaEventHandler fn);
 /* Flex `order` for a child of a flex container (default 0, lower first). */
@@ -975,6 +990,546 @@ extern char  luna_doc_title[128];
 extern int   luna_css_from_document;
 
 #ifdef LUNA_UI_IMPLEMENTATION
+
+/* ---- HTML to attributed text (declared in the public section) ---- */
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <limits.h>
+/* BEGIN generated html entities (scripts/gen-html-entities.py; HTML4 names) */
+static const struct {const char *name; unsigned value;} lh_entities[]={
+ {"AElig",0xc6},
+ {"Aacute",0xc1},
+ {"Acirc",0xc2},
+ {"Agrave",0xc0},
+ {"Alpha",0x391},
+ {"Aring",0xc5},
+ {"Atilde",0xc3},
+ {"Auml",0xc4},
+ {"Beta",0x392},
+ {"Ccedil",0xc7},
+ {"Chi",0x3a7},
+ {"Dagger",0x2021},
+ {"Delta",0x394},
+ {"ETH",0xd0},
+ {"Eacute",0xc9},
+ {"Ecirc",0xca},
+ {"Egrave",0xc8},
+ {"Epsilon",0x395},
+ {"Eta",0x397},
+ {"Euml",0xcb},
+ {"Gamma",0x393},
+ {"Iacute",0xcd},
+ {"Icirc",0xce},
+ {"Igrave",0xcc},
+ {"Iota",0x399},
+ {"Iuml",0xcf},
+ {"Kappa",0x39a},
+ {"Lambda",0x39b},
+ {"Mu",0x39c},
+ {"Ntilde",0xd1},
+ {"Nu",0x39d},
+ {"OElig",0x152},
+ {"Oacute",0xd3},
+ {"Ocirc",0xd4},
+ {"Ograve",0xd2},
+ {"Omega",0x3a9},
+ {"Omicron",0x39f},
+ {"Oslash",0xd8},
+ {"Otilde",0xd5},
+ {"Ouml",0xd6},
+ {"Phi",0x3a6},
+ {"Pi",0x3a0},
+ {"Prime",0x2033},
+ {"Psi",0x3a8},
+ {"Rho",0x3a1},
+ {"Scaron",0x160},
+ {"Sigma",0x3a3},
+ {"THORN",0xde},
+ {"Tau",0x3a4},
+ {"Theta",0x398},
+ {"Uacute",0xda},
+ {"Ucirc",0xdb},
+ {"Ugrave",0xd9},
+ {"Upsilon",0x3a5},
+ {"Uuml",0xdc},
+ {"Xi",0x39e},
+ {"Yacute",0xdd},
+ {"Yuml",0x178},
+ {"Zeta",0x396},
+ {"aacute",0xe1},
+ {"acirc",0xe2},
+ {"acute",0xb4},
+ {"aelig",0xe6},
+ {"agrave",0xe0},
+ {"alefsym",0x2135},
+ {"alpha",0x3b1},
+ {"amp",0x26},
+ {"and",0x2227},
+ {"ang",0x2220},
+ {"apos",0x27},
+ {"aring",0xe5},
+ {"asymp",0x2248},
+ {"atilde",0xe3},
+ {"auml",0xe4},
+ {"bdquo",0x201e},
+ {"beta",0x3b2},
+ {"brvbar",0xa6},
+ {"bull",0x2022},
+ {"cap",0x2229},
+ {"ccedil",0xe7},
+ {"cedil",0xb8},
+ {"cent",0xa2},
+ {"chi",0x3c7},
+ {"circ",0x2c6},
+ {"clubs",0x2663},
+ {"cong",0x2245},
+ {"copy",0xa9},
+ {"crarr",0x21b5},
+ {"cup",0x222a},
+ {"curren",0xa4},
+ {"dArr",0x21d3},
+ {"dagger",0x2020},
+ {"darr",0x2193},
+ {"deg",0xb0},
+ {"delta",0x3b4},
+ {"diams",0x2666},
+ {"divide",0xf7},
+ {"eacute",0xe9},
+ {"ecirc",0xea},
+ {"egrave",0xe8},
+ {"empty",0x2205},
+ {"emsp",0x2003},
+ {"ensp",0x2002},
+ {"epsilon",0x3b5},
+ {"equiv",0x2261},
+ {"eta",0x3b7},
+ {"eth",0xf0},
+ {"euml",0xeb},
+ {"euro",0x20ac},
+ {"exist",0x2203},
+ {"fnof",0x192},
+ {"forall",0x2200},
+ {"frac12",0xbd},
+ {"frac14",0xbc},
+ {"frac34",0xbe},
+ {"frasl",0x2044},
+ {"gamma",0x3b3},
+ {"ge",0x2265},
+ {"gt",0x3e},
+ {"hArr",0x21d4},
+ {"harr",0x2194},
+ {"hearts",0x2665},
+ {"hellip",0x2026},
+ {"iacute",0xed},
+ {"icirc",0xee},
+ {"iexcl",0xa1},
+ {"igrave",0xec},
+ {"image",0x2111},
+ {"infin",0x221e},
+ {"int",0x222b},
+ {"iota",0x3b9},
+ {"iquest",0xbf},
+ {"isin",0x2208},
+ {"iuml",0xef},
+ {"kappa",0x3ba},
+ {"lArr",0x21d0},
+ {"lambda",0x3bb},
+ {"lang",0x2329},
+ {"laquo",0xab},
+ {"larr",0x2190},
+ {"lceil",0x2308},
+ {"ldquo",0x201c},
+ {"le",0x2264},
+ {"lfloor",0x230a},
+ {"lowast",0x2217},
+ {"loz",0x25ca},
+ {"lrm",0x200e},
+ {"lsaquo",0x2039},
+ {"lsquo",0x2018},
+ {"lt",0x3c},
+ {"macr",0xaf},
+ {"mdash",0x2014},
+ {"micro",0xb5},
+ {"middot",0xb7},
+ {"minus",0x2212},
+ {"mu",0x3bc},
+ {"nabla",0x2207},
+ {"nbsp",0xa0},
+ {"ndash",0x2013},
+ {"ne",0x2260},
+ {"ni",0x220b},
+ {"not",0xac},
+ {"notin",0x2209},
+ {"nsub",0x2284},
+ {"ntilde",0xf1},
+ {"nu",0x3bd},
+ {"oacute",0xf3},
+ {"ocirc",0xf4},
+ {"oelig",0x153},
+ {"ograve",0xf2},
+ {"oline",0x203e},
+ {"omega",0x3c9},
+ {"omicron",0x3bf},
+ {"oplus",0x2295},
+ {"or",0x2228},
+ {"ordf",0xaa},
+ {"ordm",0xba},
+ {"oslash",0xf8},
+ {"otilde",0xf5},
+ {"otimes",0x2297},
+ {"ouml",0xf6},
+ {"para",0xb6},
+ {"part",0x2202},
+ {"permil",0x2030},
+ {"perp",0x22a5},
+ {"phi",0x3c6},
+ {"pi",0x3c0},
+ {"piv",0x3d6},
+ {"plusmn",0xb1},
+ {"pound",0xa3},
+ {"prime",0x2032},
+ {"prod",0x220f},
+ {"prop",0x221d},
+ {"psi",0x3c8},
+ {"quot",0x22},
+ {"rArr",0x21d2},
+ {"radic",0x221a},
+ {"rang",0x232a},
+ {"raquo",0xbb},
+ {"rarr",0x2192},
+ {"rceil",0x2309},
+ {"rdquo",0x201d},
+ {"real",0x211c},
+ {"reg",0xae},
+ {"rfloor",0x230b},
+ {"rho",0x3c1},
+ {"rlm",0x200f},
+ {"rsaquo",0x203a},
+ {"rsquo",0x2019},
+ {"sbquo",0x201a},
+ {"scaron",0x161},
+ {"sdot",0x22c5},
+ {"sect",0xa7},
+ {"shy",0xad},
+ {"sigma",0x3c3},
+ {"sigmaf",0x3c2},
+ {"sim",0x223c},
+ {"spades",0x2660},
+ {"sub",0x2282},
+ {"sube",0x2286},
+ {"sum",0x2211},
+ {"sup",0x2283},
+ {"sup1",0xb9},
+ {"sup2",0xb2},
+ {"sup3",0xb3},
+ {"supe",0x2287},
+ {"szlig",0xdf},
+ {"tau",0x3c4},
+ {"there4",0x2234},
+ {"theta",0x3b8},
+ {"thetasym",0x3d1},
+ {"thinsp",0x2009},
+ {"thorn",0xfe},
+ {"tilde",0x2dc},
+ {"times",0xd7},
+ {"trade",0x2122},
+ {"uArr",0x21d1},
+ {"uacute",0xfa},
+ {"uarr",0x2191},
+ {"ucirc",0xfb},
+ {"ugrave",0xf9},
+ {"uml",0xa8},
+ {"upsih",0x3d2},
+ {"upsilon",0x3c5},
+ {"uuml",0xfc},
+ {"weierp",0x2118},
+ {"xi",0x3be},
+ {"yacute",0xfd},
+ {"yen",0xa5},
+ {"yuml",0xff},
+ {"zeta",0x3b6},
+ {"zwj",0x200d},
+ {"zwnj",0x200c},
+};
+static inline unsigned luna_html_named_entity(const char *name, size_t length)
+{
+ size_t lo=0,hi=sizeof lh_entities/sizeof *lh_entities;
+ while(lo<hi){size_t mid=lo+(hi-lo)/2,n=strlen(lh_entities[mid].name);
+  int c=memcmp(name,lh_entities[mid].name,length<n?length:n);
+  if(!c)c=length<n?-1:length>n?1:0;
+  if(!c) {return lh_entities[mid].value;}
+  if(c<0)hi=mid;else lo=mid+1;
+ }return 0;
+}
+/* END generated html entities */
+static bool lht_grow(void **p,size_t *capacity,size_t need,size_t width)
+{
+ if(need<=*capacity)return true;
+ size_t n=*capacity ? *capacity : 16;
+ while(n<need){if(n>SIZE_MAX/2)return false;n*=2;}
+ if(n>SIZE_MAX/width)return false;
+ void *q=realloc(*p,n*width);if(!q)return false;*p=q;*capacity=n;return true;
+}
+static char *lht_copy(const char *s,size_t n)
+{if(n==SIZE_MAX)return NULL;char *p=malloc(n+1);if(p){memcpy(p,s,n);p[n]=0;}return p;}
+static bool lht_cp(struct lh_document *d,unsigned c,bool collapse)
+{
+ if(c=='\r')c='\n';
+ if(collapse && (c==' ' || c=='\n')){
+  if(!d->length || d->text[d->length-1]==' ' || d->text[d->length-1]=='\n') {return true;}
+  c=' ';
+ }
+ if(d->length>INT32_MAX-2 || !lht_grow((void **)&d->text,&d->capacity,d->length+2,sizeof *d->text))return false;
+ if(c>0x10ffff || (c>=0xd800 && c<=0xdfff) || !c)c=0xfffd;
+ if(c>0xffff){c-=0x10000;d->text[d->length++]=(uint16_t)(0xd800+(c>>10));c=0xdc00+(c&1023);}
+ d->text[d->length++]=(uint16_t)c;return true;
+}
+static bool lht_newline(struct lh_document *d,unsigned margin)
+{
+ if(!d->length) {return true;}
+ size_t n=0;
+ while(n<d->length && d->text[d->length-n-1]=='\n')++n;
+ while(n++<margin) {if(!lht_cp(d,'\n',false))return false;}
+ return true;
+}
+static unsigned lht_entity(const char *s,size_t n)
+{
+ if(n && *s=='#'){
+  size_t i=1;unsigned base=10,c=0;
+  if(i<n && (s[i]=='x'||s[i]=='X')){base=16;++i;}
+  if(i==n)return 0;
+  for(;i<n;++i){unsigned char ch=(unsigned char)s[i];unsigned v=ch>='0'&&ch<='9'?ch-'0':ch>='a'&&ch<='f'?ch-'a'+10:ch>='A'&&ch<='F'?ch-'A'+10:16;
+   if(v>=base || c>(0x10ffff-v)/base) {return 0xfffd;}
+   c=c*base+v;}
+  return c?c:0xfffd;
+ }
+ return luna_html_named_entity(s,n);
+}
+static bool lht_text(struct lh_document *d,const char *s,size_t n,bool collapse)
+{
+ for(size_t i=0;i<n;){unsigned c=(unsigned char)s[i++];
+  if(c=='&'){
+   size_t end=i;while(end<n && (isalnum((unsigned char)s[end]) || s[end]=='#'))++end;
+   unsigned value=lht_entity(s+i,end-i);
+   if(value){c=value;i=end;if(i<n && s[i]==';')++i;}
+  } else if(c>=0x80){unsigned need=c>=0xf0?3:c>=0xe0?2:c>=0xc0?1:0;
+   if(!need || i+need>n)c=0xfffd;
+   else {unsigned v=c&((1u<<(6-need))-1u);bool valid=true;
+    for(unsigned j=0;j<need;++j){unsigned b=(unsigned char)s[i+j];if((b&0xc0)!=0x80){valid=false;break;}v=(v<<6)|(b&63);}
+    if(valid){i+=need;c=v;}else c=0xfffd;}
+  }
+  if(c=='\r' && i<n && s[i]=='\n')++i;
+  if(!lht_cp(d,c,collapse))return false;
+ }return true;
+}
+static char *lht_decoded(const char *s,size_t n)
+{
+ struct lh_document d={0};if(!lht_text(&d,s,n,false)){luna_html_document_free(&d);return NULL;}
+ if(d.length>(SIZE_MAX-1)/3){luna_html_document_free(&d);return NULL;}
+ char *p=malloc(d.length*3+1);size_t used=0;
+ if(p)for(size_t i=0;i<d.length;++i){unsigned c=d.text[i];
+  if(c>=0xd800&&c<=0xdbff&&i+1<d.length){c=0x10000+((c-0xd800)<<10)+(d.text[++i]-0xdc00);}
+  if(c<128)p[used++]=(char)c;else if(c<0x800){p[used++]=(char)(0xc0|(c>>6));p[used++]=(char)(0x80|(c&63));}
+  else if(c<0x10000){p[used++]=(char)(0xe0|(c>>12));p[used++]=(char)(0x80|((c>>6)&63));p[used++]=(char)(0x80|(c&63));}
+  else {p[used++]=(char)(0xf0|(c>>18));p[used++]=(char)(0x80|((c>>12)&63));p[used++]=(char)(0x80|((c>>6)&63));p[used++]=(char)(0x80|(c&63));}
+ }if(p)p[used]=0;luna_html_document_free(&d);return p;
+}
+struct lht_attr {char *name,*value;};
+struct lht_frame {char *tag;int32_t start;unsigned margin;struct lh_span *styles;size_t count,capacity;};
+static void lht_frame_free(struct lht_frame *f)
+{free(f->tag);for(size_t i=0;i<f->count;++i)free(f->styles[i].text);free(f->styles);memset(f,0,sizeof *f);}
+static bool lht_style(struct lht_frame *f,enum lh_style kind,uint32_t value,const char *arg)
+{
+ if(!lht_grow((void **)&f->styles,&f->capacity,f->count+1,sizeof *f->styles))return false;
+ char *s=arg?lht_copy(arg,strlen(arg)):NULL;if(arg&&!s)return false;
+ f->styles[f->count++]=(struct lh_span){.kind=kind,.value=value,.text=s};return true;
+}
+static bool lht_close_frame(struct lh_document *d,struct lht_frame *f)
+{
+ int32_t end=(int32_t)d->length;
+ if(f->margin && !lht_newline(d,f->margin))return false;
+ for(size_t i=0;i<f->count;++i){struct lh_span *s=&f->styles[i];
+  int32_t last=end;
+  if(s->kind==LH_BULLET || s->kind==LH_QUOTE || s->kind==LH_ALIGNMENT) {
+   last=(int32_t)d->length;
+   if(last>=2 && d->text[last-1]=='\n' && d->text[last-2]=='\n')--last;
+  }
+  if(last<=f->start)continue;
+  if(!lht_grow((void **)&d->spans,&d->span_capacity,d->count+1,sizeof *d->spans))return false;
+  s->start=f->start;s->end=last;d->spans[d->count++]=*s;s->text=NULL;
+ }return true;
+}
+static const char *lht_get(struct lht_attr *a,size_t n,const char *name)
+{for(size_t i=0;i<n;++i)if(!strcmp(a[i].name,name))return a[i].value;return NULL;}
+static bool lht_color(const char *s,unsigned flags,uint32_t *out)
+{
+ if(!s || !*s)return false;
+ const struct {const char *name;uint32_t color;} names[]={
+  {"black",0},{"darkgray",0x444444},{"gray",0x888888},{"lightgray",0xcccccc},{"white",0xffffff},
+  {"red",0xff0000},{"green",0x00ff00},{"blue",0x0000ff},{"yellow",0xffff00},{"cyan",0xffff},{"magenta",0xff00ff},
+  {"aqua",0xffff},{"fuchsia",0xff00ff},{"darkgrey",0x444444},{"grey",0x888888},{"lightgrey",0xcccccc},
+  {"lime",0xff00},{"maroon",0x800000},{"navy",0x80},{"olive",0x808000},{"purple",0x800080},{"silver",0xc0c0c0},{"teal",0x8080}};
+ char word[32];size_t n=strlen(s);if(n>=sizeof word)return false;
+ for(size_t i=0;i<=n;++i)word[i]=(char)tolower((unsigned char)s[i]);
+ for(size_t i=0;i<sizeof names/sizeof *names;++i)if(!strcmp(word,names[i].name)){
+  uint32_t c=names[i].color;
+  if(flags&256){if(!strcmp(word,"green"))c=0x8000;else if(!strcmp(word,"gray")||!strcmp(word,"grey"))c=0x808080;
+   else if(!strcmp(word,"darkgray")||!strcmp(word,"darkgrey"))c=0xa9a9a9;else if(!strcmp(word,"lightgray")||!strcmp(word,"lightgrey"))c=0xd3d3d3;}
+  *out=0xff000000|c;return true;
+ }
+ const char *digits=s;int base=0;if(*digits=='#'){++digits;base=16;}
+ char *end;unsigned long v=strtoul(digits,&end,base);
+ if(end==digits || *end || v>UINT32_MAX || v==UINT32_MAX)return false;
+ *out=0xff000000u|(uint32_t)v;return true;
+}
+static bool lht_ascii_equal(const char *a,const char *b)
+{while(*a&&*b){if(tolower((unsigned char)*a++)!=tolower((unsigned char)*b++))return false;}return !*a&&!*b;}
+static bool lht_css(struct lht_frame *f,const char *s,unsigned flags,bool alignment)
+{
+ if(!s)return true;
+ bool foreground=false,background=false,strike=false,have_alignment=false;uint32_t fg=0,bg=0,align=0;
+ for(const char *p=s;*p;){while(*p&&(isspace((unsigned char)*p)||*p==';'))++p;
+  const char *key=p;while(*p&&*p!=':'&&*p!=';')++p;
+  if(*p!=':'){if(*p)++p;continue;}const char *end=p++;
+  while(end>key&&isspace((unsigned char)end[-1]))--end;
+  while(isspace((unsigned char)*p)) {++p;}
+  const char *value=p;while(*p&&*p!=';')++p;
+  const char *last=p;while(last>value&&isspace((unsigned char)last[-1]))--last;
+  char *v=lht_copy(value,(size_t)(last-value));if(!v)return false;
+  size_t k=(size_t)(end-key);
+  if(alignment){if(!have_alignment&&k==10&&!memcmp(key,"text-align",10)){
+    if(lht_ascii_equal(v,"start")){align=0;have_alignment=true;}
+    else if(lht_ascii_equal(v,"center")){align=1;have_alignment=true;}
+    else if(lht_ascii_equal(v,"end")){align=2;have_alignment=true;}}}
+  else if(!foreground&&k==5&&!memcmp(key,"color",5))foreground=lht_color(v,flags,&fg);
+  else if(!background&&((k==16&&!memcmp(key,"background-color",16))||(k==10&&!memcmp(key,"background",10))))background=lht_color(v,flags,&bg);
+  else if(k==15&&!memcmp(key,"text-decoration",15)&&lht_ascii_equal(v,"line-through"))strike=true;
+  free(v);
+ }
+ /* Android closes CSS marks in strike, background, foreground order. */
+ return (!have_alignment||lht_style(f,LH_ALIGNMENT,align,NULL))&&(!strike||lht_style(f,LH_STRIKE,0,NULL))&&
+  (!background||lht_style(f,LH_BACKGROUND,bg,NULL))&&(!foreground||lht_style(f,LH_FOREGROUND,fg,NULL));
+}
+static bool lht_start(struct lh_document *d,struct lht_frame *f,struct lht_attr *a,size_t n,unsigned flags)
+{
+ const char *tag=f->tag;unsigned bit=0;
+ bool heading=tag[0]=='h'&&tag[1]>='1'&&tag[1]<='6'&&!tag[2];
+ if(!strcmp(tag,"p"))bit=1;else if(heading)bit=2;else if(!strcmp(tag,"li"))bit=4;
+ else if(!strcmp(tag,"ul"))bit=8;else if(!strcmp(tag,"div"))bit=16;else if(!strcmp(tag,"blockquote"))bit=32;
+ f->margin=bit ? ((flags&bit)?1:2):0;
+ if(f->margin && !lht_newline(d,f->margin)) {return false;}
+ f->start=(int32_t)d->length;
+ if(bit && !lht_css(f,lht_get(a,n,"style"),flags,true))return false;
+ if((!strcmp(tag,"p")||!strcmp(tag,"span")||!strcmp(tag,"li")) && !lht_css(f,lht_get(a,n,"style"),flags,false))return false;
+ if(!strcmp(tag,"b")||!strcmp(tag,"strong"))return lht_style(f,LH_BOLD,0,NULL);
+ if(!strcmp(tag,"i")||!strcmp(tag,"em")||!strcmp(tag,"cite")||!strcmp(tag,"dfn"))return lht_style(f,LH_ITALIC,0,NULL);
+ if(!strcmp(tag,"u"))return lht_style(f,LH_UNDERLINE,0,NULL);
+ if(!strcmp(tag,"s")||!strcmp(tag,"strike")||!strcmp(tag,"del"))return lht_style(f,LH_STRIKE,0,NULL);
+ if(!strcmp(tag,"sup"))return lht_style(f,LH_SUPER,0,NULL);
+ if(!strcmp(tag,"sub"))return lht_style(f,LH_SUB,0,NULL);
+ if(!strcmp(tag,"tt"))return lht_style(f,LH_FACE,0,"monospace");
+ if(!strcmp(tag,"a")){const char *href=lht_get(a,n,"href");return !href||lht_style(f,LH_URL,0,href);}
+ if(!strcmp(tag,"font")){uint32_t c;const char *face=lht_get(a,n,"face");
+  return (!lht_color(lht_get(a,n,"color"),flags,&c)||lht_style(f,LH_FOREGROUND,c,NULL))&&(!face||!*face||lht_style(f,LH_FACE,0,face));}
+ if(!strcmp(tag,"li"))return lht_style(f,LH_BULLET,0,NULL);
+ if(!strcmp(tag,"blockquote"))return lht_style(f,LH_QUOTE,0,NULL);
+ if(!strcmp(tag,"img"))return lht_cp(d,0xfffc,false)&&lht_style(f,LH_IMAGE,0,lht_get(a,n,"src"));
+ if(!strcmp(tag,"big")||!strcmp(tag,"small")||heading){static const float sizes[]={1.5f,1.4f,1.3f,1.2f,1.1f,1.f};float scale=heading ? sizes[tag[1]-'1']:!strcmp(tag,"big")?1.25f:.8f;uint32_t bits;memcpy(&bits,&scale,4);
+  return lht_style(f,LH_SIZE,bits,NULL)&&(!heading||lht_style(f,LH_BOLD,0,NULL));}
+ return true;
+}
+/* TagSoup repairs crossed inline end tags by restarting the inner styles. */
+static bool lht_close_to(struct lh_document *d,struct lht_frame *stack,size_t *count,size_t at,bool restart)
+{
+ struct lht_frame *saved=NULL;size_t used=0;
+ if(restart && *count>at){
+  saved=calloc(*count-at,sizeof *saved);if(!saved)return false;
+  for(size_t i=at;i<*count;++i){const struct lht_frame *f=&stack[i];
+   if(f->margin || !f->count)continue;
+   struct lht_frame *g=&saved[used++];g->tag=lht_copy(f->tag,strlen(f->tag));if(!g->tag)goto fail;
+   for(size_t k=0;k<f->count;++k)
+    if(!lht_style(g,f->styles[k].kind,f->styles[k].value,f->styles[k].text))goto fail;
+  }
+ }
+ while(*count>=at){bool good=lht_close_frame(d,&stack[*count-1]);lht_frame_free(&stack[--*count]);if(!good)goto fail;}
+ for(size_t i=0;i<used;++i){saved[i].start=(int32_t)d->length;stack[(*count)++]=saved[i];memset(&saved[i],0,sizeof saved[i]);}
+ free(saved);return true;
+fail:
+ for(size_t i=0;i<used;++i) {lht_frame_free(&saved[i]);}
+ free(saved);return false;
+}
+static bool lht_block_tag(const char *tag)
+{
+ return !strcmp(tag,"p")||!strcmp(tag,"div")||!strcmp(tag,"ul")||!strcmp(tag,"ol")||
+  !strcmp(tag,"li")||!strcmp(tag,"blockquote")||!strcmp(tag,"table")||
+  (tag[0]=='h'&&tag[1]>='1'&&tag[1]<='6'&&!tag[2]);
+}
+bool luna_html_parse(const char *source,unsigned flags,struct lh_document *d)
+{
+ memset(d,0,sizeof *d);if(!source)return false;
+ struct lht_frame *stack=NULL;size_t count=0,capacity=0;const char *p=source;bool good=true;
+ while(*p && good){
+  if(*p!='<'){const char *end=strchr(p,'<');if(!end)end=p+strlen(p);good=lht_text(d,p,(size_t)(end-p),true);p=end;continue;}
+  if(!strncmp(p,"<!--",4)){const char *end=strstr(p+4,"-->");p=end?end+3:p+strlen(p);continue;}
+  if(p[1]=='!'||p[1]=='?'){const char *end=strchr(p,'>');p=end?end+1:p+strlen(p);continue;}
+  const char *begin=p++;bool closing=*p=='/';if(closing)++p;
+  if(!isalpha((unsigned char)*p)){good=lht_cp(d,'<',true);p=begin+1;continue;}
+  const char *name=p;while(isalnum((unsigned char)*p)||*p=='-'||*p==':'||*p=='_')++p;
+  char *tag=lht_copy(name,(size_t)(p-name));if(!tag){good=false;break;}for(char *q=tag;*q;++q)*q=(char)tolower((unsigned char)*q);
+  struct lht_attr *attrs=NULL;size_t used=0,acap=0;bool empty=false;
+  while(*p && *p!='>' && good){while(isspace((unsigned char)*p))++p;if(*p=='>'||!*p)break;
+   if(*p=='/'&&p[1]=='>'){empty=true;++p;break;}
+   const char *key=p;while(*p&&!isspace((unsigned char)*p)&&*p!='='&&*p!='>')++p;
+   if(p==key){++p;continue;}char *attr=lht_copy(key,(size_t)(p-key));if(!attr){good=false;break;}
+   for(char *q=attr;*q;++q) {*q=(char)tolower((unsigned char)*q);}
+   while(isspace((unsigned char)*p))++p;
+   const char *value="";size_t len=0;
+   if(*p=='='){++p;while(isspace((unsigned char)*p))++p;
+    char quote=(*p=='\''||*p=='"')?*p++:0;value=p;
+    while(*p&&(quote?*p!=quote:!isspace((unsigned char)*p)&&*p!='>')) {++p;}
+    len=(size_t)(p-value);if(quote&&*p)++p;}
+   char *val=lht_decoded(value,len);
+   if(!val||!lht_grow((void **)&attrs,&acap,used+1,sizeof *attrs)){free(attr);free(val);good=false;break;}
+   attrs[used++]=(struct lht_attr){attr,val};
+  }
+  if(*p=='>')++p;
+  if(good&&closing){size_t at=count;while(at && strcmp(stack[at-1].tag,tag))--at;
+   if(at)good=lht_close_to(d,stack,&count,at,true);
+   else if(!strcmp(tag,"br"))good=lht_cp(d,'\n',false);
+  }else if(good){
+   /* Block starts close an open p; list items close only in the same list. */
+   if(lht_block_tag(tag)){
+    size_t at=count;
+    while(at && strcmp(stack[at-1].tag,"p"))--at;
+    if(at)good=lht_close_to(d,stack,&count,at,true);
+   }
+   if(good&&!strcmp(tag,"li")){
+    size_t at=count;
+    while(at && strcmp(stack[at-1].tag,"li")){
+     if(!strcmp(stack[at-1].tag,"ul")||!strcmp(stack[at-1].tag,"ol")){at=0;break;}--at;
+    }
+    if(at)good=lht_close_to(d,stack,&count,at,true);
+   }
+   if(!good){for(size_t i=0;i<used;++i){free(attrs[i].name);free(attrs[i].value);}free(attrs);free(tag);break;}
+   if(!strcmp(tag,"br"))good=lht_cp(d,'\n',false);
+   else {struct lht_frame f={.tag=tag};tag=NULL;good=lht_start(d,&f,attrs,used,flags);
+    bool isvoid=empty||!strcmp(f.tag,"img")||!strcmp(f.tag,"hr")||!strcmp(f.tag,"meta")||!strcmp(f.tag,"link")||!strcmp(f.tag,"input")||!strcmp(f.tag,"wbr");
+    if(good&&!isvoid){good=lht_grow((void **)&stack,&capacity,count+1,sizeof *stack);if(good){stack[count++]=f;memset(&f,0,sizeof f);}}
+    else if(good) {good=lht_close_frame(d,&f);}
+    lht_frame_free(&f);
+   }
+  }
+  for(size_t i=0;i<used;++i){free(attrs[i].name);free(attrs[i].value);}free(attrs);free(tag);
+ }
+ while(count){if(good)good=lht_close_frame(d,&stack[count-1]);lht_frame_free(&stack[--count]);}free(stack);
+ if(!good) {luna_html_document_free(d);}
+ return good;
+}
+void luna_html_document_free(struct lh_document *d)
+{free(d->text);for(size_t i=0;i<d->count;++i)free(d->spans[i].text);free(d->spans);memset(d,0,sizeof *d);}
+
+/* ---- end HTML to attributed text ---- */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1922,9 +2477,9 @@ const char* backdrop_fs =
 #define BOX_CONTENT 0
 #define BOX_BORDER  1
 
-#define MAX_GRID_TRACKS 8
-#define MAX_GRID_AREA_ROWS 8
-#define MAX_GRID_AREA_COLS 8
+#define MAX_GRID_TRACKS 32
+#define MAX_GRID_AREA_ROWS 32
+#define MAX_GRID_AREA_COLS 32
 #define MAX_GRID_AREAS   16
 
 #define GRID_TRACK_PX     0
@@ -2389,6 +2944,7 @@ typedef struct {
        to randomly let an earlier About/window rule override its later
        refinement. */
     int specificity, source_order;
+    int index_bucket;              /* immutable target key, computed at ingestion */
     int is_hover, is_active, is_focus, is_focus_visible, is_focus_within;
 
     int has_bg;     float bg_r, bg_g, bg_b, bg_a;
@@ -2759,6 +3315,7 @@ static void luna_css_variable_store(CSSStyleSheet* t, const char* name, const ch
 }
 
 static int* g_rule_order;
+static int g_rule_sorted_count;
 
 static int luna_ensure_rule_capacity(int needed) {
     if (needed <= g_rules_cap) return 1;
@@ -2915,8 +3472,8 @@ static void element_class_updated(LunaElement* e) {
 /* The bucket (kind * BUCKETS + hash) a rule is filed under, or -1 for "any". */
 static int rule_bucket_of(const SimpleSelector* t) {
     if (t->sel_id[0]) return (int)rule_hash_str(t->sel_id);
-    if (t->sel_type[0]) return (int)(LUNA_RULE_BUCKETS + rule_hash_str(t->sel_type));
     if (t->sel_class_count > 0) return (int)(2 * LUNA_RULE_BUCKETS + rule_hash_str(t->sel_classes[0]));
+    if (t->sel_type[0]) return (int)(LUNA_RULE_BUCKETS + rule_hash_str(t->sel_type));
     return -1;
 }
 
@@ -2932,7 +3489,7 @@ static void rebuild_rule_index(void) {
     memset(g_rule_bits, 0, (size_t)words * sizeof(uint64_t));
     memset(off, 0, (nb + 1) * sizeof(int));
     for (int order = 0; order < rule_count; order++) {
-        int k = rule_bucket_of(&css_rules[g_rule_order[order]].target);
+        int k = css_rules[g_rule_order[order]].index_bucket;
         if (k < 0) rule_bit_set(g_rule_any, order); else off[k + 1]++;
     }
     for (size_t i = 0; i < nb; i++) off[i + 1] += off[i];
@@ -2940,7 +3497,7 @@ static void rebuild_rule_index(void) {
     if (!fill) abort();
     memcpy(fill, off, nb * sizeof(int));
     for (int order = 0; order < rule_count; order++) {
-        int k = rule_bucket_of(&css_rules[g_rule_order[order]].target);
+        int k = css_rules[g_rule_order[order]].index_bucket;
         if (k >= 0) lists[fill[k]++] = order;
     }
     free(fill);
@@ -5534,35 +6091,57 @@ static void parse_one_grid_track(const char* tok, float* size, int* type, float*
 }
 
 static int g_grid_tracks_are_columns = 0;
-static void parse_grid_tracks(const char* val, float* sizes, int* types, float* mins, int* count) {
+static void parse_grid_tracks_depth(const char* val, float* sizes, int* types,
+                                    float* mins, int* count, int recursion) {
     const char* p = val;
     *count = 0;
+    if (recursion > 8) return;
     while (*p && *count < MAX_GRID_TRACKS) {
         while (*p && isspace((unsigned char)*p)) p++;
         if (!*p) break;
-        char tok[64] = {0};
-        int ti = 0;
-        if (strncmp(p, "minmax(", 7) == 0) {
-            int depth = 0;
-            while (*p && ti < 63) {
-                tok[ti++] = *p;
-                if (*p == '(') depth++;
-                else if (*p == ')') { depth--; if (depth == 0) { p++; break; } }
-                p++;
-            }
-        } else {
-            while (*p && !isspace((unsigned char)*p) && ti < 63) tok[ti++] = *p++;
+        const char* start = p;
+        int depth = 0;
+        do {
+            if (*p == '(') depth++;
+            else if (*p == ')' && depth) depth--;
+            p++;
+        } while (*p && (depth || !isspace((unsigned char)*p)));
+        size_t len = (size_t)(p - start);
+        if (len > 8 && !strncmp(start, "repeat(", 7) && start[len - 1] == ')') {
+            char* end;
+            long repeat = strtol(start + 7, &end, 10);
+            while (isspace((unsigned char)*end)) end++;
+            if (end == start + 7 || *end != ',' || repeat < 1) continue;
+            if (repeat > MAX_GRID_TRACKS) repeat = MAX_GRID_TRACKS;
+            const char* inner = end + 1;
+            size_t ilen = (size_t)(start + len - 1 - inner);
+            char* text = (char*)malloc(ilen + 1);
+            if (!text) return;
+            memcpy(text, inner, ilen); text[ilen] = '\0';
+            float sub_sizes[MAX_GRID_TRACKS], sub_mins[MAX_GRID_TRACKS];
+            int sub_types[MAX_GRID_TRACKS], sub_count;
+            parse_grid_tracks_depth(text, sub_sizes, sub_types, sub_mins, &sub_count, recursion + 1);
+            free(text);
+            for (long r = 0; r < repeat && *count < MAX_GRID_TRACKS; r++)
+                for (int t = 0; t < sub_count && *count < MAX_GRID_TRACKS; t++) {
+                    sizes[*count] = sub_sizes[t]; types[*count] = sub_types[t];
+                    mins[*count] = sub_mins[t]; (*count)++;
+                }
+            continue;
         }
-        tok[ti] = '\0';
+        char tok[128];
+        if (len >= sizeof(tok)) continue;
+        memcpy(tok, start, len); tok[len] = '\0';
         trim_whitespace(tok);
         parse_one_grid_track(tok, &sizes[*count], &types[*count], &mins[*count]);
-        /* A column of width `auto` takes what the fixed tracks leave (the grid's
-         * default justify-content: stretch), not an equal share of the whole. */
         if (g_grid_tracks_are_columns && strcmp(tok, "auto") == 0) {
             types[*count] = GRID_TRACK_MINMAX; sizes[*count] = 1.0f; mins[*count] = 0.0f;
         }
         (*count)++;
     }
+}
+static void parse_grid_tracks(const char* val, float* sizes, int* types, float* mins, int* count) {
+    parse_grid_tracks_depth(val, sizes, types, mins, count, 0);
 }
 
 static void parse_single_grid_track(const char* val, float* size, int* type, float* min_px) {
@@ -5645,18 +6224,33 @@ static int grid_area_lookup(LunaElement* cont, const char* name, int* gc, int* g
 }
 
 static int parse_grid_line_val(const char* val, int* span_out) {
-    char buf[64];
-    strncpy(buf, val, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s", val);
     trim_whitespace(buf);
-    if (strncmp(buf, "span ", 5) == 0) {
+    *span_out = 1;
+    char* slash = strchr(buf, '/');
+    if (slash) *slash++ = '\0';
+    trim_whitespace(buf);
+    int line = -1;
+    if (!strncmp(buf, "span ", 5)) {
         *span_out = atoi(buf + 5);
-        if (*span_out < 1) *span_out = 1;
-        return -2;
+        line = -2;
+    } else if (strcmp(buf, "auto")) {
+        int n = atoi(buf);
+        if (n > 0) line = n - 1;
     }
-    int line = atoi(buf);
-    if (line < 1) line = 1;
-    return line - 1;
+    if (slash) {
+        trim_whitespace(slash);
+        if (!strncmp(slash, "span ", 5)) *span_out = atoi(slash + 5);
+        else if (line >= 0) {
+            int end = atoi(slash);
+            if (end > line + 1) *span_out = end - line - 1;
+        }
+    }
+    if (*span_out < 1) *span_out = 1;
+    if (*span_out > MAX_GRID_TRACKS) *span_out = MAX_GRID_TRACKS;
+    if (line < 0 && *span_out > 1) return -2;
+    return line;
 }
 
 static int parse_cursor_type(const char* val) {
@@ -6510,7 +7104,47 @@ int simple_selector_matches(SimpleSelector* s, LunaElement* e) {
 /* Match ancestors[a..] against the chain above/before `node`, with
    backtracking so "A B", "A > B", "A + B" and "A ~ B" all resolve correctly.
    ancestors[] is stored nearest-first (target side first). */
+/* A full restyle visits siblings against the same ancestor selectors.
+ * Share those results within that sweep only: DOM/attribute/hover changes
+ * between sweeps must never reuse a previous answer. */
+#define LUNA_CHAIN_CACHE_SIZE 65536u
+static struct {
+    const StyleRule* rule;
+    unsigned epoch;
+    int ancestor, node, result;
+} g_chain_cache[LUNA_CHAIN_CACHE_SIZE];
+static unsigned g_chain_epoch;
+static int g_chain_cache_active;
+
+static void style_match_begin(void) {
+    if (!g_chain_cache_active++) {
+        if (!++g_chain_epoch) { memset(g_chain_cache, 0, sizeof g_chain_cache); g_chain_epoch = 1; }
+    }
+}
+static void style_match_end(void) { g_chain_cache_active--; }
+static int match_selector_chain_uncached(StyleRule* r, int a, int node);
 static int match_selector_chain(StyleRule* r, int a, int node) {
+    if (!g_chain_cache_active || a >= r->ancestor_count)
+        return match_selector_chain_uncached(r, a, node);
+    int key = -node - 1;  /* distinct namespace for unnormalised root/sibling keys */
+    int rel = r->ancestors[a].rel;
+    if ((rel == LUNA_REL_CHILD || rel == LUNA_REL_DESC) && elements[node].parent_idx >= 0)
+        key = elements[node].parent_idx;
+    uintptr_t h = ((uintptr_t)r >> 4) ^ ((uintptr_t)(unsigned)key * 2654435761u) ^ ((unsigned)a * 97531u);
+    unsigned slot = (unsigned)(h ^ (h >> 16)) & (LUNA_CHAIN_CACHE_SIZE - 1u);
+    if (g_chain_cache[slot].epoch == g_chain_epoch && g_chain_cache[slot].rule == r &&
+        g_chain_cache[slot].ancestor == a && g_chain_cache[slot].node == key)
+        return g_chain_cache[slot].result;
+    int result = match_selector_chain_uncached(r, a, node);
+    g_chain_cache[slot].rule = r;
+    g_chain_cache[slot].epoch = g_chain_epoch;
+    g_chain_cache[slot].ancestor = a;
+    g_chain_cache[slot].node = key;
+    g_chain_cache[slot].result = result;
+    return result;
+}
+
+static int match_selector_chain_uncached(StyleRule* r, int a, int node) {
     if (a >= r->ancestor_count) return 1;
     SimpleSelector* s = &r->ancestors[a];
     switch (s->rel) {
@@ -7531,14 +8165,14 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             else if (strcmp(key, "grid-column") == 0) {
                 int span = 1;
                 int col = parse_grid_line_val(val, &span);
-                if (col == -2) { rule->has_grid_column_span = 1; rule->grid_col_span = span; }
-                else { rule->has_grid_column = 1; rule->grid_col = col; rule->grid_col_span = span; }
+                rule->has_grid_column = 1; rule->grid_col = col >= 0 ? col : -1;
+                rule->has_grid_column_span = 1; rule->grid_col_span = span;
             }
             else if (strcmp(key, "grid-row") == 0) {
                 int span = 1;
                 int row = parse_grid_line_val(val, &span);
-                if (row == -2) { rule->has_grid_row_span = 1; rule->grid_row_span = span; }
-                else { rule->has_grid_row = 1; rule->grid_row = row; rule->grid_row_span = span; }
+                rule->has_grid_row = 1; rule->grid_row = row >= 0 ? row : -1;
+                rule->has_grid_row_span = 1; rule->grid_row_span = span;
             }
             else if (strcmp(key, "grid-area") == 0) {
                 rule->has_grid_area = 1;
@@ -8246,8 +8880,29 @@ static int cmp_rule_order(const void* a, const void* b) {
 }
 
 static void rebuild_rule_order(void) {
-    for (int i = 0; i < rule_count; i++) g_rule_order[i] = i;
-    qsort(g_rule_order, (size_t)rule_count, sizeof(g_rule_order[0]), cmp_rule_order);
+    int old = g_rule_sorted_count;
+    if (old > rule_count) old = 0;
+    int added = rule_count - old;
+    if (!added) return;
+    for (int i = old; i < rule_count; i++) g_rule_order[i] = i;
+    qsort(g_rule_order + old, (size_t)added, sizeof(g_rule_order[0]), cmp_rule_order);
+    /* Sheets append rules: merge the new sorted suffix with the existing
+       cascade instead of sorting the entire document for every <link>. */
+    if (old) {
+        int* tail = (int*)malloc((size_t)added * sizeof(int));
+        if (tail) {
+            memcpy(tail, g_rule_order + old, (size_t)added * sizeof(int));
+            int a = old - 1, b = added - 1, dst = rule_count - 1;
+            while (a >= 0 && b >= 0) {
+                if (cmp_rule_order(&g_rule_order[a], &tail[b]) > 0)
+                    g_rule_order[dst--] = g_rule_order[a--];
+                else g_rule_order[dst--] = tail[b--];
+            }
+            while (b >= 0) g_rule_order[dst--] = tail[b--];
+            free(tail);
+        } else qsort(g_rule_order, (size_t)rule_count, sizeof(g_rule_order[0]), cmp_rule_order);
+    }
+    g_rule_sorted_count = rule_count;
 }
 
 /* ── Build a StyleRule from one parsed CSSRule ──────────────────────── */
@@ -8639,6 +9294,7 @@ static void ingest_parsed_rule(const CSSRule *pr) {
             if (selector_is_structural(&rule.ancestors[a])) g_has_structural_selectors = 1;
 
         rule.source_order = rule_count;
+        rule.index_bucket = rule_bucket_of(&rule.target);
         if (!luna_ensure_rule_capacity(rule_count + 1)) return;
         if (rule.custom_props) g_custom_prop_rules++;
         css_rules[rule_count] = rule;
@@ -9528,8 +10184,8 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
         e->grid_auto_col_type = r->grid_auto_col_type;
         e->grid_auto_col_min = r->grid_auto_col_min;
     }
-    if (r->has_grid_column) { e->has_grid_col = 1; e->grid_col = r->grid_col; }
-    if (r->has_grid_row) { e->has_grid_row = 1; e->grid_row = r->grid_row; }
+    if (r->has_grid_column) { e->has_grid_col = r->grid_col >= 0; e->grid_col = r->grid_col; }
+    if (r->has_grid_row) { e->has_grid_row = r->grid_row >= 0; e->grid_row = r->grid_row; }
     if (r->has_grid_column_span) e->grid_col_span = r->grid_col_span;
     if (r->has_grid_row_span) e->grid_row_span = r->grid_row_span;
     if (r->has_grid_area) {
@@ -9822,6 +10478,36 @@ static void luna_apply_hints(LunaElement* e, int* am) {
 static GLuint load_or_get_texture(const char* path);
 static int tex_cache_dims(GLuint tex, int* out_w, int* out_h);
 
+static void update_image_intrinsics(LunaElement* e) {
+    /* An image with no size of its own is as big as the picture; with one
+     * dimension it keeps the picture's proportions.  A decoded picture
+     * replaces the alt text. */
+    if (g_luna_web_compat && !strcmp(e->type, "img") && e->has_bg_image && e->bg_image_path[0]) {
+        int nw = 0, nh = 0;
+        GLuint tex = load_or_get_texture(e->bg_image_path);
+        if (tex && tex_cache_dims(tex, &nw, &nh) && nw > 0 && nh > 0) {
+            e->text[0] = '\0';
+            if (e->pct_w && !e->has_css_height && !e->pct_h) {
+                /* width: 50% / 100% with auto height keeps the picture's proportions */
+                if (!e->has_aspect_ratio) { e->has_aspect_ratio = 1; e->aspect_ratio = (float)nw / (float)nh; }
+            } else if (!e->has_css_width && !e->has_css_height) {
+                e->css_width = (float)nw; e->css_height = (float)nh;
+                e->has_css_width = e->has_css_height = 1;
+            } else if (e->has_css_width && !e->pct_w && !e->has_css_height) {
+                e->css_height = e->css_width * (float)nh / (float)nw; e->has_css_height = 1;
+            } else if (e->has_css_height && !e->pct_h && !e->has_css_width) {
+                e->css_width = e->css_height * (float)nw / (float)nh; e->has_css_width = 1;
+            }
+            if (e->has_css_width && !e->pct_w && e->has_max_width && !e->max_width_pct &&
+                e->css_width > e->css_max_width && e->css_max_width > 0 && e->has_css_height && !e->pct_h) {
+                e->css_height *= e->css_max_width / e->css_width;
+                e->css_width = e->css_max_width;
+            }
+        }
+    }
+
+}
+
 /* <button>, and <input type=submit|button|reset>, which carry their label in
  * `text`: the label is centred in the box. */
 static int el_is_button_like(const LunaElement* e) {
@@ -10102,6 +10788,13 @@ void update_element_style(LunaElement* e) {
     if (!g_rule_index_ready) rebuild_rule_index();
     LUNA_SCRATCH(uint64_t, rule_candidates, g_rule_words);
     build_rule_candidates(e, rule_candidates);
+    /* Both custom-property collection and the declaration cascade need the
+       same selectors. Match once, retaining cascade order in the bit set. */
+    for (int order = rule_candidate_next(rule_candidates, -1); order >= 0;
+         order = rule_candidate_next(rule_candidates, order)) {
+        if (!style_rule_applies(&css_rules[g_rule_order[order]], e))
+            rule_candidates[(unsigned)order >> 6] &= ~(UINT64_C(1) << ((unsigned)order & 63u));
+    }
 
     /* Custom properties first: every var() below sees the element's final
      * values, whichever rule declared them. */
@@ -10116,7 +10809,7 @@ void update_element_style(LunaElement* e) {
                  order >= 0;
                  order = rule_candidate_next(rule_candidates, order)) {
                 StyleRule* r = &css_rules[g_rule_order[order]];
-                if (!r->custom_props || !style_rule_applies(r, e)) continue;
+                if (!r->custom_props) continue;
                 css_vars_append(&raw, &rn, r->custom_props, strlen(r->custom_props));
             }
         /* Application values act like style="" on the root: they beat the
@@ -10182,7 +10875,6 @@ void update_element_style(LunaElement* e) {
          order >= 0;
          order = rule_candidate_next(rule_candidates, order)) {
         StyleRule* r = &css_rules[g_rule_order[order]];
-        if (!style_rule_applies(r, e)) continue;
         apply_style_rule(e, r, am);
         if (r->var_decls) apply_var_decls(e, r->var_decls, am);
     }
@@ -10204,32 +10896,7 @@ void update_element_style(LunaElement* e) {
         }
     }
 
-    /* An image with no size of its own is as big as the picture; with one
-     * dimension it keeps the picture's proportions.  A decoded picture
-     * replaces the alt text. */
-    if (g_luna_web_compat && !strcmp(e->type, "img") && e->has_bg_image && e->bg_image_path[0]) {
-        int nw = 0, nh = 0;
-        GLuint tex = load_or_get_texture(e->bg_image_path);
-        if (tex && tex_cache_dims(tex, &nw, &nh) && nw > 0 && nh > 0) {
-            e->text[0] = '\0';
-            if (e->pct_w && !e->has_css_height && !e->pct_h) {
-                /* width: 50% / 100% with auto height keeps the picture's proportions */
-                if (!e->has_aspect_ratio) { e->has_aspect_ratio = 1; e->aspect_ratio = (float)nw / (float)nh; }
-            } else if (!e->has_css_width && !e->has_css_height) {
-                e->css_width = (float)nw; e->css_height = (float)nh;
-                e->has_css_width = e->has_css_height = 1;
-            } else if (e->has_css_width && !e->pct_w && !e->has_css_height) {
-                e->css_height = e->css_width * (float)nh / (float)nw; e->has_css_height = 1;
-            } else if (e->has_css_height && !e->pct_h && !e->has_css_width) {
-                e->css_width = e->css_height * (float)nw / (float)nh; e->has_css_width = 1;
-            }
-            if (e->has_css_width && !e->pct_w && e->has_max_width && !e->max_width_pct &&
-                e->css_width > e->css_max_width && e->css_max_width > 0 && e->has_css_height && !e->pct_h) {
-                e->css_height *= e->css_max_width / e->css_width;
-                e->css_width = e->css_max_width;
-            }
-        }
-    }
+    update_image_intrinsics(e);
 
     /* UA em margins compute from the final font size after the author cascade,
      * not the inherited size that was present when defaults were seeded. */
@@ -10613,13 +11280,8 @@ static void decode_html_entities(char* s) {
             int hex = (n[1] == 'x' || n[1] == 'X');
             cp = (int)strtol(n + (hex ? 2 : 1), &end, hex ? 16 : 10);
             if (end != semi || cp <= 0 || cp > 0x10ffff) { *w++ = *r++; continue; }
-        } else if ((semi - n) == 3 && strncmp(n, "amp", 3) == 0) cp = '&';
-        else if ((semi - n) == 2 && strncmp(n, "lt", 2) == 0) cp = '<';
-        else if ((semi - n) == 2 && strncmp(n, "gt", 2) == 0) cp = '>';
-        else if ((semi - n) == 4 && strncmp(n, "quot", 4) == 0) cp = '"';
-        else if ((semi - n) == 4 && strncmp(n, "apos", 4) == 0) cp = '\'';
-        else if ((semi - n) == 4 && strncmp(n, "nbsp", 4) == 0) cp = 0xA0;
-        else { *w++ = *r++; continue; }
+        } else cp = (int)luna_html_named_entity(n, (size_t)(semi - n));
+        if (!cp || (cp >= 0xd800 && cp <= 0xdfff)) { *w++ = *r++; continue; }
         w += utf8_encode(cp, w);
         r = semi + 1;
     }
@@ -10895,7 +11557,10 @@ static void parse_html_markup(const char* html, int root_parent) {
         if (luna_strcasecmp(type, "title") == 0) {
             const char* text_start = tag_end + 1;
             const char* close_title = luna_strcasestr_local(text_start, "</title>");
-            if (close_title && close_title > text_start) {
+            int svg_title = 0;
+            for (int a = current_parent; a >= 0; a = elements[a].parent_idx)
+                if (!strcmp(elements[a].type, "svg")) { svg_title = 1; break; }
+            if (!svg_title && close_title && close_title > text_start) {
                 int tlen = (int)(close_title - text_start);
                 if (tlen > (int)sizeof(g_doc_title) - 1) tlen = (int)sizeof(g_doc_title) - 1;
                 strncpy(g_doc_title, text_start, (size_t)tlen);
@@ -12068,7 +12733,10 @@ static float intrinsic_content_width(LunaElement* e) {
         LunaElement* ch = &elements[c];
         if (!is_visible(c)) continue;
         if (ch->position_mode == POS_ABSOLUTE || ch->position_fixed) continue;
-        float cw = ch->pct_w ? 0.0f : intrinsic_content_width(ch);
+        /* A cyclic percentage is auto during intrinsic measurement. Its
+           descendants still contribute max-content width: zeroing it makes
+           centered column flex items collapse around width:100% children. */
+        float cw = intrinsic_content_width(ch);
         if (ch->has_min_width && cw < ch->css_min_width) cw = ch->css_min_width;
         /* A percentage max-width is indefinite during intrinsic sizing.  It
            is resolved later by the containing flex/block formatting context. */
@@ -14297,6 +14965,9 @@ static void sync_css_overlay_elements(void) {
     if (a11y == -1 && elem_count < MAX_ELEMENTS &&
         luna_ensure_element_capacity(elem_count + 1)) {
         a11y = elem_count++;
+        /* Paint and hit testing share this permutation of the DOM. Without
+         * rebuilding it, the zero-filled new slot repeats element 0 last. */
+        g_render_order_dirty = 1;
         memset(&elements[a11y], 0, sizeof(LunaElement));
         elements[a11y].tabindex = -2;
         elements[a11y].aria_expanded = -1;
@@ -19740,6 +20411,19 @@ void luna_mark_visual_dirty(int i) {
     visual_activate_idx(i);
 }
 void luna_update_element_style(int i) { g_probe_prepared = 0; if (i >= 0 && i < elem_count) (void)restyle_element_checked(&elements[i]); }
+void luna_image_arrived(int i) {
+    if (i < 0 || i >= elem_count) return;
+    LunaElement* e = &elements[i];
+    LunaElement before = *e;
+    update_image_intrinsics(e);
+    if (layout_style_changed(&before, e) || strcmp(before.text, e->text)) {
+        LUNA_AUX_ZERO(g_intrinsic_width_valid);
+        LUNA_AUX_ZERO(g_min_content_width_valid);
+        LUNA_LAYOUT_DIRTY();
+    }
+    g_probe_prepared = 0;
+}
+
 void luna_register_js_handler(const char* n, LunaEventHandler fn) { register_js_handler(n, fn); }
 void luna_set_on_click(int i, LunaEventHandler fn) { set_on_click(i, fn); }
 void luna_set_flex_order(int i, int order) {
@@ -19756,7 +20440,9 @@ int luna_load_css_file(const char* p) {
     parse_css(s);
     free(s);
     if (elem_count > 0 && (rule_count != old_rules || g_keyframe_count != old_keyframes)) {
+        style_match_begin();
         for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
+        style_match_end();
         generate_pseudo_elements();
         LUNA_AUX_ZERO(g_intrinsic_width_valid);
         LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
@@ -19771,6 +20457,7 @@ void luna_reset_css(void) {
     css_rules = NULL;
     g_rules_cap = 0;
     rule_count = 0;
+    g_rule_sorted_count = 0;
     g_keyframe_count = 0;
     g_css_from_document = 0;
     g_rule_index_ready = 0;
@@ -19782,6 +20469,12 @@ void luna_reset_css(void) {
 void luna_set_preserve_backdrop(int enabled) { g_preserve_backdrop = enabled ? 1 : 0; }
 
 void luna_reset_document(void) {
+    /* Texture keys include relative paths. They belong to this document's
+       base URL; retaining them would display another page's image and grow
+       GPU memory without bound across navigations. */
+    for (int i = 0; i < g_tex_count; i++)
+        if (g_tex_cache[i].tex) glDeleteTextures(1, &g_tex_cache[i].tex);
+    g_tex_count = 0;
     g_dom_struct_ver++;
     g_document_scroll_x = g_document_scroll_y = 0.0f;
     g_document_width = window_width;
@@ -19811,6 +20504,15 @@ void luna_reset_document(void) {
     /* Everything below is an index into elements[] or a cache keyed by one.
        Leaving any of it behind points at an element that no longer exists. */
     g_focused_element_idx = -1;
+    g_focused_idx = -1;
+    input_hist_reset();
+    drag_target_idx = -1;
+    g_scroll_drag_idx = g_scroll_hover_idx = -1;
+    g_scroll_hover_axis = -1;
+    g_input_drag_idx = -1;
+    g_click_idx = -1; g_click_n = 0;
+    memset(g_touch_slots, 0, sizeof g_touch_slots);
+    g_touch_active_count = 0;
     g_focus_trap_count = 0;
     g_drag_mode = 0;
     g_drag_moved = 0;
@@ -20026,6 +20728,7 @@ void luna_dom_flush_restyle(void) {
     if (!g_restyle_pending && !g_pseudo_pending) return;
     int full = g_restyle_pending;
     g_restyle_pending = 0; g_pseudo_pending = 0;
+    style_match_begin();
     if (full)
         for (int i = 0; i < elem_count; i++) {
             LunaElement* e = &elements[i];
@@ -20037,6 +20740,7 @@ void luna_dom_flush_restyle(void) {
                 e->cur_bd_b = e->bd_b; e->cur_bd_a = e->bd_a;
             }
         }
+    style_match_end();
     generate_pseudo_elements();
     LUNA_AUX_ZERO(g_intrinsic_width_valid);
     LUNA_LAYOUT_DIRTY();
@@ -20352,8 +21056,15 @@ void luna_parse_css(const char* c) {
     int old_rules = rule_count, old_keyframes = g_keyframe_count;
     parse_css(c);
     if (elem_count > 0 && (rule_count != old_rules || g_keyframe_count != old_keyframes)) {
-        for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
-        generate_pseudo_elements();
+        if (g_restyle_deferred) {
+            /* Stylesheets arriving in one event-loop turn share one restyle.
+               Geometry reads flush it before returning computed dimensions. */
+            if (!g_restyle_pending) g_restyle_pending = 1;
+            g_pseudo_pending = 1;
+        } else {
+            for (int i = 0; i < elem_count; i++) update_element_style(&elements[i]);
+            generate_pseudo_elements();
+        }
         LUNA_AUX_ZERO(g_intrinsic_width_valid);
         LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
     }
@@ -21780,6 +22491,7 @@ void luna_shutdown(void) {
     free(elements); elements = NULL; g_elements_cap = 0; elem_count = 0;
     free(css_rules); css_rules = NULL; g_rules_cap = 0; rule_count = 0;
     free(g_rule_order); g_rule_order = NULL;
+    g_rule_sorted_count = 0;
     for (int i = 0; i < g_tex_count; ++i)
         if (g_tex_cache[i].tex) glDeleteTextures(1, &g_tex_cache[i].tex);
     g_tex_count = 0;

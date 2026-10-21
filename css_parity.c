@@ -526,6 +526,31 @@ static void test_calc_viewport_length(void) {
     check_near(offset, -36.0f, 0.001f, "calc vh pixel offset is retained");
 }
 
+static void test_overlay_render_order(void) {
+    luna_reset_document();luna_reset_css();
+    g_a11y_live_until=0;g_a11y_live_msg[0]=0;g_focus_via_keyboard=0;
+    luna_window_width=960;luna_window_height=680;
+    luna_parse_css("body{margin:0;overflow:hidden;}button{position:absolute;left:152px;top:234px;width:552px;height:40px;}.hidden{display:none;}");
+    luna_parse_html("<body><button id='query'>Search</button></body>");
+    luna_ensure_element_capacity(elem_count+1);
+    build_render_order();
+    /* Spare slots on a fresh allocation are zero-filled; an earlier test's
+     * identity permutation must not accidentally mask the missing rebuild. */
+    render_order[elem_count]=0;
+    /* Input can build the order before the first layout creates overlays. */
+    update_layout_pass();
+    build_render_order();
+    int seen_root=0,seen_overlay=0,overlay=get_element_by_id("luna_a11y_bar");
+    for (int i=0;i<elem_count;++i) {
+        if (render_order[i]==0) ++seen_root;
+        if (render_order[i]==overlay) ++seen_overlay;
+    }
+    check_true(overlay>=0 && seen_root==1 && seen_overlay==1,
+               "appended accessibility overlay invalidates the complete paint/hit order");
+    check_true(luna_element_at_point(240,252)==get_element_by_id("query"),
+               "appending an accessibility overlay leaves underlying controls clickable");
+}
+
 int main(void) {
     test_example_layout();
     test_gradient_geometry_and_color();
@@ -544,6 +569,7 @@ int main(void) {
     test_hover_preserves_inherited_icon_face();
     test_wrapping_flex_overflow_scroll();
     test_calc_viewport_length();
+    test_overlay_render_order();
     if (failures) {
         fprintf(stderr, "%d CSS parity check(s) failed\n", failures);
         return 1;
