@@ -91,6 +91,16 @@ typedef float GLfloat;
 typedef ptrdiff_t GLsizeiptr;
 typedef ptrdiff_t GLintptr;
 typedef char GLchar;
+#elif defined(GL_VERSION_1_1) && !defined(GL_ES_VERSION_2_0)
+/* The Windows SDK / MinGW <GL/gl.h> stops at OpenGL 1.1 and has no glext.h
+ * on MSVC: supply the newer scalar types the loader typedefs below use. */
+#  if !defined(GL_VERSION_1_5)
+typedef ptrdiff_t GLsizeiptr;
+typedef ptrdiff_t GLintptr;
+#  endif
+#  if !defined(GL_VERSION_2_0)
+typedef char GLchar;
+#  endif
 #endif
 
 /* Constants missing from the legacy Windows OpenGL 1.1 header. */
@@ -446,6 +456,22 @@ typedef struct LunaInitConfig {
 
 /* Implemented by the automatically selected luna_*.h native host. */
 int   luna_app_run(const LunaAppConfig* cfg);
+/*
+ * Optional, implemented by the application: the one config every host can
+ * find.  Hosts that own the process entry point (Android NativeActivity has
+ * no main()) call it when the application defines it, so a portable app
+ * writes
+ *
+ *   LunaAppConfig luna_app_config(void) { ... }
+ *   #ifndef __ANDROID__
+ *   int main(void) { LunaAppConfig c = luna_app_config(); return luna_app_run(&c); }
+ *   #endif
+ *
+ * and needs no per-platform implementation unit: the implementation can be
+ * compiled straight from this header (cc -x c -DLUNA_UI_IMPLEMENTATION -c
+ * luna-ui.h; -x objective-c on Apple).
+ */
+LunaAppConfig luna_app_config(void);
 void  luna_app_quit(void);
 void  luna_app_request_redraw(void);
 void* luna_app_native_handle(void);
@@ -869,7 +895,8 @@ void luna_focus_element(int idx);
 void luna_set_text(int idx, const char* text);
 /* Drop a cached GL texture so the next paint reloads it from disk. */
 void luna_invalidate_texture(const char* path);
-/* Presenting thread only. RGBA rows are bottom-up, like decoded textures. */
+/* Presenting thread only. RGBA rows are bottom-up, like decoded textures.  Elements whose
+ * background-image is `key` pick the new pixels up and count as damaged on the next paint. */
 int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char* pixels);
 /* Set or clear element background-image via inline style (empty path clears). */
 void luna_set_background_image(int idx, const char* path);
@@ -1679,7 +1706,14 @@ static void* luna_scratch_alloc(size_t n) {
     LUNA_SCRATCH(T, name, count); memset(name, 0, sizeof(T) * (size_t)(count))
 
 static LunaPlatform g_luna_platform;
+/* GLES 3 / WebGL 2 hosts (web, Android, iOS) define LUNA_UI_GLES3 in their
+ * prelude; without it the shaders would get "#version 330 core" and fail to
+ * compile there.  luna_set_gles3() still overrides at runtime. */
+#if defined(LUNA_UI_GLES3)
+static int g_luna_gles3 = 1;
+#else
 static int g_luna_gles3;
+#endif
 static double g_luna_mx = 0.0, g_luna_my = 0.0;
 static int g_luna_shift = 0;
 static int g_luna_fbw = 0, g_luna_fbh = 0;
@@ -2444,6 +2478,9 @@ const char* backdrop_fs =
 #define FLEX_ALIGN_CENTER  1
 #define FLEX_ALIGN_END     2
 #define FLEX_ALIGN_STRETCH 3
+/* transition-property groups the visual interpolator can ease */
+#define LUNA_TRV_COLOR     1u   /* background, border and text colours, alpha */
+#define LUNA_TRV_TRANSFORM 2u   /* scale / translate */
 #define FLEX_ALIGN_SPACE_BETWEEN 4
 #define FLEX_ALIGN_SPACE_AROUND  5
 
@@ -2776,6 +2813,7 @@ struct LunaElement {
     int transform_tx_pct, transform_ty_pct;
     float cur_tx, cur_ty;
     float anim_speed;
+    unsigned anim_mask;     /* LUNA_TRV_*: which visuals a CSS transition eases (0 = all) */
     int pointer_events_none;
 
     int has_custom_bg, has_custom_color, has_custom_text, has_custom_border;
@@ -2831,6 +2869,7 @@ struct LunaElement {
     int mask_tint;                  /* mask-image: the picture is a shape painted in the background colour */
     int svg_src;                    /* inline <svg>: 1-based index of its markup (g_svg_src), drawn as a picture */
     GLuint bg_image_tex;
+    unsigned bg_image_rev;          /* bumped when luna_update_texture_rgba() rewrites the picture in place */
 
     /* CSS border-image (stretch): the image cut by `slice` into nine and
      * drawn into the border box with edges `width` wide. */
@@ -3095,7 +3134,7 @@ typedef struct {
     LunaBgLayer* bg_layers;
     int bg_layer_count;
 
-    /* backdrop-filter */
+    /* backdrop-filter (-1 = "none": cancels a blur from an earlier rule) */
     int has_backdrop_blur;
     float backdrop_blur_radius;
     float backdrop_saturate;
@@ -3118,6 +3157,7 @@ typedef struct {
     int transform_tx_pct, transform_ty_pct;
     int has_transition; float transition_duration;
     int transition_visual; /* background/border/transform/filter or `all` */
+    unsigned transition_mask; /* LUNA_TRV_* named by transition-property */
     int has_pointer_events; int pointer_events_none;
 
     int has_animation;
@@ -8392,6 +8432,17 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 if (sec > 0.0f) {
                     rule->has_transition = 1;
                     rule->transition_duration = sec;
+                    /* Only the named properties ease.  One shared rate for
+                       every visual made `transition: transform` also fade
+                       background and border colours, so a card losing
+                       .focus kept its highlight while the next card gained
+                       one, and a row of cards looked selected at once. */
+                    unsigned m = 0;
+                    if (strcmp(key, "transition-duration") == 0 || strstr(val, "all")) m = LUNA_TRV_COLOR | LUNA_TRV_TRANSFORM;
+                    if (strstr(val, "background") || strstr(val, "color") || strstr(val, "border") ||
+                        strstr(val, "filter")) m |= LUNA_TRV_COLOR;
+                    if (strstr(val, "transform") || strstr(val, "scale") || strstr(val, "translate")) m |= LUNA_TRV_TRANSFORM;
+                    rule->transition_mask = m;
                     /* The current fast interpolator owns paint colours and
                        transforms, not CSS `opacity` (keyframes own that field).
                        Do not let `transition:opacity` accidentally animate an
@@ -8808,6 +8859,7 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                  * the final backdrop sample costs no additional render pass. */
                 rule->backdrop_saturate = 1.0f;
                 rule->backdrop_brightness = 1.0f;
+                if (strcmp(val, "none") == 0) rule->has_backdrop_blur = -1;
                 const char* bp = strstr(val, "blur(");
                 if (bp) {
                     bp += 5;
@@ -9896,7 +9948,8 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
                 e->bg_layers[li] = r->bg_layers[li];
         }
     }
-    if (r->has_backdrop_blur) {
+    if (r->has_backdrop_blur < 0) e->has_backdrop_blur = 0;
+    else if (r->has_backdrop_blur) {
         e->has_backdrop_blur = 1;
         e->backdrop_blur_radius = r->backdrop_blur_radius;
         e->backdrop_saturate = r->backdrop_saturate;
@@ -10250,8 +10303,12 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
             e->transform_ty = e->raw_transform_ty * e->h;
     }
     if (r->has_transform_rotate) e->transform_rotate = r->transform_rotate;
-    if (r->has_transition && r->transition_visual)
-        e->anim_speed = 1.0f / r->transition_duration;
+    if (r->has_transition && r->transition_visual) {
+        /* exp(-4) ~ 2%: the transition has visibly landed at its duration
+         * (1/duration left a 0.1 s hover still 5% short after 0.3 s). */
+        e->anim_speed = 4.0f / r->transition_duration;
+        e->anim_mask = r->transition_mask;
+    }
     if (r->has_animation && r->anim_name[0]) {
         e->has_css_animation = 1;
         /* Both fields have the same fixed width. Copying the complete
@@ -10742,6 +10799,7 @@ void update_element_style(LunaElement* e) {
        styled background/border in from parser defaults, which both differed
        from browsers and kept otherwise static documents repainting. */
     e->anim_speed = 0.0f;
+    e->anim_mask = 0;
     e->pointer_events_none = 0;
     e->pct_w = 0; e->pct_h = 0; e->pct_left = 0; e->pct_top = 0;
     e->pct_bottom = 0; e->pct_right = 0;
@@ -11197,25 +11255,16 @@ static void resolve_resource_path(const char* href, char* out, size_t outsz) {
         snprintf(out, outsz, "%s", href);
 }
 
-static int tag_attr_equals(const char* tag_buf, const char* key, const char* val) {
-    char pattern[64];
-    snprintf(pattern, sizeof(pattern), "%s=\"", key);
-    const char* a = strstr(tag_buf, pattern);
-    if (!a) return 0;
-    char got[64] = {0};
-    sscanf(a + (int)strlen(pattern), "%63[^\"]", got);
-    return luna_strcasecmp(got, val) == 0;
-}
-
 static int tag_is_stylesheet_link(const char* tag_buf) {
-    if (!tag_attr_equals(tag_buf, "rel", "stylesheet")) {
-        const char* rel = strstr(tag_buf, "rel=\"");
-        if (!rel) return 0;
-        char rval[32] = {0};
-        sscanf(rel + 5, "%31[^\"]", rval);
-        return luna_strcasestr_local(rval, "stylesheet") != NULL;
+    char rel[256];
+    if (!extract_html_attr(tag_buf, "rel", rel, sizeof(rel))) return 0;
+    for (const char* p = rel; *p; ) {
+        while (isspace((unsigned char)*p)) p++;
+        const char* word = p;
+        while (*p && !isspace((unsigned char)*p)) p++;
+        if (p - word == 10 && !luna_strncasecmp(word, "stylesheet", 10)) return 1;
     }
-    return 1;
+    return 0;
 }
 
 static void load_stylesheet_href(const char* href) {
@@ -11943,10 +11992,13 @@ static float resolved_max_height(const LunaElement* e, float containing_height) 
  * without depending on it — that helper is defined later and calls us. */
 static float flow_row_item_main(const LunaElement* ch) {
     float size;
+    /* flex-basis and width name the box-sizing box; lines pack border boxes.
+     * Taking a content-box width as the outer size fitted one card too many
+     * per line, so the measured height came up a row short. */
     if (ch->has_flex_basis && !ch->flex_basis_auto)
-        size = ch->flex_basis;
+        size = css_outer_width(ch, ch->flex_basis);
     else if (ch->has_css_width && !ch->pct_w)
-        size = ch->css_width;
+        size = css_outer_width(ch, ch->css_width);
     else if (ch->w > 0.0f)
         size = ch->w;
     else
@@ -12613,7 +12665,26 @@ static float flow_content_height(LunaElement* e) {
              * one-row height while wrapping painted additional rows over the
              * wallpaper / cursor sections of the Appearance panel. */
             float avail = 0.0f;
-            if (e->pct_w && e->parent_idx >= 0 && e->parent_idx < elem_count) {
+            int fills_parent = 0;
+            if (!e->has_css_width && !e->pct_w && e->parent_idx >= 0 && e->parent_idx < elem_count) {
+                /* An auto-width box fills its parent's content box in block
+                 * flow and as a stretched item of a column flex.  e->w is
+                 * not settled yet while that parent measures it: packing
+                 * lines against it reported fewer rows than were painted,
+                 * and the next sibling was laid out over the extra rows. */
+                const LunaElement* par = &elements[e->parent_idx];
+                if (par->display_mode == DISPLAY_BLOCK) fills_parent = 1;
+                else if (par->display_mode == DISPLAY_FLEX && par->flex_direction == FLEX_DIR_COLUMN) {
+                    int al = e->align_self != ALIGN_SELF_AUTO ? e->align_self : par->align_items;
+                    fills_parent = al == FLEX_ALIGN_STRETCH;
+                }
+            }
+            if (fills_parent) {
+                const LunaElement* par = &elements[e->parent_idx];
+                avail = par->w - par->pad_l - par->pad_r - par->border_width * 2.0f
+                      - e->margin_left - e->margin_right
+                      - e->pad_l - e->pad_r - e->border_width * 2.0f;
+            } else if (e->pct_w && e->parent_idx >= 0 && e->parent_idx < elem_count) {
                 /* Percentage width must be resolved against the parent's
                  * current width — e->w may still hold a pre-stretch stale
                  * value when a column parent is measuring this child. */
@@ -14624,11 +14695,11 @@ void update_layout_pass(void) {
         LunaElement* e = &elements[i];
         if (e->transform_tx_pct) {
             e->transform_tx = e->raw_transform_tx * e->w;
-            if (e->anim_speed <= 0.0f) e->cur_tx = e->transform_tx;
+            if (e->anim_speed <= 0.0f || (e->anim_mask && !(e->anim_mask & LUNA_TRV_TRANSFORM))) e->cur_tx = e->transform_tx;
         }
         if (e->transform_ty_pct) {
             e->transform_ty = e->raw_transform_ty * e->h;
-            if (e->anim_speed <= 0.0f) e->cur_ty = e->transform_ty;
+            if (e->anim_speed <= 0.0f || (e->anim_mask && !(e->anim_mask & LUNA_TRV_TRANSFORM))) e->cur_ty = e->transform_ty;
         }
     }
     sync_css_overlay_elements();
@@ -15735,7 +15806,7 @@ static uint64_t damage_hash_element(int idx) {
     MIX_U64(e->display_none); MIX_U64(e->font_bold); MIX_U64(e->font_face);
     MIX_U64(e->text_align); MIX_U64(e->has_shadow); MIX_U64(e->shadow_count);
     MIX_U64(e->has_gradient); MIX_U64(e->grad_type); MIX_U64(e->grad_stop_count);
-    MIX_U64(e->has_backdrop_blur); MIX_U64(e->has_bg_image); MIX_U64(e->bg_image_tex);
+    MIX_U64(e->has_backdrop_blur); MIX_U64(e->has_bg_image); MIX_U64(e->bg_image_tex); MIX_U64(e->bg_image_rev);
     MIX_U64(e->has_outline); MIX_U64(e->overflow_x); MIX_U64(e->overflow_y);
     MIX_U64(e->is_hovered); MIX_U64(e->is_active); MIX_U64(e->text_decoration);
     MIX_F32(e->backdrop_blur_radius); MIX_F32(e->backdrop_saturate); MIX_F32(e->backdrop_brightness);
@@ -15957,17 +16028,21 @@ static int update_animations_internal(double dt, const int* roots, int nroots,
                 if (factor > 1.0f) factor = 1.0f;
                 if (factor < 0.0f) factor = 0.0f;
             }
-            e->cur_r += (e->r - e->cur_r) * factor;
-            e->cur_g += (e->g - e->cur_g) * factor;
-            e->cur_b += (e->b - e->cur_b) * factor;
-            e->cur_a += (target_a - e->cur_a) * factor;
-            e->cur_bd_r += (e->bd_r - e->cur_bd_r) * factor;
-            e->cur_bd_g += (e->bd_g - e->cur_bd_g) * factor;
-            e->cur_bd_b += (e->bd_b - e->cur_bd_b) * factor;
-            e->cur_bd_a += (e->bd_a - e->cur_bd_a) * factor;
-            e->cur_scale += (target_scale - e->cur_scale) * factor;
-            e->cur_tx += (e->transform_tx - e->cur_tx) * factor;
-            e->cur_ty += (e->transform_ty - e->cur_ty) * factor;
+            /* Properties the transition does not name snap to the style. */
+            unsigned tm = e->anim_mask ? e->anim_mask : (LUNA_TRV_COLOR | LUNA_TRV_TRANSFORM);
+            float fc = (tm & LUNA_TRV_COLOR) ? factor : 1.0f;
+            float ft = (tm & LUNA_TRV_TRANSFORM) ? factor : 1.0f;
+            e->cur_r += (e->r - e->cur_r) * fc;
+            e->cur_g += (e->g - e->cur_g) * fc;
+            e->cur_b += (e->b - e->cur_b) * fc;
+            e->cur_a += (target_a - e->cur_a) * fc;
+            e->cur_bd_r += (e->bd_r - e->cur_bd_r) * fc;
+            e->cur_bd_g += (e->bd_g - e->cur_bd_g) * fc;
+            e->cur_bd_b += (e->bd_b - e->cur_bd_b) * fc;
+            e->cur_bd_a += (e->bd_a - e->cur_bd_a) * fc;
+            e->cur_scale += (target_scale - e->cur_scale) * ft;
+            e->cur_tx += (e->transform_tx - e->cur_tx) * ft;
+            e->cur_ty += (e->transform_ty - e->cur_ty) * ft;
 
             if (anim_near(e->cur_r, e->r)) e->cur_r = e->r;
             if (anim_near(e->cur_g, e->g)) e->cur_g = e->g;
@@ -18452,6 +18527,16 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
             e->is_active = 1;
             (void)restyle_element_checked(e);
             restyle_descendants_of(hit);
+            /* Clicks bubble: pressing a card's icon or label must activate the
+             * card that owns the onclick, as in a browser.  Only the topmost
+             * element was armed before, so clicks on children were lost. */
+            for (int a = e->parent_idx; !e->on_click && a != -1; a = elements[a].parent_idx) {
+                if (!elements[a].on_click) continue;
+                elements[a].is_active = 1;
+                (void)restyle_element_checked(&elements[a]);
+                restyle_descendants_of(a);
+                break;
+            }
             if (e->is_draggable) {
                 g_drag_mode = e->drag_mode;
                 if (e->drag_mode == 2) {
@@ -18492,7 +18577,8 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
         for (int i = 0; i < elem_count; i++) {
             if (elements[i].is_active) {
                 elements[i].is_active = 0;
-                int still_over = hit == i;
+                /* still over the element or anything inside it */
+                int still_over = hit != -1 && is_descendant_of(hit, i);
                 if (still_over && elements[i].on_click && !g_drag_moved) {
                     g_luna_last_click_button = LUNA_MOUSE_BUTTON_LEFT;
                     elements[i].on_click(&elements[i]);
@@ -20355,6 +20441,7 @@ int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char*
         if (strcmp(elements[i].bg_image_path, key) == 0) {
             elements[i].has_bg_image = 1;
             elements[i].bg_image_tex = entry->tex;
+            elements[i].bg_image_rev++;     /* same texture id, new pixels: partial-redraw damage must see it */
         }
     return 1;
 }

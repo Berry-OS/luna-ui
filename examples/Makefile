@@ -91,7 +91,7 @@ windows: $(BUILD)/windows/luna-example.exe
 $(BUILD)/windows/luna-example.exe: example.c $(ROOT)/luna-ui.h $(ROOT)/luna_windows.h
 	@mkdir -p $(dir $@)
 	$(WINDOWS_CC) $(COMMON_CPPFLAGS) $(WINDOWS_CFLAGS) \
-		-o $@ example.c -mwindows $(WINDOWS_LIBS)
+		-o $@ example.c -mwindows -static $(WINDOWS_LIBS)
 
 # -----------------------------------------------------------------------------
 # macOS / Cocoa + OpenGL

@@ -1,5 +1,7 @@
 /* luna_android.h - header-only NativeActivity/EGL/OpenGL ES 3 host.
- * Before including l-u, applications may define:
+ * NativeActivity has no main(), so the host asks the application for its
+ * config: it calls luna_app_config() when the application defines it (see
+ * luna-ui.h).  Before including l-u, applications may instead define:
  *   #define LUNA_ANDROID_APP_CONFIG my_config_function
  * where my_config_function returns LunaAppConfig. */
 
@@ -48,8 +50,12 @@ ANativeWindow* luna_android_window(void);
 #define LUNA_ANDROID_IMPLEMENTATION_INCLUDED
 
 #ifndef LUNA_ANDROID_APP_CONFIG
+/* Weak so an implementation unit compiled on its own still links when the
+ * application leaves luna_app_config() out. */
+extern LunaAppConfig luna_app_config(void) __attribute__((weak));
 static LunaAppConfig luna_android_default_app_config(void) {
     LunaAppConfig c; memset(&c,0,sizeof(c));
+    if (luna_app_config) return luna_app_config();
     c.title="Luna UI"; c.width=1280; c.height=720; c.vsync=1;
     c.html_path="ui/main.html"; c.css_path="ui/main.css";
     return c;
@@ -244,14 +250,14 @@ static int luna_android_process_input(AInputEvent*e){
         }
         return 1;
     }
-    if(type==AINPUT_EVENT_TYPE_KEY){int act=AKeyEvent_getAction(e),key=AKeyEvent_getKeyCode(e),meta=AKeyEvent_getMetaState(e);int la=act==AKEY_EVENT_ACTION_DOWN?(AKeyEvent_getRepeatCount(e)?LUNA_REPEAT:LUNA_PRESS):LUNA_RELEASE;luna_key(luna_android_keycode(key),AKeyEvent_getScanCode(e),la,luna_android_mods(meta));if(la==LUNA_PRESS){int cp=luna_android_unicode_char(key,meta);if(cp>0)luna_char((unsigned)cp);}return 1;}
+    if(type==AINPUT_EVENT_TYPE_KEY){int act=AKeyEvent_getAction(e),key=AKeyEvent_getKeyCode(e),meta=AKeyEvent_getMetaState(e);int la=act==AKEY_EVENT_ACTION_DOWN?(AKeyEvent_getRepeatCount(e)?LUNA_REPEAT:LUNA_PRESS):LUNA_RELEASE;{int lk=luna_android_keycode(key),sc=AKeyEvent_getScanCode(e),lm=luna_android_mods(meta);if(!luna_android.config.on_key||!luna_android.config.on_key(lk,sc,la,lm,luna_android.config.userdata))luna_key(lk,sc,la,lm);}if(la==LUNA_PRESS){int cp=luna_android_unicode_char(key,meta);if(cp>0)luna_char((unsigned)cp);}return 1;}
     return 0;
 }
 
 static void*luna_android_thread(void*unused){(void)unused;luna_android.looper=ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);double prev=luna_android_time_impl();AInputQueue*attached=NULL;while(1){ANativeWindow*window;AInputQueue*input;pthread_mutex_lock(&luna_android.mutex);while(!luna_android.destroy_requested&&!luna_android.window&&!luna_android.input)pthread_cond_wait(&luna_android.cond,&luna_android.mutex);window=luna_android.window;input=luna_android.input;pthread_mutex_unlock(&luna_android.mutex);if(luna_android.destroy_requested)break;if(input!=attached){if(attached)AInputQueue_detachLooper(attached);attached=input;if(attached)AInputQueue_attachLooper(attached,luna_android.looper,1,NULL,NULL);}int ident;while((ident=ALooper_pollAll(0,NULL,NULL,NULL))>=0){(void)ident;if(attached){AInputEvent*e;while(AInputQueue_getEvent(attached,&e)>=0){if(AInputQueue_preDispatchEvent(attached,e))continue;int handled=luna_android_process_input(e);AInputQueue_finishEvent(attached,e,handled);}}}
         if(window&&luna_android.surface==EGL_NO_SURFACE){if(luna_android_egl_init(window)&&luna_android_core_init())prev=luna_android_time_impl();}
         if(!window&&luna_android.surface!=EGL_NO_SURFACE){if(luna_android.core_initialized){if(luna_android.config.on_shutdown)luna_android.config.on_shutdown(luna_android.config.userdata);luna_shutdown();luna_android.core_initialized=0;}luna_android_egl_shutdown();}
-        if(luna_android.core_initialized&&window){double now=luna_android_time_impl(),dt=now-prev;prev=now;if(dt<0||dt>.25)dt=1.0/60.0;if(luna_android.config.on_frame)luna_android.config.on_frame(dt,luna_android.config.userdata);luna_update(now,dt);luna_render(luna_android.fb_width,luna_android.fb_height);if(luna_android.config.on_render)luna_android.config.on_render(luna_android.fb_width,luna_android.fb_height,luna_android.config.userdata);eglSwapBuffers(luna_android.display,luna_android.surface);}else luna_android_sleep_millis(10);
+        if(luna_android.core_initialized&&window){double now=luna_android_time_impl(),dt=now-prev;prev=now;if(dt<0||dt>.25)dt=1.0/60.0;if(luna_android.config.on_frame)luna_android.config.on_frame(dt,luna_android.config.userdata);luna_update(now,dt);(void)luna_needs_redraw(now,dt);if(!luna_android.config.custom_render)luna_render(luna_android.fb_width,luna_android.fb_height);if(luna_android.config.on_render)luna_android.config.on_render(luna_android.fb_width,luna_android.fb_height,luna_android.config.userdata);eglSwapBuffers(luna_android.display,luna_android.surface);}else luna_android_sleep_millis(10);
     }if(attached)AInputQueue_detachLooper(attached);if(luna_android.core_initialized){if(luna_android.config.on_shutdown)luna_android.config.on_shutdown(luna_android.config.userdata);luna_shutdown();}luna_android_egl_shutdown();return NULL;}
 
 static void luna_android_on_destroy(ANativeActivity*a){(void)a;luna_android_close();pthread_join(luna_android.thread,NULL);pthread_cond_destroy(&luna_android.cond);pthread_mutex_destroy(&luna_android.mutex);}

@@ -161,6 +161,10 @@ static int luna_mac_key(NSEvent* e) {
         case 115: return LUNA_KEY_HOME;
         case 119: return LUNA_KEY_END;
         case 111: return LUNA_KEY_F12;
+        case 122: return LUNA_KEY_F1;  case 120: return LUNA_KEY_F2;  case 99:  return LUNA_KEY_F3;
+        case 118: return LUNA_KEY_F4;  case 96:  return LUNA_KEY_F5;  case 97:  return LUNA_KEY_F6;
+        case 98:  return LUNA_KEY_F7;  case 100: return LUNA_KEY_F8;  case 101: return LUNA_KEY_F9;
+        case 109: return LUNA_KEY_F10; case 103: return LUNA_KEY_F11;
         default: {
             NSString* chars = e.charactersIgnoringModifiers;
             if (chars.length) {
@@ -261,6 +265,11 @@ static float luna_mac_scale(void) {
     return luna_mac.window ? (float)luna_mac.window.backingScaleFactor : 1.0f;
 }
 
+/* on_key sees raw keys first, as on every host; non-zero consumes the key. */
+static int luna_mac_raw_key(int key, int scan, int action, int mods) {
+    return luna_mac.config.on_key && luna_mac.config.on_key(key, scan, action, mods, luna_mac.config.userdata);
+}
+
 @implementation LunaMacView
 
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -293,13 +302,16 @@ static float luna_mac_scale(void) {
 - (void)scrollWheel:(NSEvent*)e { luna_scroll(e.scrollingDeltaX / 10.0, e.scrollingDeltaY / 10.0); }
 
 - (void)keyDown:(NSEvent*)e {
-    luna_key(luna_mac_key(e), (int)e.keyCode, e.isARepeat ? LUNA_REPEAT : LUNA_PRESS,
-             luna_mac_mods(e.modifierFlags));
+    int key = luna_mac_key(e), action = e.isARepeat ? LUNA_REPEAT : LUNA_PRESS;
+    int mods = luna_mac_mods(e.modifierFlags);
+    if (luna_mac_raw_key(key, (int)e.keyCode, action, mods)) return;
+    luna_key(key, (int)e.keyCode, action, mods);
     [self interpretKeyEvents:@[e]];
 }
 - (void)keyUp:(NSEvent*)e {
-    luna_key(luna_mac_key(e), (int)e.keyCode, LUNA_RELEASE,
-             luna_mac_mods(e.modifierFlags));
+    int key = luna_mac_key(e), mods = luna_mac_mods(e.modifierFlags);
+    if (luna_mac_raw_key(key, (int)e.keyCode, LUNA_RELEASE, mods)) return;
+    luna_key(key, (int)e.keyCode, LUNA_RELEASE, mods);
 }
 
 - (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
@@ -343,10 +355,13 @@ static void luna_mac_frame(NSTimer* timer) {
         if (luna_mac.config.on_frame)
             luna_mac.config.on_frame(dt, luna_mac.config.userdata);
         luna_update(now, dt);
+        (void)luna_needs_redraw(now, dt);   /* steps CSS transitions and animations */
         [[luna_mac.view openGLContext] makeCurrentContext];
         backing = [luna_mac.view convertRectToBacking:luna_mac.view.bounds];
         if (backing.size.width > 0 && backing.size.height > 0) {
-            luna_render((int)backing.size.width, (int)backing.size.height);
+            /* custom_render: on_render paints the frame and the DOM itself */
+            if (!luna_mac.config.custom_render)
+                luna_render((int)backing.size.width, (int)backing.size.height);
             if (luna_mac.config.on_render)
                 luna_mac.config.on_render((int)backing.size.width, (int)backing.size.height,
                                           luna_mac.config.userdata);

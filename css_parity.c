@@ -515,6 +515,66 @@ static void test_wrapping_flex_overflow_scroll(void) {
                "mouse wheel scrolls a wrapping flex overflow container");
 }
 
+/* A content-box wrapping row inside a padded column flex: the parent's
+ * intrinsic measure must pack border boxes against the content width, or
+ * the following sibling is placed over the last wrapped line. */
+static void test_wrapping_row_in_column_measure(void) {
+    luna_window_width = 1280.0f;
+    luna_window_height = 720.0f;
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"panel\"><div id=\"cards\">"
+                    "<div class=\"card\"></div><div class=\"card\"></div><div class=\"card\"></div>"
+                    "<div class=\"card\"></div><div class=\"card\"></div><div class=\"card\"></div>"
+                    "<div class=\"card\"></div><div class=\"card\"></div><div class=\"card\"></div>"
+                    "<div class=\"card\"></div></div><div id=\"below\">x</div></div></body>");
+    luna_parse_css("body{margin:0}#panel{position:absolute;right:28px;top:28px;bottom:28px;width:440px;"
+                   "padding:22px;display:flex;flex-direction:column}"
+                   "#cards{display:flex;flex-wrap:wrap;gap:8px}"
+                   ".card{width:80px;height:76px;border:3px solid #fff}");
+    update_layout_pass();
+    int cards = luna_get_element_by_id("cards"), below = luna_get_element_by_id("below");
+    check_true(cards >= 0 && below >= 0, "wrapping-row measure fixture is addressable");
+    if (cards < 0 || below < 0) return;
+    check_near(elements[cards].h, 3.0f * 82.0f + 2.0f * 8.0f, 0.5f, "four 86px cards per 440px line: three lines");
+    check_true(elements[below].y >= elements[cards].y + elements[cards].h - 0.5f,
+               "sibling after a wrapping row starts below its last line");
+}
+
+/* `transition: transform` eases only the transform: losing a highlight
+ * class must swap the background at once, not fade it out.  A click on an
+ * element's child must reach the onclick of the element that owns it. */
+static int bubbled_clicks;
+static void count_bubbled_click(LunaElement *element) { (void)element; bubbled_clicks++; }
+static void test_transition_property_and_click_bubbling(void) {
+    luna_window_width = 640.0f;
+    luna_window_height = 480.0f;
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"tcard\" class=\"tcard on\"><div id=\"tdot\" class=\"tdot\"></div></div></body>");
+    luna_parse_css("body{margin:0}.tcard{position:absolute;left:10px;top:10px;width:80px;height:80px;"
+                   "background:#0000ff;transition:transform 0.1s}.tcard.on{background:#ff0000;transform:scale(1.2)}"
+                   ".tdot{width:40px;height:40px;background:#00ff00}");
+    update_layout_pass();
+    int card = luna_get_element_by_id("tcard");
+    check_true(card >= 0, "transition fixture is addressable");
+    if (card < 0) return;
+    for (int i = 0; i < 60; i++) update_animations(1.0 / 60.0);
+    luna_remove_class(card, "on");
+    update_layout_pass();
+    update_animations(1.0 / 60.0);
+    check_near(elements[card].cur_r, elements[card].r, 0.001f, "untransitioned background snaps (red channel)");
+    check_near(elements[card].cur_b, elements[card].b, 0.001f, "untransitioned background snaps (blue channel)");
+    check_true(elements[card].cur_scale > 1.0f, "the named transform still eases");
+    for (int i = 0; i < 6; i++) update_animations(1.0 / 60.0);
+    check_true(fabsf(elements[card].cur_scale - 1.0f) < 0.05f, "a 0.1 s transition has landed after 0.1 s");
+
+    luna_set_on_click(card, count_bubbled_click);
+    bubbled_clicks = 0;
+    luna_mouse_move(30.0, 30.0);
+    luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_PRESS, 0, 30.0, 30.0);
+    luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_RELEASE, 0, 30.0, 30.0);
+    check_true(bubbled_clicks == 1, "a click on a child fires its ancestor's onclick");
+}
+
 static void test_calc_viewport_length(void) {
     float value = 0.0f, offset = 0.0f;
     int percent = 0;
@@ -568,6 +628,8 @@ int main(void) {
     test_touch_input();
     test_hover_preserves_inherited_icon_face();
     test_wrapping_flex_overflow_scroll();
+    test_wrapping_row_in_column_measure();
+    test_transition_property_and_click_bubbling();
     test_calc_viewport_length();
     test_overlay_render_order();
     if (failures) {

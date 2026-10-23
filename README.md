@@ -290,7 +290,13 @@ Add `examples/example_ios.m` and the Luna headers to an iOS application target. 
 
 The Android host uses `android.app.NativeActivity`, EGL, and OpenGL ES 3. The implementation exports `ANativeActivity_onCreate`.
 
-For NativeActivity builds the application config can be supplied before including the implementation:
+NativeActivity has no `main()`, so the host calls `luna_app_config()` when the application defines it. A portable app defines that one function, calls it from its own `main()` on the other platforms, and can compile the implementation straight from the header — no per-app implementation file:
+
+```sh
+cc -x c -DLUNA_UI_IMPLEMENTATION -c luna-ui.h -o luna-ui.o   # -x objective-c on Apple
+```
+
+Alternatively the config function can be named before including the implementation:
 
 ```c
 #define LUNA_ANDROID_APP_CONFIG luna_android_make_config

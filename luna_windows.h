@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <imm.h>
+#include <shellapi.h>   /* NOTIFYICONDATAW: WIN32_LEAN_AND_MEAN leaves it out */
 #include <GL/gl.h>
 #define LUNA_UI_PLATFORM_GL_INCLUDED 1
 #endif
@@ -258,8 +259,15 @@ static int luna_win_key(WPARAM vk) {
         case VK_NEXT: return LUNA_KEY_PAGE_DOWN;
         case VK_HOME: return LUNA_KEY_HOME;
         case VK_END: return LUNA_KEY_END;
-        case VK_F12: return LUNA_KEY_F12;
+        case VK_SHIFT: return LUNA_KEY_LEFT_SHIFT;
+        case VK_LSHIFT: return LUNA_KEY_LEFT_SHIFT;
+        case VK_RSHIFT: return LUNA_KEY_RIGHT_SHIFT;
+        case VK_CONTROL: case VK_LCONTROL: return LUNA_KEY_LEFT_CONTROL;
+        case VK_RCONTROL: return LUNA_KEY_RIGHT_CONTROL;
+        case VK_MENU: case VK_LMENU: return LUNA_KEY_LEFT_ALT;
+        case VK_RMENU: return LUNA_KEY_RIGHT_ALT;
         default:
+            if (vk >= VK_F1 && vk <= VK_F12) return LUNA_KEY_F1 + (int)(vk - VK_F1);
             if (vk >= 'A' && vk <= 'Z') return (int)vk;
             if (vk >= '0' && vk <= '9') return (int)vk;
             return (int)vk;
@@ -533,15 +541,20 @@ static LRESULT CALLBACK luna_win_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             luna_win.redraw = 1;
             return 0;
         case WM_KEYDOWN: case WM_SYSKEYDOWN:
-            luna_key(luna_win_key(wp), (int)((lp >> 16) & 0xff),
-                     (lp & (1u << 30)) ? LUNA_REPEAT : LUNA_PRESS, luna_win_mods());
+        case WM_KEYUP: case WM_SYSKEYUP: {
+            int key = luna_win_key(wp), scan = (int)((lp >> 16) & 0xff), mods = luna_win_mods();
+            int action = (msg == WM_KEYUP || msg == WM_SYSKEYUP) ? LUNA_RELEASE
+                       : (lp & (1u << 30)) ? LUNA_REPEAT : LUNA_PRESS;
+            if (key == LUNA_KEY_LEFT_SHIFT && scan == 0x36) key = LUNA_KEY_RIGHT_SHIFT;
+            if ((key == LUNA_KEY_LEFT_CONTROL || key == LUNA_KEY_LEFT_ALT) && (lp & (1 << 24)))
+                key = key == LUNA_KEY_LEFT_CONTROL ? LUNA_KEY_RIGHT_CONTROL : LUNA_KEY_RIGHT_ALT;
+            /* on_key sees raw keys first, as on every host; non-zero consumes */
+            if (!luna_win.config.on_key ||
+                !luna_win.config.on_key(key, scan, action, mods, luna_win.config.userdata))
+                luna_key(key, scan, action, mods);
             luna_win.redraw = 1;
             return 0;
-        case WM_KEYUP: case WM_SYSKEYUP:
-            luna_key(luna_win_key(wp), (int)((lp >> 16) & 0xff),
-                     LUNA_RELEASE, luna_win_mods());
-            luna_win.redraw = 1;
-            return 0;
+        }
         case WM_CHAR:
             luna_win_emit_utf16((wchar_t)wp);
             luna_win.redraw = 1;
@@ -744,9 +757,11 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
             if (dt < 0.0 || dt > 0.25) dt = 1.0 / 60.0;
             if (cfg.on_frame) cfg.on_frame(dt, cfg.userdata);
             luna_update(now, dt);
+            (void)luna_needs_redraw(now, dt);   /* steps CSS transitions and animations */
             GetClientRect(luna_win.hwnd, &r);
             if (r.right > r.left && r.bottom > r.top) {
-                luna_render(r.right-r.left, r.bottom-r.top);
+                /* custom_render: on_render paints the frame and the DOM itself */
+                if (!cfg.custom_render) luna_render(r.right-r.left, r.bottom-r.top);
                 if (cfg.on_render)
                     cfg.on_render(r.right-r.left, r.bottom-r.top, cfg.userdata);
                 SwapBuffers(luna_win.dc);
