@@ -766,6 +766,16 @@ void luna_set_preserve_backdrop(int enabled);
  * thread must serialise with its render. */
 /* Loads CPU font metrics without creating GL objects. Caller serializes access. */
 int luna_prepare_font_metrics(void);
+/* A face a skin ships for one CSS family name (a pixel font such as Chicago-like bitmaps).  Text whose
+ * `font-family` list names `family` is set in the TrueType file at `path`; codepoints it lacks fall back to
+ * the UI / CJK faces.  Pass family or path NULL to remove it.  Returns 1 when the font is in use.  Safe to
+ * call again when the skin changes: cached glyphs are dropped. */
+int luna_set_skin_font(const char* family, const char* path);
+/* Replace the UI faces with TrueType data the application ships (a pixel font, a brand face).
+ * `bold` may be NULL: the regular face then serves bold text too.  Other roles (CJK, symbols, ...)
+ * stay as the platform provides them and still back up codepoints the new faces lack.  The data
+ * is copied; call before luna_app_run() / the first document, e.g. from luna_app_config(). */
+void luna_set_ui_fonts(const void* regular, long regular_size, const void* bold, long bold_size);
 typedef struct LunaFontMetrics {
     float top, ascent, descent, bottom, leading;
 } LunaFontMetrics;
@@ -2363,6 +2373,7 @@ const char* img_fs =
     "uniform float uAlpha;\n"
     "uniform vec2 uImgOrigin;\n"
     "uniform vec2 uImgDrawSize;\n"
+    "uniform vec2 uImgRepeat;\n"
     "void main() {\n"
     "    vec2 halfSize = uSize / 2.0;\n"
     "    float r = max(uRadius, 0.001);\n"
@@ -2373,6 +2384,9 @@ const char* img_fs =
     "    float alpha = uRadius < 0.0 ? 1.0 : 1.0 - smoothstep(r - 1.0, r + 0.5, dist);\n"
     "    if(alpha <= 0.0) discard;\n"
     "    vec2 p = FragPos - uImgOrigin;\n"
+    /* background-repeat: wrap the position into one tile on the repeating axes */
+    "    if(uImgRepeat.x > 0.5) p.x = p.x - uImgDrawSize.x * floor(p.x / uImgDrawSize.x);\n"
+    "    if(uImgRepeat.y > 0.5) p.y = p.y - uImgDrawSize.y * floor(p.y / uImgDrawSize.y);\n"
     "    if(any(lessThan(p, vec2(0.0))) || any(greaterThan(p, uImgDrawSize))) discard;\n"
     "    vec2 uv = p / uImgDrawSize;\n"
     "    vec4 tc = texture(uImage, uv);\n"
@@ -2637,6 +2651,7 @@ struct LunaElement {
 
     float border_radius;              /* max corner radius (legacy/scrollbar paths) */
     float rad_c[4];                   /* per-corner radius: tl, tr, br, bl */
+    float rad_pct[4];                 /* corner given as a percentage (0..1 ratio), 0 = rad_c is px */
     float border_width;
     float outline_width;
     float outline_offset;
@@ -2843,6 +2858,7 @@ struct LunaElement {
     int bg_size_mode;   /* 0=auto 1=cover 2=contain 3=explicit */
     float bg_size_w, bg_size_h;
     unsigned char bg_size_wu, bg_size_hu;   /* LUNA_BG_SIZE_AUTO/PX/PCT */
+    unsigned char bg_repeat;   /* background-repeat: bit 0 = along x, bit 1 = along y (0: one copy) */
     float bg_pos_x, bg_pos_y;        /* a fraction of the free space, or px when bg_pos_*_px */
     char bg_pos_x_px, bg_pos_y_px;
 
@@ -3001,6 +3017,7 @@ typedef struct {
     float ol_r, ol_g, ol_b, ol_a;
     int has_radius; float border_radius;
     int has_rad_c[4]; float rad_c[4];   /* per-corner radius: tl, tr, br, bl */
+    float rad_pct[4];                   /* percentage corners as 0..1 ratios (0 = px) */
     int has_width;  float width;
     int has_height; float height;
     /* width/height: auto (and the content keywords): a later rule's reset of
@@ -3196,6 +3213,7 @@ typedef struct {
 
     /* background-size / background-position */
     int has_bg_size; int bg_size_mode;
+    int has_bg_repeat; unsigned char bg_repeat;
     float bg_size_w, bg_size_h;
     unsigned char bg_size_wu, bg_size_hu;
     int has_bg_pos; float bg_pos_x, bg_pos_y; char bg_pos_x_px, bg_pos_y_px;
@@ -3735,7 +3753,7 @@ static struct {
 } tx_uni;
 static struct {
     GLint uResolution, uPos, uSize, uRadius, uAlpha, uImage;
-    GLint uImgOrigin, uImgDrawSize;
+    GLint uImgOrigin, uImgDrawSize, uImgRepeat;
 } img_loc;
 static struct {
     GLint uResolution, uPos, uSize;
@@ -3843,11 +3861,19 @@ static int            g_brand_font_info_ok = 0;
 /* The CSS-selected icon face for the current text paint.  It is deliberately
  * a tiny integer: changing faces does not add an allocation or a draw call. */
 static int            g_font_face_hint = 0;
+/* The skin's own face (CSS face 4): family name it answers to, and its font data. */
+static stbtt_fontinfo g_skin_font_info;
+static unsigned char* g_skin_font_ttf = NULL;
+static int            g_skin_font_info_ok = 0;
+static char           g_skin_font_family[64];
 static int            g_font_bold_hint = 0;
 /* Use the exact-size dynamic atlas for ASCII whenever the requested CSS size
  * is not one of the pre-baked sizes, or whenever the framebuffer has a
  * device-pixel ratio above 1.  This avoids scaling a nearby atlas size. */
 static int            g_text_dynamic_ascii = 0;
+/* Synthetic bold (no bold face loaded) smears each glyph 1px to the right (2px from 24px up).  The pen has to
+ * advance by the same amount, or neighbouring letters fuse and the measured width comes out short. */
+static float          g_text_synth_adv = 0.0f;
 
 #define LUNA_ASCII_ATLAS_SIZE 512
 #define LUNA_DYN_ATLAS_W 1024
@@ -4167,6 +4193,7 @@ static stbtt_fontinfo* font_for_codepoint_slow(int cp) {
     if (g_font_face_hint == 1 && icon_has) return &g_icon_font_info;
     if (g_font_face_hint == 2 && brand_has) return &g_brand_font_info;
     if (g_font_face_hint == 3 && mono_has && !prefer_cjk) return &g_mono_font_info;
+    if (g_font_face_hint == 4 && font_has_cp(&g_skin_font_info, g_skin_font_info_ok, cp)) return &g_skin_font_info;
     if (pua) {
         if (icon_has)  return &g_icon_font_info;
         if (brand_has) return &g_brand_font_info;
@@ -4199,7 +4226,7 @@ typedef struct { int cp; unsigned hints; stbtt_fontinfo* f; } FontPick;
 static FontPick g_font_pick[4096];
 
 static stbtt_fontinfo* font_for_codepoint(int cp) {
-    unsigned hints = (unsigned)(g_font_face_hint & 3) | (g_font_bold_hint ? 4u : 0u) |
+    unsigned hints = (unsigned)(g_font_face_hint & 7) << 9 | (g_font_bold_hint ? 4u : 0u) | (g_skin_font_info_ok ? 2u : 0u) |
                      (g_font_info_ok ? 8u : 0u) | (g_cjk_font_info_ok ? 16u : 0u) |
                      (g_bold_font_info_ok ? 32u : 0u) | (g_mono_font_info_ok ? 64u : 0u) |
                      (g_icon_font_info_ok ? 128u : 0u) | (g_brand_font_info_ok ? 256u : 0u) | 0x8000u;
@@ -4392,8 +4419,8 @@ static float glyph_metric_advance(int cp, float css_px) {
 
 static float glyph_advance(FontAtlas* atlas, int cp, float css_px) {
     if (cp >= 32 && cp < 128 && !g_text_dynamic_ascii)
-        return atlas->cdata[cp - 32].xadvance;
-    return glyph_metric_advance(cp, css_px);
+        return atlas->cdata[cp - 32].xadvance + g_text_synth_adv;
+    return glyph_metric_advance(cp, css_px) + g_text_synth_adv;
 }
 
 static char g_screenshot_path[512] = {0};
@@ -5120,11 +5147,15 @@ static void parse_box_shadow(const char* val, StyleRule* rule) {
 // Parse border-radius shorthand: 1-4 values → tl, tr, br, bl (CSS rules).
 static void parse_border_radius_shorthand(const char* val, StyleRule* rule) {
     const char* p = val;
-    float v[4]; int n = 0;
+    float v[4], pc[4]; int n = 0;
     while (*p && n < 4) {
         while (isspace((unsigned char)*p)) p++;
         if (!*p || *p == '/') break; /* elliptical radii unsupported: use first set */
-        v[n++] = read_css_length(&p);
+        const char* start = p;
+        v[n] = read_css_length(&p);
+        pc[n] = 0.0f;
+        for (const char* q = start; q < p; q++) if (*q == '%') { pc[n] = v[n] / 100.0f; break; }
+        n++;
     }
     if (n == 0) return;
     rule->has_radius = 1;
@@ -5137,6 +5168,11 @@ static void parse_border_radius_shorthand(const char* val, StyleRule* rule) {
     }
     rule->rad_c[0] = tl; rule->rad_c[1] = tr; rule->rad_c[2] = br; rule->rad_c[3] = bl;
     rule->has_rad_c[0] = rule->has_rad_c[1] = rule->has_rad_c[2] = rule->has_rad_c[3] = 1;
+    {
+        /* same 1-4 value expansion for the percentage flags */
+        int map[4][4] = {{0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}};
+        for (int c = 0; c < 4; c++) rule->rad_pct[c] = pc[map[n - 1][c]];
+    }
     float mx = tl;
     if (tr > mx) mx = tr;
     if (br > mx) mx = br;
@@ -5687,8 +5723,11 @@ static void bg_layer_parse(const char* layer, StyleRule* out, char* pos, size_t 
         } else if (!strncmp(tok, "linear-gradient", 15) || !strncmp(tok, "repeating-linear-gradient", 25)) parse_linear_gradient(tok, out);
         else if (!strncmp(tok, "radial-gradient", 15)) parse_radial_gradient(tok, out);
         else if (!strncmp(tok, "conic-gradient", 14)) parse_conic_gradient(tok, out);
-        else if (!strcmp(tok, "no-repeat") || !strcmp(tok, "repeat") || !strcmp(tok, "repeat-x") || !strcmp(tok, "repeat-y") ||
-                 !strcmp(tok, "space") || !strcmp(tok, "round") || !strcmp(tok, "fixed") || !strcmp(tok, "scroll") ||
+        else if (!strcmp(tok, "no-repeat") || !strcmp(tok, "repeat") || !strcmp(tok, "repeat-x") || !strcmp(tok, "repeat-y")) {
+            out->has_bg_repeat = 1;
+            out->bg_repeat = !strcmp(tok, "repeat") ? 3 : !strcmp(tok, "repeat-x") ? 1 : !strcmp(tok, "repeat-y") ? 2 : 0;
+        }
+        else if (!strcmp(tok, "space") || !strcmp(tok, "round") || !strcmp(tok, "fixed") || !strcmp(tok, "scroll") ||
                  !strcmp(tok, "local") || !strcmp(tok, "border-box") || !strcmp(tok, "padding-box") ||
                  !strcmp(tok, "content-box") || !strcmp(tok, "text")) { /* not painted differently here */ }
         else if (after_slash || !strcmp(tok, "left") || !strcmp(tok, "right") || !strcmp(tok, "top") ||
@@ -7373,7 +7412,9 @@ static void apply_one_declaration(const char* key, const char* val, StyleRule* r
  * and the common concrete monospace names case-insensitively. */
 static void apply_font_family_value(StyleRule* rule, const char* val) {
     rule->has_font_face = 1;
-    if (val && (luna_strcasestr_local(val, "Luna Symbols") ||
+    if (val && g_skin_font_family[0] && g_skin_font_info_ok && luna_strcasestr_local(val, g_skin_font_family)) {
+        rule->font_face = 4;
+    } else if (val && (luna_strcasestr_local(val, "Luna Symbols") ||
                 luna_strcasestr_local(val, "Font Awesome 6 Free") ||
                 luna_strcasestr_local(val, "Font Awesome 5 Free"))) {
         rule->font_face = 1;
@@ -7890,10 +7931,10 @@ void parse_declarations(char* declarations, StyleRule* rule) {
             else if (strcmp(key, "color") == 0)            { rule->has_color = 1; parse_color(val, &rule->c_r, &rule->c_g, &rule->c_b, &rule->c_a); }
             else if (strcmp(key, "caret-color") == 0)      { rule->has_caret_color = 1; parse_color(val, &rule->caret_r, &rule->caret_g, &rule->caret_b, &rule->caret_a); }
             else if (strcmp(key, "border-radius") == 0)    { parse_border_radius_shorthand(val, rule); }
-            else if (strcmp(key, "border-top-left-radius") == 0)     { rule->has_radius = 1; rule->has_rad_c[0] = 1; rule->rad_c[0] = parse_float_val(val); }
-            else if (strcmp(key, "border-top-right-radius") == 0)    { rule->has_radius = 1; rule->has_rad_c[1] = 1; rule->rad_c[1] = parse_float_val(val); }
-            else if (strcmp(key, "border-bottom-right-radius") == 0) { rule->has_radius = 1; rule->has_rad_c[2] = 1; rule->rad_c[2] = parse_float_val(val); }
-            else if (strcmp(key, "border-bottom-left-radius") == 0)  { rule->has_radius = 1; rule->has_rad_c[3] = 1; rule->rad_c[3] = parse_float_val(val); }
+            else if (strcmp(key, "border-top-left-radius") == 0) { rule->has_radius = 1; rule->has_rad_c[0] = 1; rule->rad_c[0] = parse_float_val(val); rule->rad_pct[0] = strchr(val, '%') ? rule->rad_c[0] / 100.0f : 0.0f; }
+            else if (strcmp(key, "border-top-right-radius") == 0) { rule->has_radius = 1; rule->has_rad_c[1] = 1; rule->rad_c[1] = parse_float_val(val); rule->rad_pct[1] = strchr(val, '%') ? rule->rad_c[1] / 100.0f : 0.0f; }
+            else if (strcmp(key, "border-bottom-right-radius") == 0) { rule->has_radius = 1; rule->has_rad_c[2] = 1; rule->rad_c[2] = parse_float_val(val); rule->rad_pct[2] = strchr(val, '%') ? rule->rad_c[2] / 100.0f : 0.0f; }
+            else if (strcmp(key, "border-bottom-left-radius") == 0) { rule->has_radius = 1; rule->has_rad_c[3] = 1; rule->rad_c[3] = parse_float_val(val); rule->rad_pct[3] = strchr(val, '%') ? rule->rad_c[3] / 100.0f : 0.0f; }
             else if (strcmp(key, "border-width") == 0)     { rule->has_border = 1; rule->border_width = parse_float_val(val); }
             else if (strcmp(key, "outline-width") == 0)  { rule->has_outline = 1; rule->outline_width = parse_float_val(val); }
             else if (strcmp(key, "outline-color") == 0)  {
@@ -8796,6 +8837,17 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 }
                 rule->has_tf_origin = 1;
                 rule->tf_ox = fx; rule->tf_oy = fy; rule->tf_oxpx = px; rule->tf_oypx = py;
+            }
+            else if (strcmp(key, "background-repeat") == 0) {
+                /* <x> [<y>]: repeat | no-repeat | repeat-x | repeat-y (space and round tile like repeat) */
+                char v1[24] = "", v2[24] = "";
+                int n = sscanf(val, "%23s %23s", v1, v2);
+                int fx = 1, fy = 1;
+                if (!strcmp(v1, "repeat-x")) fy = 0;
+                else if (!strcmp(v1, "repeat-y")) fx = 0;
+                else if (!strcmp(v1, "no-repeat")) fx = fy = 0;
+                if (n >= 2) { fy = strcmp(v2, "no-repeat") != 0; if (!strcmp(v1, "no-repeat")) fx = 0; else fx = 1; }
+                rule->has_bg_repeat = 1; rule->bg_repeat = (unsigned char)(fx | fy << 1);
             }
             else if (strcmp(key, "background-size") == 0 || strcmp(key, "mask-size") == 0 ||
                      strcmp(key, "-webkit-mask-size") == 0) {
@@ -9990,7 +10042,7 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
     }
     if (r->has_radius) {
         for (int c = 0; c < 4; c++)
-            if (r->has_rad_c[c]) e->rad_c[c] = r->rad_c[c];
+            if (r->has_rad_c[c]) { e->rad_c[c] = r->rad_c[c]; e->rad_pct[c] = r->rad_pct[c]; }
         float mx = e->rad_c[0];
         for (int c = 1; c < 4; c++) if (e->rad_c[c] > mx) mx = e->rad_c[c];
         e->border_radius = mx;
@@ -10338,6 +10390,7 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
     }
     if (r->has_font_italic) e->font_italic = r->font_italic;
     if (r->has_aspect_ratio) { e->has_aspect_ratio = 1; e->aspect_ratio = r->aspect_ratio; }
+    if (r->has_bg_repeat) e->bg_repeat = r->bg_repeat;
     if (r->has_bg_size) {
         e->bg_size_mode = r->bg_size_mode;
         e->bg_size_w = r->bg_size_w;
@@ -10396,6 +10449,7 @@ static void anon_text_fixup(LunaElement* e) {
     e->opacity = 1.0f;
     e->border_radius = 0.0f;
     e->rad_c[0] = e->rad_c[1] = e->rad_c[2] = e->rad_c[3] = 0.0f;
+    e->rad_pct[0] = e->rad_pct[1] = e->rad_pct[2] = e->rad_pct[3] = 0.0f;
     e->transform_scale = 1.0f; e->transform_tx = e->transform_ty = 0.0f; e->transform_rotate = 0.0f;
     e->tf_ox = e->tf_oy = 0.5f; e->tf_oxpx = e->tf_oypx = 0.0f;
     e->has_css_animation = 0; e->anim_name[0] = '\0';
@@ -10613,6 +10667,7 @@ void update_element_style(LunaElement* e) {
     e->ol_r = 0.39f; e->ol_g = 0.40f; e->ol_b = 0.95f; e->ol_a = 0.5f;
     e->border_radius = 0; e->padding = 0;
     e->rad_c[0] = e->rad_c[1] = e->rad_c[2] = e->rad_c[3] = 0.0f;
+    e->rad_pct[0] = e->rad_pct[1] = e->rad_pct[2] = e->rad_pct[3] = 0.0f;
     e->shadow_count = 0;
     e->pad_t = e->pad_r = e->pad_b = e->pad_l = 0;
     e->margin_top = e->margin_right = e->margin_bottom = e->margin_left = 0.0f;
@@ -10830,6 +10885,7 @@ void update_element_style(LunaElement* e) {
     e->has_aspect_ratio = 0;
     e->aspect_ratio = 0.0f;
     e->bg_size_mode = 0;
+    e->bg_repeat = 0;
     e->bg_size_w = e->bg_size_h = 0.0f;
     e->bg_pos_x = 0.5f;
     e->bg_pos_y = 0.5f;
@@ -11109,6 +11165,14 @@ static int restyle_element_checked(LunaElement* e) {
     if (layout_changed) {
         LUNA_AUX_ZERO(g_intrinsic_width_valid);
         LUNA_LAYOUT_DIRTY();
+    } else {
+        /* apply_style_rule() seeds w/h from the CSS width/height (the content
+         * box).  With no layout input changed no relayout follows, so keep
+         * the laid-out border box: otherwise a padded `width: 440px` panel
+         * shrank to 440px whenever :focus-within / :active restyled it (a
+         * pressed button's ancestors) until something else relaid out. */
+        e->x = before.x; e->y = before.y;
+        e->w = before.w; e->h = before.h;
     }
     if (before.z_index != e->z_index)
         g_render_order_dirty = 1;
@@ -14690,6 +14754,20 @@ void update_layout_pass(void) {
     apply_document_metrics();
     apply_scroll_offsets();
     apply_sticky_positions();
+    /* border-radius: 50% is relative to the box.  It used to be read as 50px,
+     * which only looked round on boxes up to 100px; a big round blob came out
+     * as a rounded square.  (Circular corners: the percentage applies to the
+     * shorter side, so 50% is a circle or a pill.) */
+    for (int i = 0; i < elem_count; i++) {
+        LunaElement* e = &elements[i];
+        if (e->rad_pct[0] <= 0.0f && e->rad_pct[1] <= 0.0f && e->rad_pct[2] <= 0.0f && e->rad_pct[3] <= 0.0f) continue;
+        float side = e->w < e->h ? e->w : e->h, mx = 0.0f;
+        for (int c = 0; c < 4; c++) {
+            if (e->rad_pct[c] > 0.0f) e->rad_c[c] = e->rad_pct[c] * side;
+            if (e->rad_c[c] > mx) mx = e->rad_c[c];
+        }
+        e->border_radius = mx;
+    }
     /* Resolve percentage-based transforms after element sizes are known */
     for (int i = 0; i < elem_count; i++) {
         LunaElement* e = &elements[i];
@@ -16624,6 +16702,42 @@ static unsigned char* luna_try_font_candidates(const char* const* paths,
     return NULL;
 }
 
+static unsigned char* g_app_font_reg = NULL;  static long g_app_font_reg_sz = 0;
+static unsigned char* g_app_font_bold = NULL;  static long g_app_font_bold_sz = 0;
+static unsigned char* luna_dup_bytes(const unsigned char* p, long n) {
+    unsigned char* d = (unsigned char*)malloc((size_t)n);
+    if (d) memcpy(d, p, (size_t)n);
+    return d;
+}
+void luna_set_ui_fonts(const void* regular, long regular_size, const void* bold, long bold_size) {
+    free(g_app_font_reg);  g_app_font_reg = NULL;  g_app_font_reg_sz = 0;
+    free(g_app_font_bold); g_app_font_bold = NULL; g_app_font_bold_sz = 0;
+    if (regular && regular_size > 0 && (g_app_font_reg = luna_dup_bytes((const unsigned char*)regular, regular_size)))
+        g_app_font_reg_sz = regular_size;
+    if (bold && bold_size > 0 && (g_app_font_bold = luna_dup_bytes((const unsigned char*)bold, bold_size)))
+        g_app_font_bold_sz = bold_size;
+}
+int luna_set_skin_font(const char* family, const char* path) {
+    free(g_skin_font_ttf); g_skin_font_ttf = NULL;
+    g_skin_font_info_ok = 0; g_skin_font_family[0] = 0;
+    if (family && *family && path && *path) {
+        long n = 0;
+        unsigned char* buf = read_file_bytes(path, &n);
+        if (buf) {
+            int off = stbtt_GetFontOffsetForIndex(buf, 0);
+            if (off < 0) off = 0;
+            if (stbtt_InitFont(&g_skin_font_info, buf, off)) {
+                g_skin_font_ttf = buf; g_skin_font_info_ok = 1;
+                snprintf(g_skin_font_family, sizeof g_skin_font_family, "%s", family);
+            } else free(buf);
+        }
+    }
+    memset(g_font_pick, 0, sizeof g_font_pick);
+    memset(g_advance_memo, 0, sizeof g_advance_memo);
+    dyn_atlas_reset();
+    return g_skin_font_info_ok;
+}
+
 int luna_prepare_font_metrics(void) {
     if (g_font_ttf) return g_font_info_ok;
     g_font_info_ok = g_bold_font_info_ok = g_cjk_font_info_ok = 0;
@@ -16648,6 +16762,17 @@ int luna_prepare_font_metrics(void) {
     g_mono_font_ttf = luna_load_font_role(LUNA_FONT_MONO, &mono_sz);
     g_icon_font_ttf = luna_load_font_role(LUNA_FONT_SYMBOLS, &icon_sz);
     g_brand_font_ttf = luna_load_font_role(LUNA_FONT_BRANDS, &brand_sz);
+
+    if (g_app_font_reg) {                       /* faces the application ships win over the platform's */
+        unsigned char* r = luna_dup_bytes(g_app_font_reg, g_app_font_reg_sz);
+        unsigned char* b = g_app_font_bold ? luna_dup_bytes(g_app_font_bold, g_app_font_bold_sz)
+                                           : luna_dup_bytes(g_app_font_reg, g_app_font_reg_sz);
+        if (r && b) {
+            free(reg_buf); free(g_bold_font_ttf);
+            reg_buf = r; g_font_ttf_sz = g_app_font_reg_sz;
+            g_bold_font_ttf = b; bold_sz = g_app_font_bold ? g_app_font_bold_sz : g_app_font_reg_sz;
+        } else { free(r); free(b); }
+    }
 
     if (!reg_buf) {
         const char* env_ui = getenv("LUNA_FONT_REGULAR");
@@ -16852,7 +16977,9 @@ static void text_metrics_begin(float css_px, int bold, int face, FontAtlas* atla
     g_text_css_px = css_px > 0.0f ? css_px : 16.0f;
     g_font_face_hint = face;
     g_font_bold_hint = (bold && bold_font_loaded) ? 1 : 0;
-    g_text_dynamic_ascii = (face == 3) || !atlas || !atlas->loaded ||
+    g_text_synth_adv = (bold && !(bold_font_loaded && g_bold_font_ttf))
+                           ? (g_text_css_px >= 24.0f ? 2.0f : 1.0f) : 0.0f;
+    g_text_dynamic_ascii = (face >= 3) || !atlas || !atlas->loaded ||
                            fabsf(atlas_nominal_size(atlas) - g_text_css_px) > 0.01f ||
                            text_device_scale() > 1.01f;
 }
@@ -16862,6 +16989,7 @@ static void text_metrics_end(void) {
     g_font_face_hint = 0;
     g_font_bold_hint = 0;
     g_text_dynamic_ascii = 0;
+    g_text_synth_adv = 0.0f;
 }
 
 float measure_text_width(FontAtlas* atlas, const char* text) {
@@ -16922,7 +17050,9 @@ static int fit_text_chars(FontAtlas* atlas, const char* text, int len, float max
         int cp = utf8_decode(&p);
         if (cp == '\n' || cp == '\r') break;
         float adv = glyph_advance(atlas, cp, px) + g_text_letter_spacing;
-        if (w + adv > max_w && last != text) return (int)(last - text);
+        /* A run that is exactly as wide as its box (the box was sized from this very measurement) must fit:
+         * the sum of the advances and the box width differ by float rounding only. */
+        if (w + adv > max_w + 0.05f && last != text) return (int)(last - text);
         w += adv;
         last = p;
         (void)before;
@@ -17227,6 +17357,7 @@ static void draw_image(float x, float y, float w, float h, float radius, GLuint 
     glUniform1f(img_loc.uAlpha, alpha);
     glUniform2f(img_loc.uImgOrigin, img_x, img_y);
     glUniform2f(img_loc.uImgDrawSize, img_w, img_h);
+    glUniform2f(img_loc.uImgRepeat, e && (e->bg_repeat & 1) ? 1.0f : 0.0f, e && (e->bg_repeat & 2) ? 1.0f : 0.0f);
     if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     glUniform1i_(img_loc.uImage, 0);
@@ -17254,6 +17385,7 @@ static void draw_image_piece(float dx, float dy, float dw, float dh,
     glUniform2f(img_loc.uImgOrigin, -sx * dw / sw,
                 -((float)th - sy - sh) * dh / sh);
     glUniform2f(img_loc.uImgDrawSize, img_w, img_h);
+    glUniform2f(img_loc.uImgRepeat, 0.0f, 0.0f);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
@@ -17447,7 +17579,10 @@ void draw_rect_full(float x, float y, float w, float h,
                     const float* rad4, float b_w,
                     float bd_r, float bd_g, float bd_b, float bd_a,
                     const LunaElement* ge) {
-    int grad_mode = (ge && ge->has_gradient) ? ge->grad_type : GRAD_NONE;
+    /* background-clip: text paints its gradient through the glyphs only, never as a box */
+    const int clip_text = ge && ge->has_bg_clip_text && ge->has_gradient;
+    int grad_mode = (ge && ge->has_gradient && !clip_text) ? ge->grad_type : GRAD_NONE;
+    if (clip_text) a = 0.0f;        /* the first gradient stop doubles as the flat fill: drop it too */
     if (a <= 0.0f && bd_a <= 0.0f && grad_mode == GRAD_NONE) return;
 
     // CSS border-radius: 50% is stored as 50 (parse_float_val ignores %).
@@ -17468,7 +17603,7 @@ void draw_rect_full(float x, float y, float w, float h,
     uni1f(bg_loc.uBorderWidth, &bg_uni.uBorderWidth, b_w);
     uni4f(bg_loc.uRadius4, &bg_uni.uRadius4, c4[0], c4[1], c4[2], c4[3]);
     uni1i(bg_loc.uGradient, &bg_uni.uGradient, grad_mode);
-    if (ge && ge->has_gradient) {
+    if (ge && ge->has_gradient && !clip_text) {
         float erx = ge->grad_rad_rx_pct ? ge->grad_rad_rx * w : ge->grad_rad_rx;
         float ery = ge->grad_rad_ry_pct ? ge->grad_rad_ry * h : ge->grad_rad_ry;
         float stop_basis = gradient_stop_basis(ge->grad_type, ge->grad_angle,
@@ -17648,6 +17783,8 @@ static void flush_text_batch(GLuint tex, float* batch_buf, int* batch_count) {
     *batch_count = 0;
 }
 
+/* set while a background-clip: text gradient is being painted, so render_text_pass() keeps the shader's gradient mode on */
+static int g_text_grad_pass = 0;
 void render_text_pass(FontAtlas* atlas, const char* text,
                       float start_x, float baseline_y,
                       float r, float g, float b, float a) {
@@ -17680,7 +17817,7 @@ void render_text_pass(FontAtlas* atlas, const char* text,
     luna_use_program(text_program);
     uni2f(tx_loc.uResolution, &tx_uni.uResolution, LUNA_RRES_X, LUNA_RRES_Y);
     uni4f(tx_loc.textColor,   &tx_uni.textColor,   r, g, b, a);
-    uni1i(tx_loc.uGradMode,   &tx_uni.uGradMode,   0);
+    uni1i(tx_loc.uGradMode,   &tx_uni.uGradMode,   g_text_grad_pass);
     if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
     luna_bind_vao(text_vao);
 
@@ -17713,7 +17850,7 @@ void render_text_pass(FontAtlas* atlas, const char* text,
             t0 = (float)bc->y0 / (float)LUNA_ASCII_ATLAS_SIZE;
             s1 = (float)bc->x1 / (float)LUNA_ASCII_ATLAS_SIZE;
             t1 = (float)bc->y1 / (float)LUNA_ASCII_ATLAS_SIZE;
-            draw_x += bc->xadvance + g_text_letter_spacing;
+            draw_x += bc->xadvance + g_text_letter_spacing + g_text_synth_adv;
         } else {
             LunaDynGlyph* gd = dyn_bake_glyph(cp, css_px);
             if (!gd) continue;
@@ -17726,7 +17863,7 @@ void render_text_pass(FontAtlas* atlas, const char* text,
             t0 = gd->y0 / (float)LUNA_DYN_ATLAS_H;
             s1 = gd->x1 / (float)LUNA_DYN_ATLAS_W;
             t1 = gd->y1 / (float)LUNA_DYN_ATLAS_H;
-            draw_x += gd->xadvance + g_text_letter_spacing;
+            draw_x += gd->xadvance + g_text_letter_spacing + g_text_synth_adv;
         }
 
         /* Flush on texture boundary or full buffer */
@@ -18064,12 +18201,14 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
             float ex = x - g_render_off_x;
             float ey = y - g_render_off_y;
             uni4f(tx_loc.uElemBounds, &tx_uni.uElemBounds, ex, ey, box_w, box_h);
+            g_text_grad_pass = 1;
             render_text_pass(atlas, line, start_x, baseline, 1.0f, 1.0f, 1.0f, 1.0f);
             if (is_fake_bold) {
                 render_text_pass(atlas, line, start_x + 1.0f, baseline, 1.0f, 1.0f, 1.0f, 1.0f);
                 if (fsize >= 24.0f)
                     render_text_pass(atlas, line, start_x + 2.0f, baseline, 1.0f, 1.0f, 1.0f, 1.0f);
             }
+            g_text_grad_pass = 0;
             luna_use_program(text_program);
             uni1i(tx_loc.uGradMode, &tx_uni.uGradMode, 0);
         } else {
@@ -20126,10 +20265,10 @@ static void key_callback(void* window, int key, int scancode, int action, int mo
             if (fe->is_input) return;
             if (fe->on_click) {
                 fe->is_active = 1;
-                update_element_style(fe);
+                (void)restyle_element_checked(fe);
                 fe->on_click(fe);
                 fe->is_active = 0;
-                update_element_style(fe);
+                (void)restyle_element_checked(fe);
             }
         }
         return;
@@ -22489,6 +22628,7 @@ static void cache_uniform_locations(void) {
     img_loc.uImage      = glGetUniformLocation(img_program, "uImage");
     img_loc.uImgOrigin  = glGetUniformLocation(img_program, "uImgOrigin");
     img_loc.uImgDrawSize = glGetUniformLocation(img_program, "uImgDrawSize");
+    img_loc.uImgRepeat = glGetUniformLocation(img_program, "uImgRepeat");
     if (blur_program) {
         blur_loc.uResolution  = glGetUniformLocation(blur_program, "uResolution");
         blur_loc.uPos         = glGetUniformLocation(blur_program, "uPos");

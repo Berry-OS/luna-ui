@@ -5336,6 +5336,21 @@ static int file_dialog_handle_key(int key, int scancode, int action, int mods) {
         }
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_COMMA)open_settings_dialog();
         else if(g.settings_open||g.open_with_open||g.desktop_edit_open){}
+        else if(g.modal_kind){}
+        else if((mods&LUNA_MOD_ALT)&&key==LUNA_KEY_LEFT)on_back(NULL);
+        else if((mods&LUNA_MOD_ALT)&&key==LUNA_KEY_RIGHT)on_forward(NULL);
+        else if((mods&LUNA_MOD_ALT)&&key==LUNA_KEY_UP)on_up(NULL);
+        else if(action==LUNA_PRESS&&(key==LUNA_KEY_F5||((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_R)))on_reload(NULL);
+        else if(action==LUNA_PRESS&&(mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_H){on_hidden(NULL);apply_basic_preferences();}
+        else if(action==LUNA_PRESS&&(mods&LUNA_MOD_CONTROL)&&(mods&LUNA_MOD_SHIFT)&&key==LUNA_KEY_N)on_new_folder(NULL);
+        else if(action==LUNA_PRESS&&(mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_F&&g.show_search){luna_focus_element(g.id_search);}
+        else if(focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input&&
+                (key==LUNA_KEY_HOME||key==LUNA_KEY_END||key==LUNA_KEY_PAGE_UP||key==LUNA_KEY_PAGE_DOWN)){
+            int page=g.view_cols>1&&g.grid_view?g.view_cols*4:10;
+            if(key==LUNA_KEY_HOME)move_selection_by(-g.vis_count);
+            else if(key==LUNA_KEY_END)move_selection_by(g.vis_count);
+            else move_selection_by(key==LUNA_KEY_PAGE_UP?-page:page);
+        }
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_C&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(0);
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_X&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(1);
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_V&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)paste_clipboard();

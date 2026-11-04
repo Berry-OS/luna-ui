@@ -575,6 +575,23 @@ static void test_transition_property_and_click_bubbling(void) {
     check_true(bubbled_clicks == 1, "a click on a child fires its ancestor's onclick");
 }
 
+/* border-radius percentages are relative to the box, not pixels. */
+static void test_percentage_border_radius(void) {
+    luna_window_width = 800.0f;
+    luna_window_height = 600.0f;
+    luna_reset_css();
+    luna_parse_html("<body><div id=\"blob\"></div><div id=\"pill\"></div></body>");
+    luna_parse_css("body{margin:0}#blob{width:300px;height:300px;border-radius:50%}"
+                   "#pill{width:200px;height:60px;border-radius:12px 50%}");
+    update_layout_pass();
+    int blob = luna_get_element_by_id("blob"), pill = luna_get_element_by_id("pill");
+    check_true(blob >= 0 && pill >= 0, "radius fixture is addressable");
+    if (blob < 0 || pill < 0) return;
+    check_near(elements[blob].rad_c[0], 150.0f, 0.5f, "50% of a 300px box is a 150px corner (a circle)");
+    check_near(elements[pill].rad_c[0], 12.0f, 0.01f, "pixel corners stay pixels");
+    check_near(elements[pill].rad_c[1], 30.0f, 0.5f, "a percentage corner follows the shorter side");
+}
+
 static void test_calc_viewport_length(void) {
     float value = 0.0f, offset = 0.0f;
     int percent = 0;
@@ -630,6 +647,7 @@ int main(void) {
     test_wrapping_flex_overflow_scroll();
     test_wrapping_row_in_column_measure();
     test_transition_property_and_click_bubbling();
+    test_percentage_border_radius();
     test_calc_viewport_length();
     test_overlay_render_order();
     if (failures) {
