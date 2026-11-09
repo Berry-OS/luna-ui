@@ -750,6 +750,13 @@ void luna_set_image_decoder(LunaImageDecoder fn);
  * separate (luna_reset_css); a host that keeps its sheet may reset only
  * this. */
 void luna_reset_document(void);
+/* Textures whose key starts with this prefix survive luna_reset_document().  A
+ * host that uploads pictures under names of its own (no file behind them) keeps
+ * them across the document republishes it does every frame, instead of
+ * uploading every picture again each time.  They go away through
+ * luna_invalidate_texture(). */
+void luna_set_persistent_texture_prefix(const char* prefix);
+int luna_has_texture(const char* key);
 /* Web viewport scrolling is independent of an element's overflow box. */
 void luna_document_scroll(float x, float y);
 void luna_document_scroll_state(float* x, float* y, float* width, float* height);
@@ -903,11 +910,20 @@ int  luna_get_element_by_class(const char* class_name);
 int  luna_focused_element(void);
 void luna_focus_element(int idx);
 void luna_set_text(int idx, const char* text);
+/* Moves an absolutely positioned element: its left/top (px, against its
+ * parent) become these values and only layout is redone. */
+void luna_set_position(int idx, float left, float top);
 /* Drop a cached GL texture so the next paint reloads it from disk. */
 void luna_invalidate_texture(const char* path);
 /* Presenting thread only. RGBA rows are bottom-up, like decoded textures.  Elements whose
  * background-image is `key` pick the new pixels up and count as damaged on the next paint. */
 int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char* pixels);
+/* The same for a picture that changed only inside a rectangle (x, y, rw, rh in
+ * texture rows, the way the pixels are laid out in `pixels`, which is the whole
+ * w x h image).  Falls back to a full upload when the texture is not there or
+ * has another size. */
+int luna_update_texture_rgba_rect(const char* key, int w, int h, const unsigned char* pixels,
+                                  int x, int y, int rw, int rh);
 /* Set or clear element background-image via inline style (empty path clears). */
 void luna_set_background_image(int idx, const char* path);
 /* Update only the painted text, preserving the element's current geometry.
@@ -3871,9 +3887,6 @@ static int            g_font_bold_hint = 0;
  * is not one of the pre-baked sizes, or whenever the framebuffer has a
  * device-pixel ratio above 1.  This avoids scaling a nearby atlas size. */
 static int            g_text_dynamic_ascii = 0;
-/* Synthetic bold (no bold face loaded) smears each glyph 1px to the right (2px from 24px up).  The pen has to
- * advance by the same amount, or neighbouring letters fuse and the measured width comes out short. */
-static float          g_text_synth_adv = 0.0f;
 
 #define LUNA_ASCII_ATLAS_SIZE 512
 #define LUNA_DYN_ATLAS_W 1024
@@ -4419,8 +4432,8 @@ static float glyph_metric_advance(int cp, float css_px) {
 
 static float glyph_advance(FontAtlas* atlas, int cp, float css_px) {
     if (cp >= 32 && cp < 128 && !g_text_dynamic_ascii)
-        return atlas->cdata[cp - 32].xadvance + g_text_synth_adv;
-    return glyph_metric_advance(cp, css_px) + g_text_synth_adv;
+        return atlas->cdata[cp - 32].xadvance;
+    return glyph_metric_advance(cp, css_px);
 }
 
 static char g_screenshot_path[512] = {0};
@@ -16977,8 +16990,8 @@ static void text_metrics_begin(float css_px, int bold, int face, FontAtlas* atla
     g_text_css_px = css_px > 0.0f ? css_px : 16.0f;
     g_font_face_hint = face;
     g_font_bold_hint = (bold && bold_font_loaded) ? 1 : 0;
-    g_text_synth_adv = (bold && !(bold_font_loaded && g_bold_font_ttf))
-                           ? (g_text_css_px >= 24.0f ? 2.0f : 1.0f) : 0.0f;
+    /* Synthetic bold widens ink only. Keep advances identical to the face
+     * metrics used by luna_measure_text and the Android Paint bridge. */
     g_text_dynamic_ascii = (face >= 3) || !atlas || !atlas->loaded ||
                            fabsf(atlas_nominal_size(atlas) - g_text_css_px) > 0.01f ||
                            text_device_scale() > 1.01f;
@@ -16989,7 +17002,6 @@ static void text_metrics_end(void) {
     g_font_face_hint = 0;
     g_font_bold_hint = 0;
     g_text_dynamic_ascii = 0;
-    g_text_synth_adv = 0.0f;
 }
 
 float measure_text_width(FontAtlas* atlas, const char* text) {
@@ -17850,7 +17862,7 @@ void render_text_pass(FontAtlas* atlas, const char* text,
             t0 = (float)bc->y0 / (float)LUNA_ASCII_ATLAS_SIZE;
             s1 = (float)bc->x1 / (float)LUNA_ASCII_ATLAS_SIZE;
             t1 = (float)bc->y1 / (float)LUNA_ASCII_ATLAS_SIZE;
-            draw_x += bc->xadvance + g_text_letter_spacing + g_text_synth_adv;
+            draw_x += bc->xadvance + g_text_letter_spacing;
         } else {
             LunaDynGlyph* gd = dyn_bake_glyph(cp, css_px);
             if (!gd) continue;
@@ -17863,7 +17875,7 @@ void render_text_pass(FontAtlas* atlas, const char* text,
             t0 = gd->y0 / (float)LUNA_DYN_ATLAS_H;
             s1 = gd->x1 / (float)LUNA_DYN_ATLAS_W;
             t1 = gd->y1 / (float)LUNA_DYN_ATLAS_H;
-            draw_x += gd->xadvance + g_text_letter_spacing + g_text_synth_adv;
+            draw_x += gd->xadvance + g_text_letter_spacing;
         }
 
         /* Flush on texture boundary or full buffer */
@@ -17889,6 +17901,26 @@ void render_text_pass(FontAtlas* atlas, const char* text,
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+
+/* A line may end between two CJK characters (CSS line-break: normal): Japanese
+ * and Chinese have no spaces, so without this a title wider than its box ran on
+ * past it instead of wrapping.  `take` is a byte offset on a character boundary. */
+static int cjk_wrappable_cp(int cp) {
+    return (cp >= 0x2E80 && cp <= 0x9FFF) || (cp >= 0xA960 && cp <= 0xA97F) ||
+           (cp >= 0xAC00 && cp <= 0xD7FF) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+           (cp >= 0xFF00 && cp <= 0xFFEF) || (cp >= 0x20000 && cp <= 0x3FFFF);
+}
+static int cjk_break_at(const char* p, int take) {
+    if (take <= 0) return 0;
+    int k = take - 1;
+    while (k > 0 && ((unsigned char)p[k] & 0xC0) == 0x80) k--;      /* start of the previous character */
+    const char* q = p + k;
+    int prev = utf8_decode(&q);
+    q = p + take;
+    if (!*q) return 0;
+    int next = utf8_decode(&q);
+    return cjk_wrappable_cp(prev) && cjk_wrappable_cp(next);
+}
 
 static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
                             float line_h, int max_lines,
@@ -17920,7 +17952,9 @@ static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
         } else {
             take = fit_text_chars(atlas, p, para_len, box_w);
             if (take <= 0 && para_len > 0) take = 1;
-            if (take < para_len && !overflow_wrap) {
+            if (take < para_len && !overflow_wrap && cjk_break_at(p, take)) {
+                /* between two CJK characters: the line ends here */
+            } else if (take < para_len && !overflow_wrap) {
                 int last_space = -1;
                 for (int i = 0; i < take; i++)
                     if (p[i] == ' ' || p[i] == '\t') last_space = i;
@@ -18098,7 +18132,9 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
         } else {
             take = fit_text_chars(atlas, p, para_len, box_w);
             if (take <= 0 && para_len > 0) take = 1;
-            if (take < para_len && !overflow_wrap) {
+            if (take < para_len && !overflow_wrap && cjk_break_at(p, take)) {
+                /* between two CJK characters: the line ends here */
+            } else if (take < para_len && !overflow_wrap) {
                 int last_space = -1;
                 for (int i = 0; i < take; i++)
                     if (p[i] == ' ' || p[i] == '\t') last_space = i;
@@ -20546,6 +20582,16 @@ int luna_element_bounds(int idx, float* x, float* y, float* w, float* h) {
 }
 
 void luna_set_text(int i, const char* t) { g_probe_prepared = 0; set_text(i, t); }
+void luna_set_position(int i, float left, float top) {
+    if (i < 0 || i >= elem_count) return;
+    LunaElement* e = &elements[i];
+    e->has_left = 1; e->has_top = 1;
+    e->pct_left = 0; e->pct_top = 0;
+    e->raw_left = left; e->raw_top = top;
+    e->raw_left_off = 0.0f; e->raw_top_off = 0.0f;
+    e->rel_x = left; e->rel_y = top;
+    LUNA_LAYOUT_DIRTY();
+}
 int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char* pixels) {
     if (!key || !*key || strlen(key) >= sizeof(g_tex_cache[0].path) || !pixels || w <= 0 || h <= 0) return 0;
     int slot = 0;
@@ -20582,6 +20628,25 @@ int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char*
             elements[i].bg_image_tex = entry->tex;
             elements[i].bg_image_rev++;     /* same texture id, new pixels: partial-redraw damage must see it */
         }
+    return 1;
+}
+int luna_update_texture_rgba_rect(const char* key, int w, int h, const unsigned char* pixels,
+                                  int x, int y, int rw, int rh) {
+    if (!key || !*key || !pixels || w <= 0 || h <= 0) return 0;
+    int slot = 0;
+    while (slot < g_tex_count && strcmp(g_tex_cache[slot].path, key) != 0) slot++;
+    if (slot == g_tex_count || !g_tex_cache[slot].tex || g_tex_cache[slot].tw != w || g_tex_cache[slot].th != h ||
+        x < 0 || y < 0 || rw <= 0 || rh <= 0 || x + rw > w || y + rh > h)
+        return luna_update_texture_rgba(key, w, h, pixels);
+    TexEntry* entry = &g_tex_cache[slot];
+    glBindTexture(GL_TEXTURE_2D, entry->tex);
+    /* Whole rows: the rows are contiguous in `pixels`, so no row length is needed. */
+    (void)x; (void)rw;
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, w, rh, GL_RGBA, GL_UNSIGNED_BYTE, pixels + (size_t)y * (size_t)w * 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    g_probe_prepared = 0;
+    for (int i = 0; i < elem_count; i++)
+        if (strcmp(elements[i].bg_image_path, key) == 0) elements[i].bg_image_rev++;
     return 1;
 }
 void luna_invalidate_texture(const char* path) {
@@ -20694,13 +20759,43 @@ void luna_reset_css(void) {
 }
 void luna_set_preserve_backdrop(int enabled) { g_preserve_backdrop = enabled ? 1 : 0; }
 
+static char g_persistent_tex_prefix[4][32];
+void luna_set_persistent_texture_prefix(const char* prefix) {
+    /* Up to four prefixes; setting one that is already there changes nothing,
+       and NULL or "" clears the list. */
+    if (!prefix || !*prefix) { memset(g_persistent_tex_prefix, 0, sizeof g_persistent_tex_prefix); return; }
+    for (int i = 0; i < 4; i++)
+        if (!strcmp(g_persistent_tex_prefix[i], prefix)) return;
+    for (int i = 0; i < 4; i++)
+        if (!g_persistent_tex_prefix[i][0]) { snprintf(g_persistent_tex_prefix[i], sizeof g_persistent_tex_prefix[i], "%s", prefix); return; }
+}
+static int persistent_texture_key(const char* key) {
+    for (int i = 0; i < 4; i++) {
+        size_t n = strlen(g_persistent_tex_prefix[i]);
+        if (n && strncmp(key, g_persistent_tex_prefix[i], n) == 0) return 1;
+    }
+    return 0;
+}
+int luna_has_texture(const char* key) {
+    if (!key) return 0;
+    for (int i = 0; i < g_tex_count; i++)
+        if (g_tex_cache[i].tex && strcmp(g_tex_cache[i].path, key) == 0) return 1;
+    return 0;
+}
 void luna_reset_document(void) {
     /* Texture keys include relative paths. They belong to this document's
        base URL; retaining them would display another page's image and grow
-       GPU memory without bound across navigations. */
-    for (int i = 0; i < g_tex_count; i++)
+       GPU memory without bound across navigations.  Only the host's own
+       named pictures (see luna_set_persistent_texture_prefix) are kept. */
+    int kept = 0;
+    for (int i = 0; i < g_tex_count; i++) {
+        if (g_tex_cache[i].tex && persistent_texture_key(g_tex_cache[i].path)) {
+            g_tex_cache[kept++] = g_tex_cache[i];
+            continue;
+        }
         if (g_tex_cache[i].tex) glDeleteTextures(1, &g_tex_cache[i].tex);
-    g_tex_count = 0;
+    }
+    g_tex_count = kept;
     g_dom_struct_ver++;
     g_document_scroll_x = g_document_scroll_y = 0.0f;
     g_document_width = window_width;

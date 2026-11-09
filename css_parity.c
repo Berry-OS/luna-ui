@@ -628,7 +628,30 @@ static void test_overlay_render_order(void) {
                "appending an accessibility overlay leaves underlying controls clickable");
 }
 
+/* Synthetic bold changes ink coverage, not glyph advances.  The Android
+   Paint bridge and host line breaking must agree even without a bold face. */
+static void test_synthetic_bold_metrics(void) {
+    int saved_loaded = font_loaded;
+    check_true(luna_prepare_font_metrics(), "font metrics available");
+    int saved_bold_loaded = bold_font_loaded;
+    bold_font_loaded = 0;
+    const char *samples[] = {"番組", "すべて", "Label"};
+    for (int i = 0; i < 3; ++i) {
+        float width = luna_measure_text(samples[i], 26.0f, 1);
+        text_metrics_begin(26.0f, 1, 0, NULL);
+        check_near(measure_text_width(NULL, samples[i]), width, 0.001f,
+                   "synthetic bold line layout agrees with Paint measurement");
+        check_true(count_text_lines(NULL, samples[i], ceilf(width), 32.0f,
+                                   10, 0, 0, 0) == 1,
+                   "text fitting its measured width stays on one line");
+        text_metrics_end();
+    }
+    bold_font_loaded = saved_bold_loaded;
+    font_loaded = saved_loaded;
+}
+
 int main(void) {
+    test_synthetic_bold_metrics();
     test_example_layout();
     test_gradient_geometry_and_color();
     test_conic_and_ellipse_cascade();
