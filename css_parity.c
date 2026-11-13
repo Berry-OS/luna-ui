@@ -305,12 +305,14 @@ static void test_long_data_url(void) {
 /* background-size percentages are of the box; auto keeps the aspect. */
 static void test_background_size_units(void) {
     luna_reset_css();
-    luna_parse_html("<body><div id=\"bgs-a\">x</div><div id=\"bgs-b\">x</div></body>");
+    luna_parse_html("<body><div id=\"bgs-a\">x</div><div id=\"bgs-b\">x</div><div id=\"bgs-c\">x</div></body>");
     luna_parse_css("#bgs-a{width:400px;height:200px;background-size:100% 100%}"
-                   "#bgs-b{width:400px;height:200px;background-size:50%}");
+                   "#bgs-b{width:400px;height:200px;background-size:50%}"
+                   "#bgs-c{width:400px;height:200px;background-size:auto}");
     int a = luna_get_element_by_id("bgs-a"), b = luna_get_element_by_id("bgs-b");
-    check_true(a >= 0 && b >= 0, "background-size fixture is addressable");
-    if (a < 0 || b < 0) return;
+    int c = luna_get_element_by_id("bgs-c");
+    check_true(a >= 0 && b >= 0 && c >= 0, "background-size fixture is addressable");
+    if (a < 0 || b < 0 || c < 0) return;
     float ox, oy, w, h;
     bg_image_dest_rect(&elements[a], 400.0f, 200.0f, 100, 50, &ox, &oy, &w, &h);
     check_near(w, 400.0f, 0.01f, "background-size 100% spans the box width");
@@ -318,6 +320,9 @@ static void test_background_size_units(void) {
     bg_image_dest_rect(&elements[b], 400.0f, 200.0f, 100, 50, &ox, &oy, &w, &h);
     check_near(w, 200.0f, 0.01f, "background-size 50% is half the box width");
     check_near(h, 100.0f, 0.01f, "background-size auto height keeps the aspect");
+    bg_image_dest_rect(&elements[c], 400.0f, 200.0f, 100, 50, &ox, &oy, &w, &h);
+    check_near(w, 100.0f, 0.01f, "background-size auto is the image's own width, not the box's");
+    check_near(h, 50.0f, 0.01f, "background-size auto is the image's own height, not the box's");
 }
 
 static void test_dynamic_ancestor_selector(void) {

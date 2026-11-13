@@ -314,6 +314,10 @@ LunaAppConfig luna_android_make_config(void) {
 
 Link `android`, `EGL`, `GLESv3`, `dl`, and `log`. Pack HTML, CSS, images, and bundled fonts in the APK assets as appropriate.
 
+## 🔢 Element indices and DOM changes
+
+Elements are addressed by index, and the element array is kept in document (= paint) order, so `luna_dom_insert()` / `luna_dom_set_inner_html()` renumber elements. Register every `int` that stores an index with `luna_dom_track(&idx)` and Luna rewrites it on each renumbering; there is nothing to re-look-up (`luna_dom_untrack()` to stop; `luna_dom_uid()` / `luna_dom_find()` remain for handles that outlive the array slot).
+
 ## 🔧 Custom host / embedding
 
 The renderer can be embedded in another window system without any built-in host:

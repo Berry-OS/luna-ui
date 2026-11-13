@@ -1005,6 +1005,14 @@ void luna_flush_pending_screenshot(void);
  */
 unsigned luna_dom_uid(int idx);
 int  luna_dom_find(unsigned uid);
+/* Keeps a stored index valid.  Register the address of every int that holds an
+ * element index (luna_get_element_by_id() results, array slots, struct fields);
+ * whenever the DOM is renumbered the engine rewrites *idx to the element's new
+ * index, so the application never has to re-look-up after luna_dom_set_inner_html(),
+ * luna_dom_insert() & co.  The address must stay valid until luna_dom_untrack()
+ * (or luna_shutdown()).  Tracking the same address twice is a no-op. */
+void luna_dom_track(int* idx);
+void luna_dom_untrack(int* idx);
 /* Web-document mode: HTML's default inline boxes (span, a, b, img, input…)
  * and text runs between elements as anonymous "#text" nodes.  Set before
  * parsing; Luna's own UIs leave it off. */
@@ -8867,7 +8875,13 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 rule->has_bg_size = 1;
                 if (strcmp(val, "cover") == 0)   { rule->bg_size_mode = 1; }
                 else if (strcmp(val, "contain") == 0) { rule->bg_size_mode = 2; }
-                else if (strcmp(val, "auto") == 0)    { rule->bg_size_mode = 0; }
+                else if (strcmp(val, "auto") == 0) {
+                    /* CSS `auto` is the image's own size.  (An element that
+                     * never says is left as it always was: the image fills
+                     * its box.) */
+                    rule->bg_size_mode = 3;
+                    rule->bg_size_wu = rule->bg_size_hu = LUNA_BG_SIZE_AUTO;
+                }
                 else {
                     /* <w> [<h>]: each auto, a length or a percentage of the
                      * box; one value means `<w> auto`. */
@@ -20964,6 +20978,24 @@ static void dom_invalidate_index_state(void) {
     g_probe_prepared = 0;
 }
 
+static int** g_dom_tracked = NULL;
+static int g_dom_tracked_n = 0, g_dom_tracked_cap = 0;
+void luna_dom_track(int* idx) {
+    if (!idx) return;
+    for (int i = 0; i < g_dom_tracked_n; i++) if (g_dom_tracked[i] == idx) return;
+    if (g_dom_tracked_n == g_dom_tracked_cap) {
+        int cap = g_dom_tracked_cap ? g_dom_tracked_cap * 2 : 64;
+        int** grown = (int**)realloc(g_dom_tracked, sizeof(int*) * (size_t)cap);
+        if (!grown) return;
+        g_dom_tracked = grown; g_dom_tracked_cap = cap;
+    }
+    g_dom_tracked[g_dom_tracked_n++] = idx;
+}
+void luna_dom_untrack(int* idx) {
+    for (int i = 0; i < g_dom_tracked_n; i++)
+        if (g_dom_tracked[i] == idx) { g_dom_tracked[i] = g_dom_tracked[--g_dom_tracked_n]; return; }
+}
+
 /* Reorders elements[] so that new position k holds old element order[k], and
  * renumbers everything that refers to an element by index. */
 static int dom_apply_order(const int* order) {
@@ -21004,6 +21036,8 @@ static int dom_apply_order(const int* order) {
     g_scroll_hover_idx = DOM_RM(g_scroll_hover_idx);
     for (int i = 0; i < g_hover_chain_count; i++)
         g_hover_chain[i] = DOM_RM(g_hover_chain[i]);
+    for (int i = 0; i < g_dom_tracked_n; i++)
+        *g_dom_tracked[i] = DOM_RM(*g_dom_tracked[i]);
 #undef DOM_RM
     if (++g_hover_epoch == 0) g_hover_epoch = 1;
     free(remap);
@@ -22811,6 +22845,7 @@ void luna_shutdown(void) {
 #undef LUNA_AUX_FREE
     g_aux_cap = 0;
     free(elements); elements = NULL; g_elements_cap = 0; elem_count = 0;
+    free(g_dom_tracked); g_dom_tracked = NULL; g_dom_tracked_n = g_dom_tracked_cap = 0;
     free(css_rules); css_rules = NULL; g_rules_cap = 0; rule_count = 0;
     free(g_rule_order); g_rule_order = NULL;
     g_rule_sorted_count = 0;
