@@ -1,5 +1,6 @@
 /*
  * luna-ui.h — Luna UI: CSS/HTML layout + OpenGL renderer (single-file library)
+ * Copyright © 2026 Yuichiro Nakada / MPL 2.0
  *
  * Paint path is CSS-driven (boxes, gradients, shadows, text, caret-color).
  * Text controls: <input type="text|password"> / <textarea>
@@ -16,8 +17,8 @@
  * Requires nanosvg.h + nanosvgrast.h next to this header. Override DPI with
  * LUNA_UI_SVG_DPI (default 96) or clamp edge length with LUNA_UI_SVG_MAX_EDGE.
  *
- * Copyright © 2026 Yuichiro Nakada / Project Vespera — MPL 2.0
  */
+
 #ifndef LUNA_UI_H
 #define LUNA_UI_H
 
@@ -16729,6 +16730,31 @@ static unsigned char* luna_try_font_candidates(const char* const* paths,
     return NULL;
 }
 
+#if defined(_WIN32)
+/* Also used by embedded hosts which do not install luna_windows.h callbacks. */
+static unsigned char* luna_try_windows_font(int role, long* out_size) {
+    static const char* const names[][4] = {
+        {"segoeui.ttf", "arial.ttf", NULL, NULL},
+        {"segoeuib.ttf", "arialbd.ttf", NULL, NULL},
+        {"YuGothR.ttc", "meiryo.ttc", "msgothic.ttc", NULL},
+        {"consola.ttf", "cour.ttf", NULL, NULL}
+    };
+    const char* root = getenv("SystemRoot");
+    char path[1024];
+    if (!root || !root[0]) root = getenv("WINDIR");
+    if (!root || !root[0]) return NULL;
+    if (role < LUNA_FONT_REGULAR || role > LUNA_FONT_MONO) return NULL;
+    for (size_t i = 0; names[role][i]; ++i) {
+        int n = snprintf(path, sizeof(path), "%s/Fonts/%s", root, names[role][i]);
+        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+        const char* candidate = path;
+        unsigned char* p = luna_try_font_candidates(&candidate, 1, out_size, "system font");
+        if (p) return p;
+    }
+    return NULL;
+}
+#endif
+
 static unsigned char* g_app_font_reg = NULL;  static long g_app_font_reg_sz = 0;
 static unsigned char* g_app_font_bold = NULL;  static long g_app_font_bold_sz = 0;
 static unsigned char* luna_dup_bytes(const unsigned char* p, long n) {
@@ -16823,13 +16849,17 @@ int luna_prepare_font_metrics(void) {
     if (!reg_buf) {
         static const char* const cands[] = {
             "/System/Library/Fonts/Helvetica.ttc", "/System/Library/Fonts/HelveticaNeue.ttc",
-            "/System/Library/Fonts/Geneva.ttf", "/Library/Fonts/Arial.ttf"
+            "/System/Library/Fonts/Geneva.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf"
         };
         reg_buf = luna_try_font_candidates(cands, sizeof(cands)/sizeof(cands[0]),
                                            &g_font_ttf_sz, "regular font");
     }
 #endif
     if (!reg_buf) reg_buf = try_load_font_list(&reg, font_path_score_ui, &g_font_ttf_sz);
+#if defined(_WIN32)
+    if (!reg_buf) reg_buf = luna_try_windows_font(LUNA_FONT_REGULAR, &g_font_ttf_sz);
+#endif
 
     if (!g_bold_font_ttf) {
         static const char* const cands[] = {
@@ -16843,6 +16873,19 @@ int luna_prepare_font_metrics(void) {
     }
     if (!g_bold_font_ttf)
         g_bold_font_ttf = try_load_font_list(&bold_list, font_path_score_ui, &bold_sz);
+
+#if defined(_WIN32)
+    if (!g_bold_font_ttf) g_bold_font_ttf = luna_try_windows_font(LUNA_FONT_BOLD, &bold_sz);
+#elif defined(__APPLE__)
+    if (!g_bold_font_ttf) {
+        static const char* const cands[] = {
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf"
+        };
+        g_bold_font_ttf = luna_try_font_candidates(cands, sizeof(cands)/sizeof(cands[0]),
+                                                   &bold_sz, "bold font");
+    }
+#endif
 
     if (!g_cjk_font_ttf) {
         const char* env = getenv("LUNA_FONT_CJK");
@@ -16863,6 +16906,9 @@ int luna_prepare_font_metrics(void) {
     }
 #endif
     if (!g_cjk_font_ttf) g_cjk_font_ttf = try_load_font_list(&reg, font_path_score, &cjk_sz);
+#if defined(_WIN32)
+    if (!g_cjk_font_ttf) g_cjk_font_ttf = luna_try_windows_font(LUNA_FONT_CJK, &cjk_sz);
+#endif
 
     if (!g_mono_font_ttf) {
         const char* env = getenv("LUNA_FONT_MONO");
@@ -16879,6 +16925,9 @@ int luna_prepare_font_metrics(void) {
     }
 #endif
     if (!g_mono_font_ttf) g_mono_font_ttf = try_load_font_list(&reg, font_path_score_mono, &mono_sz);
+#if defined(_WIN32)
+    if (!g_mono_font_ttf) g_mono_font_ttf = luna_try_windows_font(LUNA_FONT_MONO, &mono_sz);
+#endif
 
     if (!g_icon_font_ttf) {
         const char* env = getenv("LUNA_FONT_ICONS");
