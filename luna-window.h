@@ -1374,6 +1374,8 @@ static void volumes_poll(void);
 static void render_volumes(void);
 static void navigate(const char *path, int add_history);
 static void hide_volume_context(void);
+static int trash_base_dir(char *out, size_t cap);
+static int ensure_dir_all(const char *path, mode_t mode);
 static int program_exists(const char *name);
 static int pipe_read_program(const char *prog, char *const argv[], char *out, size_t cap);
 static void trim_text(char *s);
@@ -2128,6 +2130,11 @@ static void save_settings(void) {
     char path[PATH_MAX]; settings_path(path,sizeof(path));
     luna_platform_get_window_rect(NULL,NULL,&g.window_width,&g.window_height);
     if(g.cwd[0])safe_copy(g.last_directory,sizeof(g.last_directory),g.cwd);
+    {   /* ~/.config may not exist yet; without it the settings were silently never saved. */
+        char dir[PATH_MAX]; safe_copy(dir,sizeof(dir),path);
+        char *slash=strrchr(dir,'/');
+        if(slash&&slash!=dir){*slash=0;ensure_dir_all(dir,0755);}
+    }
     FILE *fp=fopen(path,"w"); if(!fp)return;
     fprintf(fp,"show_sidebar=%d\n",g.show_sidebar);
     fprintf(fp,"show_search=%d\n",g.show_search);
@@ -2182,7 +2189,12 @@ static void build_sidebar_paths(void) {
     xdg_user_dir("XDG_PICTURES_DIR","Pictures",g.side_paths[4],sizeof(g.side_paths[4]));
     xdg_user_dir("XDG_MUSIC_DIR","Music",g.side_paths[5],sizeof(g.side_paths[5]));
     xdg_user_dir("XDG_VIDEOS_DIR","Videos",g.side_paths[6],sizeof(g.side_paths[6]));
-    snprintf(g.side_paths[7],sizeof(g.side_paths[7]),"%s/.local/share/Trash/files",home_dir());
+    {
+        char trash[PATH_MAX];
+        if (!trash_base_dir(trash,sizeof(trash)) ||
+            !path_join(g.side_paths[7],sizeof(g.side_paths[7]),trash,"files"))
+            snprintf(g.side_paths[7],sizeof(g.side_paths[7]),"%s/.local/share/Trash/files",home_dir());
+    }
     safe_copy(g.side_paths[8],sizeof(g.side_paths[8]),"/");
 }
 
@@ -2662,6 +2674,23 @@ static int ensure_dir(const char *path, mode_t mode) {
     return errno == EEXIST;
 }
 
+/* mkdir -p.  The trash and the configuration live under ~/.local/share and
+ * ~/.config, which do not exist yet for a user who has never run a desktop
+ * (a freshly flashed board): a plain mkdir of the leaf fails there. */
+static int ensure_dir_all(const char *path, mode_t mode) {
+    char tmp[PATH_MAX];
+    size_t n = strlen(path);
+    if (!n || n >= sizeof(tmp)) return 0;
+    memcpy(tmp, path, n + 1);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return 0;
+        *p = '/';
+    }
+    return ensure_dir(tmp, mode);
+}
+
 static int copy_file_bytes(const char *src, const char *dst, mode_t mode) {
     int in = open(src, O_RDONLY | O_CLOEXEC);
     if (in < 0) return 0;
@@ -2785,12 +2814,21 @@ static void url_escape_path(const char *src, char *dst, size_t cap) {
     dst[w]=0;
 }
 
+/* XDG trash: $XDG_DATA_HOME/Trash, ~/.local/share/Trash by default. */
+static int trash_base_dir(char *out, size_t cap) {
+    const char *data_home = getenv("XDG_DATA_HOME");
+    int n = (data_home && data_home[0] == '/')
+        ? snprintf(out,cap,"%s/Trash",data_home)
+        : snprintf(out,cap,"%s/.local/share/Trash",home_dir());
+    return n > 0 && (size_t)n < cap;
+}
+
 static int move_to_trash(const char *path) {
     char base[PATH_MAX], files[PATH_MAX], info[PATH_MAX];
-    snprintf(base,sizeof(base),"%s/.local/share/Trash",home_dir());
-    path_join(files,sizeof(files),base,"files");
-    path_join(info,sizeof(info),base,"info");
-    ensure_dir(base,0700); ensure_dir(files,0700); ensure_dir(info,0700);
+    if (!trash_base_dir(base,sizeof(base))) return 0;
+    if (!path_join(files,sizeof(files),base,"files") ||
+        !path_join(info,sizeof(info),base,"info")) return 0;
+    if (!ensure_dir_all(base,0700) || !ensure_dir(files,0700) || !ensure_dir(info,0700)) return 0;
     char dst[PATH_MAX];
     if (!unique_destination(files,base_name(path),dst,sizeof(dst))) return 0;
     if (rename(path,dst)!=0) {
@@ -3485,7 +3523,7 @@ static int save_desktop_edit_dialog(void) {
         if (access(dest, W_OK) != 0) {
             char local_dir[PATH_MAX], local_name[NAME_MAX + 1];
             snprintf(local_dir, sizeof(local_dir), "%s/.local/share/applications", home_dir());
-            ensure_dir(local_dir, 0755);
+            ensure_dir_all(local_dir, 0755);
             safe_copy(local_name, sizeof(local_name), base_name(dest));
             if (!unique_destination(local_dir, local_name, dest, sizeof(dest))) {
                 show_toast("ユーザー領域へコピー保存できませんでした");
@@ -3612,7 +3650,7 @@ static void open_terminal_here(void) {
     }
     const char *env=getenv("TERMINAL");
     if(env&&*env&&launch_terminal_command(env,g.cwd)){show_toast("ターミナルを開きました");return;}
-    static const char *candidates[]={"xdg-terminal-exec","foot","kitty","alacritty","wezterm","gnome-terminal","konsole","xfce4-terminal","mate-terminal","lxterminal","qterminal","xterm",NULL};
+    static const char *candidates[]={"luna-term","xdg-terminal-exec","foot","kitty","alacritty","wezterm","gnome-terminal","konsole","xfce4-terminal","mate-terminal","lxterminal","qterminal","xterm",NULL};
     for(int i=0;candidates[i];i++){
         if(!program_exists(candidates[i]))continue;
         char *argv[]={(char*)candidates[i],NULL};
@@ -4398,7 +4436,9 @@ static void delete_selected(void) {
     int ok=0,fail=0;
     for(int i=0;i<g.entry_count;i++)if(g.entries[i].selected){if(move_to_trash(g.entries[i].path))ok++;else fail++;}
     refresh_sidebar_visibility();
-    load_directory(g.cwd);show_toast("%d 件をごみ箱へ移動%s",ok,fail?"（一部失敗）":"");
+    load_directory(g.cwd);
+    if(!ok)show_toast("ごみ箱へ移動できませんでした（%d 件）。Shift+Delete で完全に削除できます",fail);
+    else show_toast("%d 件をごみ箱へ移動%s",ok,fail?"（一部失敗）":"");
 }
 
 static void open_modal(int kind, int target) {
@@ -4461,7 +4501,18 @@ static void open_modal(int kind, int target) {
                             kind==3?"properties-dialog":"");
     }
     luna_push_focus_trap(g.id_modal,NULL,0);
-    if(kind!=3&&kind!=7)luna_focus_element(g.id_modal_input);
+    if(kind!=3&&kind!=7){
+        luna_focus_element(g.id_modal_input);
+        /* Typing replaces the suggestion instead of being appended to it.  A
+           rename keeps the extension out of the selection. */
+        luna_input_select_all(g.id_modal_input);
+        if(kind==2&&target>=0&&!g.entries[target].is_dir){
+            LunaElement *in=luna_element_at(g.id_modal_input);
+            const char *nm=g.entries[target].name;
+            const char *dot=strrchr(nm,'.');
+            if(in&&dot&&dot!=nm&&dot[1]){in->sel_anchor=0;in->sel_has=1;in->caret=(int)(dot-nm);}
+        }
+    }
     request_overlay_layout();
 }
 
@@ -5354,8 +5405,8 @@ static int file_dialog_handle_key(int key, int scancode, int action, int mods) {
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_C&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(0);
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_X&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)clipboard_take_selection(1);
         else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_V&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input)paste_clipboard();
-        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_A&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input){for(int k=0;k<g.vis_count;k++)g.entries[g.vis[k]].selected=1;refresh_file_visuals();}
-        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_L){reset_path_completion();luna_set_value(g.id_path,g.cwd);luna_focus_element(g.id_path);show_toast("場所バーを選択しました");}
+        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_A&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input){for(int k=0;k<g.vis_count;k++)g.entries[g.vis[k]].selected=1;refresh_file_visuals();consumed=1;/* not the page-wide text select-all */}
+        else if((mods&LUNA_MOD_CONTROL)&&key==LUNA_KEY_L){reset_path_completion();luna_set_value(g.id_path,g.cwd);luna_focus_element(g.id_path);luna_input_select_all(g.id_path);show_toast("場所バーを選択しました");}
         else if(key==LUNA_KEY_F2){int i=first_selected();if(i>=0)open_modal(2,i);}
         else if(action==LUNA_PRESS&&key==LUNA_KEY_F4)open_terminal_here();
         else if(key==LUNA_KEY_DELETE&&focused!=g.id_path&&focused!=g.id_search&&focused!=g.id_modal_input){if(mods&LUNA_MOD_SHIFT){int i=first_selected();if(i>=0)open_modal(7,i);}else delete_selected();}

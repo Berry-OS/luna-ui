@@ -354,7 +354,6 @@ static void luna_mac_frame(NSTimer* timer) {
         if (dt < 0.0 || dt > 0.25) dt = 1.0/60.0;
         if (luna_mac.config.on_frame)
             luna_mac.config.on_frame(dt, luna_mac.config.userdata);
-        luna_update(now, dt);
         (void)luna_needs_redraw(now, dt);   /* steps CSS transitions and animations */
         [[luna_mac.view openGLContext] makeCurrentContext];
         backing = [luna_mac.view convertRectToBacking:luna_mac.view.bounds];

@@ -404,6 +404,10 @@ static void luna_glfw_close(GLFWwindow* window) {
 
 /* ── LunaHostOps implementation ─────────────────────────────────────────── */
 
+static void luna_glfw_error(int code, const char* desc) {
+    fprintf(stderr, "luna-ui: GLFW error 0x%x: %s\n", code, desc ? desc : "");
+}
+
 static int luna_glfw_host_start(const LunaHostConfig* user_cfg) {
     LunaHostConfig cfg;
     LunaPlatform platform;
@@ -420,17 +424,66 @@ static int luna_glfw_host_start(const LunaHostConfig* user_cfg) {
 
     memset(&luna_glfw, 0, sizeof(luna_glfw));
     luna_glfw.config = cfg;
+    glfwSetErrorCallback(luna_glfw_error);
     if (!glfwInit()) {
         fprintf(stderr, "luna-ui: glfwInit failed\n");
         return 0;
     }
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_RESIZABLE, cfg.resizable ? GLFW_TRUE : GLFW_FALSE);
-    glfwWindowHint(GLFW_DECORATED, cfg.frameless ? GLFW_FALSE : GLFW_TRUE);
-    glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, cfg.transparent ? GLFW_TRUE : GLFW_FALSE);
-    luna_glfw.window = glfwCreateWindow(cfg.width, cfg.height, cfg.title, NULL, NULL);
+    /* Desktop OpenGL 3.3 core first; OpenGL ES 3.0 when the driver has no such
+     * context.  ARM boards are the case that matters: Mali under panfrost stops
+     * at desktop GL 3.1 while offering GLES 3.x, so asking only for 3.3 core
+     * meant no Luna application could open a window there at all.
+     * LUNA_GL=es forces the ES path, LUNA_GL=gl forbids it. */
+    {
+        const char* gl_env = getenv("LUNA_GL");
+        int force_es = gl_env && (!strcmp(gl_env, "es") || !strcmp(gl_env, "gles"));
+        int allow_es = !(gl_env && !strcmp(gl_env, "gl"));
+        luna_glfw.window = NULL;
+        for (int es = force_es ? 1 : 0; es <= (allow_es ? 1 : 0) && !luna_glfw.window; ++es) {
+            glfwDefaultWindowHints();
+            if (es) {
+                glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+                glfwWindowHint(GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);
+                glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+                glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+            } else {
+                glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+                glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+                glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+            }
+            /* Name the window after the program so the shell can match it to
+             * its launcher (StartupWMClass / app_id) instead of "glfw". */
+            {
+                char app_id[64] = {0};
+                const char* env_id = getenv("LUNA_APP_ID");
+                if (env_id && env_id[0]) snprintf(app_id, sizeof(app_id), "%s", env_id);
+                else {
+                    FILE* cf = fopen("/proc/self/comm", "r");
+                    if (cf) {
+                        if (fgets(app_id, sizeof(app_id), cf)) app_id[strcspn(app_id, "\n")] = 0;
+                        fclose(cf);
+                    }
+                }
+                if (app_id[0]) {
+#ifdef GLFW_X11_CLASS_NAME
+                    glfwWindowHintString(GLFW_X11_CLASS_NAME, app_id);
+                    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, app_id);
+#endif
+#ifdef GLFW_WAYLAND_APP_ID
+                    glfwWindowHintString(GLFW_WAYLAND_APP_ID, app_id);
+#endif
+                }
+            }
+            glfwWindowHint(GLFW_RESIZABLE, cfg.resizable ? GLFW_TRUE : GLFW_FALSE);
+            glfwWindowHint(GLFW_DECORATED, cfg.frameless ? GLFW_FALSE : GLFW_TRUE);
+            glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, cfg.transparent ? GLFW_TRUE : GLFW_FALSE);
+            luna_glfw.window = glfwCreateWindow(cfg.width, cfg.height, cfg.title, NULL, NULL);
+            if (luna_glfw.window && es) {
+                luna_set_gles3(1);
+                fprintf(stderr, "luna-ui: using an OpenGL ES 3 context\n");
+            }
+        }
+    }
     if (!luna_glfw.window) {
         fprintf(stderr, "luna-ui: glfwCreateWindow failed\n");
         glfwTerminate();
@@ -606,17 +659,48 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
     host.on_char         = cfg.on_char;
     host.on_touch        = cfg.on_touch;
     host.userdata        = cfg.userdata;
-    if (!luna_glfw_host_start(&host)) return 1;
-
-    glfwGetWindowSize(luna_glfw.window, &width, &height);
-    memset(&init, 0, sizeof(init));
-    init.width = (float)width;
-    init.height = (float)height;
-    init.get_proc = luna_glfw_get_proc;
-    init.frameless = cfg.frameless;
-    if (!luna_init(&init)) {
-        luna_glfw_host_terminate();
-        return 1;
+    /* GL bring-up can fail at two points: no usable context (glfwCreateWindow)
+     * or a context whose driver cannot build the shaders (luna_init).  Boards
+     * such as the Orange Pi hit one of these with a half-working Mali/panfrost
+     * stack, so instead of giving up, retry in turn with: the default choice,
+     * the OpenGL ES 3 path, and finally Mesa's CPU rasteriser (llvmpipe).
+     * LUNA_GL_FALLBACK=0 disables the retries. */
+    {
+        const char* fb_env = getenv("LUNA_GL_FALLBACK");
+        int fallback = !(fb_env && fb_env[0] == '0');
+        const char* saved_gl = getenv("LUNA_GL");
+        char* user_gl = saved_gl ? strdup(saved_gl) : NULL;
+        int forced_es = saved_gl && (!strcmp(saved_gl, "es") || !strcmp(saved_gl, "gles"));
+        int ok = 0;
+        for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+            if (attempt > 0) {
+                if (!fallback) break;
+                if (attempt == 1 && forced_es) continue;   /* already tried ES */
+                if (attempt == 1) {
+                    fprintf(stderr, "luna-ui: GL init failed, retrying with OpenGL ES 3\n");
+                    setenv("LUNA_GL", "es", 1);
+                } else {
+                    fprintf(stderr, "luna-ui: GL init failed, falling back to software rendering (llvmpipe)\n");
+                    if (user_gl) setenv("LUNA_GL", user_gl, 1); else unsetenv("LUNA_GL");
+                    setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+                    setenv("GALLIUM_DRIVER", "llvmpipe", 1);
+                }
+            }
+            luna_set_gles3(0);
+            if (!luna_glfw_host_start(&host)) continue;
+            glfwGetWindowSize(luna_glfw.window, &width, &height);
+            memset(&init, 0, sizeof(init));
+            init.width = (float)width;
+            init.height = (float)height;
+            init.get_proc = luna_glfw_get_proc;
+            init.frameless = cfg.frameless;
+            if (luna_init(&init)) { ok = 1; break; }
+            fprintf(stderr, "luna-ui: renderer initialisation failed\n");
+            luna_glfw_host_terminate();
+        }
+        if (user_gl) { setenv("LUNA_GL", user_gl, 1); free(user_gl); }
+        else if (!ok) unsetenv("LUNA_GL");
+        if (!ok) return 1;
     }
     if (cfg.html) luna_parse_html(cfg.html);
     else if (cfg.html_path && !luna_load_html_file(cfg.html_path))
@@ -638,8 +722,11 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
             glfwPollEvents();
         else if (cfg.on_frame)
             glfwWaitEventsTimeout(cfg.frame_interval);
-        else if (!luna_glfw.redraw)
-            glfwWaitEvents();
+        else if (!luna_glfw.redraw) {
+            double wake = luna_next_wake_seconds();
+            if (wake > 0.0) glfwWaitEventsTimeout(wake);
+            else glfwWaitEvents();
+        }
         else
             glfwPollEvents();
         if (glfwWindowShouldClose(luna_glfw.window)) break;
@@ -653,7 +740,6 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
         previous = now;
         if (dt < 0.0 || dt > 0.25) dt = 1.0 / 60.0;
         if (cfg.on_frame) cfg.on_frame(dt, cfg.userdata);
-        luna_update(now, dt);
         if (luna_needs_redraw(now, dt)) luna_glfw.redraw = 1;
         if (!luna_glfw.redraw) continue;
         glfwGetFramebufferSize(luna_glfw.window, &fb_width, &fb_height);

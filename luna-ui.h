@@ -27,7 +27,7 @@
  * LUNA_UI_NO_PLATFORM before including this file when embedding the renderer
  * in an existing window/event system.
  */
-#if !defined(LUNA_UI_NO_PLATFORM) && defined(LUNA_UI_IMPLEMENTATION)
+#if !defined(LUNA_UI_NO_PLATFORM) && (defined(LUNA_UI_IMPLEMENTATION) || defined(LUNA_UI_SHARED_CLIENT))
 #  define LUNA_UI_PLATFORM_PRELUDE 1
 #  if defined(__EMSCRIPTEN__)
 #    include "luna_web.h"
@@ -820,6 +820,10 @@ enum {
 };
 /* Advance layout/animation state once and summarize why another frame is needed. */
 int  luna_needs_redraw(double now, double dt);
+/* Seconds until the next caret-blink phase flip while a text input has focus,
+ * or -1 when nothing time-driven is pending.  Event-driven hosts pass this as
+ * their wait timeout so an idle focused input wakes only on blink edges. */
+double luna_next_wake_seconds(void);
 /* Multi-surface form. out_flags[k] receives LUNA_REDRAW_* for roots[k]. */
 int  luna_needs_redraw_mask(double now, double dt, const int* roots,
                             int nroots, unsigned* out_flags);
@@ -1050,6 +1054,42 @@ extern float luna_window_width;
 extern float luna_window_height;
 extern char  luna_doc_title[128];
 extern int   luna_css_from_document;
+
+#if defined(LUNA_UI_SHARED_CLIENT) && !defined(LUNA_UI_IMPLEMENTATION)
+/* An app linked against the shared luna-ui-impl.o: types, the GL loader
+ * pointers and a few internals only; no implementation is compiled here. */
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <limits.h>
+#include <stdio.h>
+#include <math.h>
+#include <time.h>
+#include <errno.h>
+#include <strings.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "stb_truetype.h"
+#include "stb_image.h"
+#include "stb_image_write.h"
+#endif
+/* Visibility of luna-ui internals used by the bundled apps. */
+#if defined(LUNA_UI_SHARED_CLIENT) && !defined(LUNA_UI_IMPLEMENTATION)
+#  define LUNA_UI_INTERNAL extern
+#  define LUNA_UI_INTERNAL_VAR_DECL extern
+#  define LUNA_UI_GLVAR extern
+#elif defined(LUNA_UI_EXPORT_INTERNALS)
+#  define LUNA_UI_INTERNAL
+#  define LUNA_UI_INTERNAL_VAR
+#  define LUNA_UI_INTERNAL_VAR_DECL extern
+#  define LUNA_UI_GLVAR
+#else
+#  define LUNA_UI_INTERNAL static
+#  define LUNA_UI_INTERNAL_VAR static
+#  define LUNA_UI_INTERNAL_VAR_DECL static
+#  define LUNA_UI_GLVAR
+#endif
 
 #ifdef LUNA_UI_IMPLEMENTATION
 
@@ -1927,6 +1967,8 @@ int   luna_css_from_document = 0;
 #define g_doc_title   luna_doc_title
 #define g_css_from_document luna_css_from_document
 
+#endif
+#if defined(LUNA_UI_IMPLEMENTATION) || defined(LUNA_UI_SHARED_CLIENT)
 typedef void (*LunaPFNGLGENVERTEXARRAYSPROC)(GLsizei n, GLuint* arrays);
 typedef void (*LunaPFNGLDELETEVERTEXARRAYSPROC)(GLsizei n, const GLuint* arrays);
 typedef void (*LunaPFNGLGENBUFFERSPROC)(GLsizei n, GLuint* buffers);
@@ -2004,33 +2046,33 @@ typedef void (*LUNA_PFNGLREADPIXELSPROC)(GLint x, GLint y, GLsizei width, GLsize
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 #endif
 
-LunaPFNGLGENVERTEXARRAYSPROC luna_glGenVertexArrays;
-LunaPFNGLDELETEVERTEXARRAYSPROC luna_glDeleteVertexArrays;
-LunaPFNGLGENBUFFERSPROC luna_glGenBuffers;
-LunaPFNGLBINDBUFFERPROC luna_glBindBuffer;
-LunaPFNGLBUFFERDATAPROC luna_glBufferData;
-LunaPFNGLBUFFERSUBDATAPROC luna_glBufferSubData;
-LunaPFNGLVERTEXATTRIBPOINTERPROC luna_glVertexAttribPointer;
-LunaPFNGLENABLEVERTEXATTRIBARRAYPROC luna_glEnableVertexAttribArray;
-LunaPFNGLDELETEBUFFERSPROC luna_glDeleteBuffers;
-LunaPFNGLBINDVERTEXARRAYPROC luna_glBindVertexArray;
-LunaPFNGLCREATESHADERPROC luna_glCreateShader;
-LunaPFNGLSHADERSOURCEPROC luna_glShaderSource;
-LunaPFNGLCOMPILESHADERPROC luna_glCompileShader;
-LunaPFNGLGETSHADERIVPROC glGetShaderiv_;
-LunaPFNGLGETSHADERINFOLOGPROC glGetShaderInfoLog_;
-LunaPFNGLDELETESHADERPROC glDeleteShader_;
-LunaPFNGLCREATEPROGRAMPROC luna_glCreateProgram;
-LunaPFNGLATTACHSHADERPROC luna_glAttachShader;
-LunaPFNGLLINKPROGRAMPROC luna_glLinkProgram;
-LunaPFNGLGETPROGRAMIVPROC glGetProgramiv_;
-LunaPFNGLGETPROGRAMINFOLOGPROC glGetProgramInfoLog_;
-LunaPFNGLUSEPROGRAMPROC luna_glUseProgram;
-LunaPFNGLDELETEPROGRAMPROC glDeleteProgram_;
-LunaPFNGLGETUNIFORMLOCATIONPROC luna_glGetUniformLocation;
-LunaPFNGLUNIFORM4FPROC luna_glUniform4f;
-LunaPFNGLUNIFORM2FPROC luna_glUniform2f;
-LunaPFNGLUNIFORM1FPROC luna_glUniform1f;
+LUNA_UI_GLVAR LunaPFNGLGENVERTEXARRAYSPROC luna_glGenVertexArrays;
+LUNA_UI_GLVAR LunaPFNGLDELETEVERTEXARRAYSPROC luna_glDeleteVertexArrays;
+LUNA_UI_GLVAR LunaPFNGLGENBUFFERSPROC luna_glGenBuffers;
+LUNA_UI_GLVAR LunaPFNGLBINDBUFFERPROC luna_glBindBuffer;
+LUNA_UI_GLVAR LunaPFNGLBUFFERDATAPROC luna_glBufferData;
+LUNA_UI_GLVAR LunaPFNGLBUFFERSUBDATAPROC luna_glBufferSubData;
+LUNA_UI_GLVAR LunaPFNGLVERTEXATTRIBPOINTERPROC luna_glVertexAttribPointer;
+LUNA_UI_GLVAR LunaPFNGLENABLEVERTEXATTRIBARRAYPROC luna_glEnableVertexAttribArray;
+LUNA_UI_GLVAR LunaPFNGLDELETEBUFFERSPROC luna_glDeleteBuffers;
+LUNA_UI_GLVAR LunaPFNGLBINDVERTEXARRAYPROC luna_glBindVertexArray;
+LUNA_UI_GLVAR LunaPFNGLCREATESHADERPROC luna_glCreateShader;
+LUNA_UI_GLVAR LunaPFNGLSHADERSOURCEPROC luna_glShaderSource;
+LUNA_UI_GLVAR LunaPFNGLCOMPILESHADERPROC luna_glCompileShader;
+LUNA_UI_GLVAR LunaPFNGLGETSHADERIVPROC glGetShaderiv_;
+LUNA_UI_GLVAR LunaPFNGLGETSHADERINFOLOGPROC glGetShaderInfoLog_;
+LUNA_UI_GLVAR LunaPFNGLDELETESHADERPROC glDeleteShader_;
+LUNA_UI_GLVAR LunaPFNGLCREATEPROGRAMPROC luna_glCreateProgram;
+LUNA_UI_GLVAR LunaPFNGLATTACHSHADERPROC luna_glAttachShader;
+LUNA_UI_GLVAR LunaPFNGLLINKPROGRAMPROC luna_glLinkProgram;
+LUNA_UI_GLVAR LunaPFNGLGETPROGRAMIVPROC glGetProgramiv_;
+LUNA_UI_GLVAR LunaPFNGLGETPROGRAMINFOLOGPROC glGetProgramInfoLog_;
+LUNA_UI_GLVAR LunaPFNGLUSEPROGRAMPROC luna_glUseProgram;
+LUNA_UI_GLVAR LunaPFNGLDELETEPROGRAMPROC glDeleteProgram_;
+LUNA_UI_GLVAR LunaPFNGLGETUNIFORMLOCATIONPROC luna_glGetUniformLocation;
+LUNA_UI_GLVAR LunaPFNGLUNIFORM4FPROC luna_glUniform4f;
+LUNA_UI_GLVAR LunaPFNGLUNIFORM2FPROC luna_glUniform2f;
+LUNA_UI_GLVAR LunaPFNGLUNIFORM1FPROC luna_glUniform1f;
 #define glGenVertexArrays luna_glGenVertexArrays
 #define glDeleteVertexArrays luna_glDeleteVertexArrays
 #define glGenBuffers luna_glGenBuffers
@@ -2052,36 +2094,36 @@ LunaPFNGLUNIFORM1FPROC luna_glUniform1f;
 #define glUniform4f luna_glUniform4f
 #define glUniform2f luna_glUniform2f
 #define glUniform1f luna_glUniform1f
-LunaPFNGLUNIFORM1IPROC glUniform1i_;
-LunaPFNGLACTIVETEXTUREPROC glActiveTexture_;
-LunaPFNGLGENFRAMEBUFFERSPROC glGenFramebuffers_;
-LunaPFNGLBINDFRAMEBUFFERPROC glBindFramebuffer_;
-LunaPFNGLFRAMEBUFFERTEXTURE2DPROC glFramebufferTexture2D_;
-LunaPFNGLDELETEFRAMEBUFFERSPROC glDeleteFramebuffers_;
-LunaPFNGLCHECKFRAMEBUFFERSTATUSPROC glCheckFramebufferStatus_;
+LUNA_UI_GLVAR LunaPFNGLUNIFORM1IPROC glUniform1i_;
+LUNA_UI_GLVAR LunaPFNGLACTIVETEXTUREPROC glActiveTexture_;
+LUNA_UI_GLVAR LunaPFNGLGENFRAMEBUFFERSPROC glGenFramebuffers_;
+LUNA_UI_GLVAR LunaPFNGLBINDFRAMEBUFFERPROC glBindFramebuffer_;
+LUNA_UI_GLVAR LunaPFNGLFRAMEBUFFERTEXTURE2DPROC glFramebufferTexture2D_;
+LUNA_UI_GLVAR LunaPFNGLDELETEFRAMEBUFFERSPROC glDeleteFramebuffers_;
+LUNA_UI_GLVAR LunaPFNGLCHECKFRAMEBUFFERSTATUSPROC glCheckFramebufferStatus_;
 
 /* GL 1.0/1.1 core function pointers, resolved in load_gl_functions() through
  * the same get_proc()/eglGetProcAddress() path as the modern entry points so
  * every GL call shares one dispatch table (see the typedef comment above).
  * The macros redirect every subsequent gl* call in luna-ui.h and luna-shell.c
  * from the directly-linked libGL symbol to these pointers. */
-LUNA_PFNGLVIEWPORTPROC         luna_p_glViewport;
-LUNA_PFNGLCLEARPROC            luna_p_glClear;
-LUNA_PFNGLCLEARCOLORPROC       luna_p_glClearColor;
-LUNA_PFNGLENABLEPROC           luna_p_glEnable;
-LUNA_PFNGLDISABLEPROC          luna_p_glDisable;
-LUNA_PFNGLBLENDFUNCPROC        luna_p_glBlendFunc;
-LUNA_PFNGLBLENDFUNCSEPARATEPROC luna_p_glBlendFuncSeparate;
-LUNA_PFNGLSCISSORPROC          luna_p_glScissor;
-LUNA_PFNGLDRAWARRAYSPROC       luna_p_glDrawArrays;
-LUNA_PFNGLGENTEXTURESPROC      luna_p_glGenTextures;
-LUNA_PFNGLDELETETEXTURESPROC   luna_p_glDeleteTextures;
-LUNA_PFNGLBINDTEXTUREPROC      luna_p_glBindTexture;
-LUNA_PFNGLTEXPARAMETERIPROC    luna_p_glTexParameteri;
-LUNA_PFNGLTEXIMAGE2DPROC       luna_p_glTexImage2D;
-LUNA_PFNGLTEXSUBIMAGE2DPROC    luna_p_glTexSubImage2D;
-LUNA_PFNGLCOPYTEXSUBIMAGE2DPROC luna_p_glCopyTexSubImage2D;
-LUNA_PFNGLREADPIXELSPROC       luna_p_glReadPixels;
+LUNA_UI_GLVAR LUNA_PFNGLVIEWPORTPROC         luna_p_glViewport;
+LUNA_UI_GLVAR LUNA_PFNGLCLEARPROC            luna_p_glClear;
+LUNA_UI_GLVAR LUNA_PFNGLCLEARCOLORPROC       luna_p_glClearColor;
+LUNA_UI_GLVAR LUNA_PFNGLENABLEPROC           luna_p_glEnable;
+LUNA_UI_GLVAR LUNA_PFNGLDISABLEPROC          luna_p_glDisable;
+LUNA_UI_GLVAR LUNA_PFNGLBLENDFUNCPROC        luna_p_glBlendFunc;
+LUNA_UI_GLVAR LUNA_PFNGLBLENDFUNCSEPARATEPROC luna_p_glBlendFuncSeparate;
+LUNA_UI_GLVAR LUNA_PFNGLSCISSORPROC          luna_p_glScissor;
+LUNA_UI_GLVAR LUNA_PFNGLDRAWARRAYSPROC       luna_p_glDrawArrays;
+LUNA_UI_GLVAR LUNA_PFNGLGENTEXTURESPROC      luna_p_glGenTextures;
+LUNA_UI_GLVAR LUNA_PFNGLDELETETEXTURESPROC   luna_p_glDeleteTextures;
+LUNA_UI_GLVAR LUNA_PFNGLBINDTEXTUREPROC      luna_p_glBindTexture;
+LUNA_UI_GLVAR LUNA_PFNGLTEXPARAMETERIPROC    luna_p_glTexParameteri;
+LUNA_UI_GLVAR LUNA_PFNGLTEXIMAGE2DPROC       luna_p_glTexImage2D;
+LUNA_UI_GLVAR LUNA_PFNGLTEXSUBIMAGE2DPROC    luna_p_glTexSubImage2D;
+LUNA_UI_GLVAR LUNA_PFNGLCOPYTEXSUBIMAGE2DPROC luna_p_glCopyTexSubImage2D;
+LUNA_UI_GLVAR LUNA_PFNGLREADPIXELSPROC       luna_p_glReadPixels;
 
 #define glViewport          luna_p_glViewport
 #define glClear             luna_p_glClear
@@ -2101,6 +2143,8 @@ LUNA_PFNGLREADPIXELSPROC       luna_p_glReadPixels;
 #define glCopyTexSubImage2D luna_p_glCopyTexSubImage2D
 #define glReadPixels        luna_p_glReadPixels
 
+#endif
+#ifdef LUNA_UI_IMPLEMENTATION
 // --- Shaders ---
 
 /* Version directives are supplied by compile_shader at run time. */
@@ -2500,6 +2544,8 @@ const char* backdrop_fs =
     "    FragColor = vec4(clamp(filtered, 0.0, 1.0), alpha);\n"
     "}\0";
 
+#endif
+#if defined(LUNA_UI_IMPLEMENTATION) || defined(LUNA_UI_SHARED_CLIENT)
 #define MAX_GRAD_STOPS 12
 #define GRAD_NONE    0
 #define GRAD_LINEAR  1
@@ -2962,6 +3008,8 @@ struct LunaElement {
     /* The containing block an absolute box was last sized against. */
     float abs_cb_w, abs_cb_h;
 };
+#endif
+#ifdef LUNA_UI_IMPLEMENTATION
 
 // --- CSS Rule ---
 
@@ -3017,7 +3065,7 @@ typedef struct {
 typedef struct {
     char selector[128];
     SimpleSelector target;
-    SimpleSelector ancestors[MAX_SEL_ANCESTORS];
+    SimpleSelector* ancestors;          /* ancestor_count entries, kept by rule_text_keep(); NULL when 0 */
     int ancestor_count;
     /* CSS resolves equal-specificity declarations by source order.  Keep it
        explicitly: qsort is deliberately unstable for equal keys, which used
@@ -3791,9 +3839,23 @@ static struct {
 } backdrop_loc;
 
 // Texture cache — path → GL texture ID (loaded once, reused)
-typedef struct { char path[512]; GLuint tex; int tw, th; } TexEntry;
+typedef struct { char path[512]; GLuint tex; int tw, th; unsigned h; } TexEntry;
 static TexEntry* g_tex_cache;      /* grows with the images a page uses */
 static int g_tex_count = 0, g_tex_cap = 0;
+static int g_tex_dims_hint = 0;    /* last tex_cache_dims() hit: one image is drawn many times in a row */
+static unsigned tex_key_hash(const char* k) {
+    unsigned h = 2166136261u;
+    while (*k) h = (h ^ (unsigned char)*k++) * 16777619u;
+    return h ? h : 1u;
+}
+/* Index of the entry for `key`, or -1.  The hash rejects almost every
+ * mismatch without touching the 512-byte path. */
+static int tex_find(const char* key) {
+    unsigned h = tex_key_hash(key);
+    for (int i = 0; i < g_tex_count; i++)
+        if (g_tex_cache[i].h == h && strcmp(g_tex_cache[i].path, key) == 0) return i;
+    return -1;
+}
 void* g_window_ptr_ptr = NULL;
 static char g_html_base_dir[512] = "ui";
 int   drag_target_idx = -1;
@@ -3871,11 +3933,11 @@ static unsigned char* g_bold_font_ttf = NULL;
 static int            g_bold_font_info_ok = 0;
 static stbtt_fontinfo g_cjk_font_info;
 static unsigned char* g_cjk_font_ttf = NULL;
-static int            g_cjk_font_info_ok = 0;
+LUNA_UI_INTERNAL_VAR int g_cjk_font_info_ok = 0;
 /* Optional monospace face used by code editors and terminals. */
 static stbtt_fontinfo g_mono_font_info;
 static unsigned char* g_mono_font_ttf = NULL;
-static int            g_mono_font_info_ok = 0;
+LUNA_UI_INTERNAL_VAR int g_mono_font_info_ok = 0;
 /* LunaSymbols (Font Awesome–derived) — solid UI icons + brand marks. */
 static stbtt_fontinfo g_icon_font_info;
 static unsigned char* g_icon_font_ttf = NULL;
@@ -3901,7 +3963,7 @@ static int            g_text_dynamic_ascii = 0;
 #define LUNA_DYN_ATLAS_W 1024
 #define LUNA_DYN_ATLAS_H 1024
 #define LUNA_MAX_DYN_GLYPHS 4096
-#define LUNA_GLYPH_HASH 1024
+#define LUNA_GLYPH_HASH 4096
 
 typedef struct {
     int   codepoint;
@@ -3977,7 +4039,7 @@ static int dyn_glyph_capacity_ensure(int needed) {
     return 1;
 }
 
-static int utf8_decode(const char** pp) {
+LUNA_UI_INTERNAL int utf8_decode(const char** pp) {
     const unsigned char* s = (const unsigned char*)*pp;
     if (!s || !*s) return 0;
     unsigned char c = s[0];
@@ -4013,7 +4075,7 @@ static int utf8_next_boundary(const char* s, int pos) {
     return pos;
 }
 
-static int utf8_encode(int cp, char* out) {
+LUNA_UI_INTERNAL int utf8_encode(int cp, char* out) {
     if (cp < 0x80) { out[0] = (char)cp; return 1; }
     if (cp < 0x800) {
         out[0] = (char)(0xC0 | (cp >> 6));
@@ -4046,6 +4108,22 @@ static int font_path_score(const char* path) {
     if (strstr(lower, "/ja/") || strstr(lower, "japanese")) score += 100;
     if (strstr(lower, "noto"))        score += 40;
     if (strstr(lower, "mplus") || strstr(lower, "sourcehansans")) score += 60;
+    /* Faces the common distributions ship instead of Noto (Debian/Armbian
+     * fonts-ipafont, fonts-vlgothic, fonts-takao, fonts-wqy-*, AOSP).  The name
+     * only orders the candidates: luna_pick_cjk_font() checks real coverage. */
+    if (strstr(lower, "ipaex") || strstr(lower, "ipag") || strstr(lower, "/ipa")) score += 150;
+    if (strstr(lower, "vlgothic") || strstr(lower, "vl-gothic") || strstr(lower, "vl-pgothic")) score += 150;
+    if (strstr(lower, "takao")) score += 140;
+    if (strstr(lower, "migu") || strstr(lower, "mgen") || strstr(lower, "hackgen") ||
+        strstr(lower, "plemol") || strstr(lower, "bizud") || strstr(lower, "biz-ud") ||
+        strstr(lower, "sourcehan") || strstr(lower, "source-han")) score += 130;
+    if (strstr(lower, "sazanami") || strstr(lower, "kochi") || strstr(lower, "ume-")) score += 90;
+    if (strstr(lower, "wqy") || strstr(lower, "droidsansfallback") ||
+        strstr(lower, "droid-fallback") || strstr(lower, "uming") || strstr(lower, "ukai") ||
+        strstr(lower, "nanum") || strstr(lower, "unfonts")) score += 80;
+    if (strstr(lower, "unifont")) score += 30;
+    if (strstr(lower, "gothic")) score += 20;
+    if (strstr(lower, "mincho") || strstr(lower, "serif")) score -= 15;
     if (strstr(lower, "dejavu") || strstr(lower, "liberation")) score += 10;
     if (strstr(lower, "emoji") || strstr(lower, "icon") || strstr(lower, "symbol")) score -= 100;
     if (strstr(lower, "lunasymbols") || strstr(lower, "fontawesome") || strstr(lower, "awesome")) score -= 500;
@@ -4263,6 +4341,7 @@ static stbtt_fontinfo* font_for_codepoint(int cp) {
 /* Design-unit advances, by face and codepoint. */
 typedef struct { stbtt_fontinfo* f; int cp; int advance; } AdvanceMemo;
 static AdvanceMemo g_advance_memo[8192];
+static unsigned long long g_line_memo_epoch;   /* bumped when font data is reloaded */
 
 static LunaDynGlyph* dyn_bake_glyph(int cp, float css_px) {
     stbtt_fontinfo* finfo = font_for_codepoint(cp);
@@ -4382,7 +4461,7 @@ static void dyn_flush_atlas(void) {
 }
 
 // Shared VAO/VBO for rectangle drawing — created once, reused every frame.
-static GLuint g_rect_vao = 0, g_rect_vbo = 0;
+LUNA_UI_INTERNAL_VAR GLuint g_rect_vao = 0, g_rect_vbo = 0;
 
 struct LunaContext {
     GLuint rect_vao;
@@ -4409,11 +4488,37 @@ static const float font_sizes[NUM_FONT_SIZES] = {
     28.0f, 46.0f
 };
 
+#endif
+#if defined(LUNA_UI_IMPLEMENTATION) || defined(LUNA_UI_SHARED_CLIENT)
 typedef struct {
     stbtt_bakedchar cdata[96];
     GLuint tex;
     int    loaded;
 } FontAtlas;
+
+/* Internals shared with the bundled apps (luna-term/view/editor).  Exported
+ * only by a LUNA_UI_EXPORT_INTERNALS build (luna-ui-impl.c); otherwise static. */
+LUNA_UI_INTERNAL int   utf8_decode(const char** pp);
+LUNA_UI_INTERNAL int   utf8_encode(int cp, char* out);
+LUNA_UI_INTERNAL float glyph_advance(FontAtlas* atlas, int cp, float css_px);
+LUNA_UI_INTERNAL void  text_metrics_begin(float css_px, int bold, int face, FontAtlas* atlas);
+LUNA_UI_INTERNAL void  text_metrics_end(void);
+LUNA_UI_INTERNAL void  element_set_inline_style(LunaElement* e, const char* s);
+LUNA_UI_INTERNAL void  rc_scissor_reset(void);
+LUNA_UI_INTERNAL GLuint create_shader_program(const char* vertex_src, const char* fragment_src, const char* label);
+LUNA_UI_INTERNAL_VAR_DECL int g_cjk_font_info_ok;
+LUNA_UI_INTERNAL_VAR_DECL int g_mono_font_info_ok;
+LUNA_UI_INTERNAL_VAR_DECL GLuint g_rect_vao, g_rect_vbo;
+FontAtlas* get_atlas(float size, int bold, int* out_is_fake_bold);
+float measure_text_width(FontAtlas* atlas, const char* text);
+void draw_rect(float x, float y, float w, float h, float r, float g, float b, float a,
+               float radius, float b_w, float bd_r, float bd_g, float bd_b, float bd_a);
+void render_text_fx(const char* text, float x, float y, float box_w, float box_h, int align,
+                    int v_align, float r, float g, float b, float a, float fsize, int bold,
+                    float css_line_height, int white_space, int text_overflow, int overflow_wrap,
+                    const LunaElement* fx);
+#endif
+#ifdef LUNA_UI_IMPLEMENTATION
 
 FontAtlas font_regular[NUM_FONT_SIZES];
 FontAtlas font_bold_atlas[NUM_FONT_SIZES];
@@ -4439,7 +4544,7 @@ static float glyph_metric_advance(int cp, float css_px) {
     return (float)advance * scale;
 }
 
-static float glyph_advance(FontAtlas* atlas, int cp, float css_px) {
+LUNA_UI_INTERNAL float glyph_advance(FontAtlas* atlas, int cp, float css_px) {
     if (cp >= 32 && cp < 128 && !g_text_dynamic_ascii)
         return atlas->cdata[cp - 32].xadvance;
     return glyph_metric_advance(cp, css_px);
@@ -6604,7 +6709,7 @@ static const char* element_inline_style(const LunaElement* e) {
     return e->inline_style_ext ? e->inline_style_ext : e->inline_style;
 }
 
-static void element_set_inline_style(LunaElement* e, const char* s) {
+LUNA_UI_INTERNAL void element_set_inline_style(LunaElement* e, const char* s) {
     free(e->inline_style_ext);
     e->inline_style_ext = NULL;
     if (!s) s = "";
@@ -6881,25 +6986,6 @@ void parse_simple_selector(const char* sel_in, SimpleSelector* out) {
             else if (strlen(token) > 0) snprintf(out->sel_type, sizeof(out->sel_type), "%s", token);
         }
     }
-}
-
-void parse_selector(const char* sel_in, StyleRule* rule) {
-    char sel[128]; strncpy(sel, sel_in, sizeof(sel) - 1); sel[sizeof(sel)-1] = 0;
-    rule->ancestor_count = 0;
-
-    char* compounds[MAX_SEL_ANCESTORS + 1];
-    int compound_count = 0;
-    char* tok = strtok(sel, " \t");
-    while (tok && compound_count < MAX_SEL_ANCESTORS + 1) {
-        compounds[compound_count++] = tok;
-        tok = strtok(NULL, " \t");
-    }
-    if (compound_count == 0) { memset(&rule->target, 0, sizeof(SimpleSelector)); return; }
-
-    parse_simple_selector(compounds[compound_count - 1], &rule->target);
-    /* nearest-first, matching match_selector_chain's walk order */
-    for (int i = compound_count - 2; i >= 0; i--)
-        parse_simple_selector(compounds[i], &rule->ancestors[rule->ancestor_count++]);
 }
 
 /* 1-based position of e among its non-internal siblings (same parent). */
@@ -9358,6 +9444,8 @@ static void ingest_parsed_rule(const CSSRule *pr) {
         }
 
         StyleRule rule = tmpl[importance];
+        SimpleSelector anc_tmp[MAX_SEL_ANCESTORS];   /* built here, then kept at exact size */
+        rule.ancestors = anc_tmp;
         rule.pseudo_elem = pseudo_elem_type;
         int is_hover = 0, is_active = 0, is_focus = 0, is_fvis = 0, is_fwithin = 0;
 
@@ -9428,6 +9516,13 @@ static void ingest_parsed_rule(const CSSRule *pr) {
         rule.source_order = rule_count;
         rule.index_bucket = rule_bucket_of(&rule.target);
         if (!luna_ensure_rule_capacity(rule_count + 1)) return;
+        if (rule.ancestor_count > 0) {
+            rule.ancestors = (SimpleSelector*)(void*)rule_text_keep(
+                (const char*)anc_tmp, sizeof(SimpleSelector) * (size_t)rule.ancestor_count);
+            if (!rule.ancestors) return;
+        } else {
+            rule.ancestors = NULL;
+        }
         if (rule.custom_props) g_custom_prop_rules++;
         css_rules[rule_count] = rule;
         rule_count++;
@@ -12048,8 +12143,8 @@ void parse_html(const char* html) { parse_html_into(html, -1); }
 
 FontAtlas* get_atlas(float size, int bold, int* out_is_fake_bold);
 float measure_text_width(FontAtlas* atlas, const char* text);
-static void text_metrics_begin(float css_px, int bold, int face, FontAtlas* atlas);
-static void text_metrics_end(void);
+LUNA_UI_INTERNAL void text_metrics_begin(float css_px, int bold, int face, FontAtlas* atlas);
+LUNA_UI_INTERNAL void text_metrics_end(void);
 
 static float css_outer_height(const LunaElement* e, float css_h) {
     return e->box_sizing == BOX_CONTENT
@@ -16022,14 +16117,18 @@ static void rc_element_draw_bounds(int idx, float* out_x, float* out_y,
 static int g_rc_scissor_on = -1;
 static int g_rc_scissor[4] = {0, 0, 0, 0};
 
-static void rc_scissor_reset(void) { g_rc_scissor_on = -1; }
+LUNA_UI_INTERNAL void rc_scissor_reset(void) { g_rc_scissor_on = -1; }
 
 static void rc_set_element_scissor(int idx, int fbw, int fbh) {
     const LunaRenderCache* c = &g_rc[idx];
-    if (!c->clipped || c->cw <= 0.0f || c->ch <= 0.0f) return;
     float cx = c->cx, cy = c->cy, cw = c->cw, ch = c->ch;
-    apply_sticky_clip_bands(idx, &cx, &cy, &cw, &ch);
-    if (cw <= 0.0f || ch <= 0.0f) return;
+    if (c->clipped && cw > 0.0f && ch > 0.0f)
+        apply_sticky_clip_bands(idx, &cx, &cy, &cw, &ch);
+    if (!c->clipped || cw <= 0.0f || ch <= 0.0f) {
+        /* Unclipped: the scissor may still be on from the previous element. */
+        if (g_rc_scissor_on != 0) { glDisable(GL_SCISSOR_TEST); g_rc_scissor_on = 0; }
+        return;
+    }
     float res_x = LUNA_RRES_X, res_y = LUNA_RRES_Y;
     float sx = (float)fbw / res_x;
     float sy = (float)fbh / res_y;
@@ -16520,17 +16619,30 @@ static int cmp_render_order(const void* a, const void* b) {
 static void build_render_order() {
     if (!g_render_order_dirty) return;
     for (int i = 0; i < elem_count; i++) {
-        int z = elements[i].z_index;
         int p = elements[i].parent_idx;
-        while (p != -1) {
-            z += elements[p].z_index;
-            p = elements[p].parent_idx;
+        int z = elements[i].z_index;
+        if (p >= 0 && p < i) {
+            /* Parents normally precede their children: take the parent's
+             * accumulated value (less the sticky bump it carries). */
+            z += g_cached_eff_z[p] - (elements[p].position_sticky ? 1 : 0);
+        } else {
+            while (p != -1) {
+                z += elements[p].z_index;
+                p = elements[p].parent_idx;
+            }
         }
         if (elements[i].position_sticky) z += 1;
         g_cached_eff_z[i] = z;
         render_order[i] = i;
     }
-    qsort(render_order, elem_count, sizeof(int), cmp_render_order);
+    /* Identity order is already right when no element needs to move (the
+     * common case of a page with no z-index/sticky); skip the sort. */
+    int sorted = 1;
+    for (int i = 1; i < elem_count && sorted; i++) {
+        int a = i - 1, b = i;
+        if (cmp_render_order(&a, &b) > 0) sorted = 0;
+    }
+    if (!sorted) qsort(render_order, elem_count, sizeof(int), cmp_render_order);
     g_render_order_dirty = 0;
 }
 
@@ -16657,20 +16769,31 @@ static void fpl_free(FontPathList* fpl) {
 
 #if LUNA_UI_ENABLE_FONT_SCAN
 // Recursively scan dir and collect font paths into reg/bold lists.
+/* Font trees are shallow (fonts/<format>/<family>/file).  The depth limit is
+ * what stops a symlink that points back at its own parent: without it the scan
+ * walked TrueType/TrueType/TrueType/... until the path buffer overflowed, which
+ * cost seconds of start-up on an SD card. */
+#define LUNA_FONT_SCAN_MAX_DEPTH 6
+static void scan_fonts_dir_depth(const char* dir, FontPathList* reg, FontPathList* bold, int depth);
 static void scan_fonts_dir(const char* dir, FontPathList* reg, FontPathList* bold) {
+    scan_fonts_dir_depth(dir, reg, bold, 0);
+}
+static void scan_fonts_dir_depth(const char* dir, FontPathList* reg, FontPathList* bold, int depth) {
     DIR* d = opendir(dir);
     if (!d) return;
     struct dirent* ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue; // skip . and ..
         char path[1024];
-        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        int pn = snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        if (pn < 0 || (size_t)pn >= sizeof(path)) continue;
 
         struct stat st;
         if (stat(path, &st) != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            scan_fonts_dir(path, reg, bold); // recurse
+            if (depth < LUNA_FONT_SCAN_MAX_DEPTH)
+                scan_fonts_dir_depth(path, reg, bold, depth + 1); // recurse
         } else if (S_ISREG(st.st_mode) && is_font_file(ent->d_name)) {
             if (is_bold_name(ent->d_name))
                 fpl_add(bold, path);
@@ -16704,6 +16827,145 @@ static unsigned char* try_load_font_list(FontPathList* fpl, int (*score_fn)(cons
         }
     }
     return NULL;
+}
+
+/* The CJK picker below stats candidate files (and the font scan that feeds it
+ * only exists on POSIX desktop targets), so it is compiled under the same
+ * LUNA_UI_ENABLE_FONT_SCAN guard as its only caller. */
+#if LUNA_UI_ENABLE_FONT_SCAN
+/* Does the face at index 0 of this file map every listed codepoint? */
+static int luna_font_blob_covers(const unsigned char* buf, const int* cps, int n) {
+    stbtt_fontinfo info;
+    int off = stbtt_GetFontOffsetForIndex(buf, 0);
+    if (off < 0) off = 0;
+    if (!stbtt_InitFont(&info, buf, off)) return 0;
+    for (int i = 0; i < n; i++)
+        if (stbtt_FindGlyphIndex(&info, cps[i]) == 0) return 0;
+    return 1;
+}
+
+/* The CJK fallback face.
+ *
+ * Picking by file name alone left Japanese as missing-glyph boxes on every
+ * system whose Japanese font is not called Noto/CJK/M+ (IPA, VL Gothic, Takao,
+ * WenQuanYi, Droid Sans Fallback — i.e. most ARM board images), and could
+ * equally select a "Noto" face with no kana in it.  The name now only orders
+ * the candidates; a face is accepted when it really contains the glyphs. */
+static unsigned char* luna_pick_cjk_font(FontPathList* fpl, long* out_sz) {
+    static const int need_ja[]  = { 0x3042, 0x30A2, 0x65E5 };   /* あ ア 日 */
+    static const int need_han[] = { 0x65E5 };                   /* 日 */
+    static const int need_ko[]  = { 0xD55C };                   /* 한 */
+    const struct { const int* cps; int n; } wants[] = {
+        { need_ja, 3 }, { need_han, 1 }, { need_ko, 1 }
+    };
+    int n = fpl->count;
+    if (n <= 0) return NULL;
+    int* score = (int*)malloc(sizeof(int) * (size_t)n);
+    unsigned char* tried = (unsigned char*)calloc((size_t)n, 1);
+    unsigned char* found = NULL;
+    if (!score || !tried) { free(score); free(tried); return NULL; }
+    for (int i = 0; i < n; i++) score[i] = font_path_score(fpl->paths[i]);
+
+    for (int want = 0; want < 3 && !found; want++) {
+        memset(tried, 0, (size_t)n);
+        /* Named candidates first, best name first; then whatever is left that
+         * is big enough to be a CJK face (Latin-only files are small). */
+        for (int pass = 0; pass < 2 && !found; pass++) {
+            int budget = pass == 0 ? 16 : 48;
+            while (budget-- > 0 && !found) {
+                int best = -1;
+                for (int i = 0; i < n; i++) {
+                    if (tried[i]) continue;
+                    if (pass == 0 ? score[i] <= 0 : score[i] <= -100) continue;
+                    if (best < 0 || score[i] > score[best]) best = i;
+                }
+                if (best < 0) break;
+                tried[best] = 1;
+                if (pass == 1) {
+                    struct stat st;
+                    if (stat(fpl->paths[best], &st) != 0 || st.st_size < 600 * 1024) {
+                        budget++;           /* a stat is free; do not spend the budget */
+                        continue;
+                    }
+                }
+                long sz = 0;
+                unsigned char* buf = read_file_bytes(fpl->paths[best], &sz);
+                if (!buf) continue;
+                if (sz > 64 && luna_font_blob_covers(buf, wants[want].cps, wants[want].n)) {
+                    fprintf(stderr, "[luna-ui] CJK font loaded: %s\n", fpl->paths[best]);
+                    if (out_sz) *out_sz = sz;
+                    found = buf;
+                } else free(buf);
+            }
+        }
+    }
+    free(score); free(tried);
+    if (!found)
+        fprintf(stderr, "[luna-ui] warning: no Japanese/CJK font found; non-Latin text will be blank.\n"
+                        "          Install one (e.g. apt install fonts-noto-cjk  or  fonts-ipafont-gothic)\n"
+                        "          or point LUNA_FONT_CJK at a .ttf/.otf/.ttc file.\n");
+    return found;
+}
+#endif /* LUNA_UI_ENABLE_FONT_SCAN */
+
+/* Fixed pitch, judged from the metrics rather than the file name. */
+static int luna_font_blob_is_mono(const unsigned char* buf) {
+    stbtt_fontinfo info;
+    int off = stbtt_GetFontOffsetForIndex(buf, 0);
+    int a = 0, b = 0, c = 0, lsb = 0;
+    if (off < 0) off = 0;
+    if (!stbtt_InitFont(&info, buf, off)) return 0;
+    if (!stbtt_FindGlyphIndex(&info, 'i') || !stbtt_FindGlyphIndex(&info, 'M') ||
+        !stbtt_FindGlyphIndex(&info, 'W')) return 0;
+    stbtt_GetCodepointHMetrics(&info, 'i', &a, &lsb);
+    stbtt_GetCodepointHMetrics(&info, 'M', &b, &lsb);
+    stbtt_GetCodepointHMetrics(&info, 'W', &c, &lsb);
+    return a > 0 && a == b && b == c;
+}
+
+/* The monospace face (editor, terminal).  A name match is preferred, but a
+ * system without any "*Mono*" file still usually has a fixed-pitch face — the
+ * Japanese gothic fonts (IPA Gothic, VL Gothic, ...) are fixed pitch — so fall
+ * back to probing the metrics instead of drawing a terminal in a proportional
+ * UI font. */
+static unsigned char* luna_pick_mono_font(FontPathList* fpl, long* out_sz) {
+    int n = fpl->count;
+    if (n <= 0) return NULL;
+    int* score = (int*)malloc(sizeof(int) * (size_t)n);
+    unsigned char* tried = (unsigned char*)calloc((size_t)n, 1);
+    unsigned char* found = NULL;
+    if (!score || !tried) { free(score); free(tried); return NULL; }
+    for (int pass = 0; pass < 3 && !found; pass++) {
+        int budget = pass == 0 ? 12 : pass == 1 ? 24 : 40;
+        for (int i = 0; i < n; i++) {
+            const char* path = fpl->paths[i];
+            int ms = font_path_score_mono(path);
+            if (pass == 0) score[i] = ms;
+            else if (ms <= -1000 || font_path_score_symbols(path) > 0 ||
+                     font_path_score_brands(path) > 0) score[i] = -1;
+            else if (pass == 1) score[i] = font_path_score(path);   /* CJK gothic faces */
+            else score[i] = 1;
+        }
+        while (budget-- > 0 && !found) {
+            int best = -1;
+            for (int i = 0; i < n; i++) {
+                if (tried[i] || score[i] <= 0) continue;
+                if (best < 0 || score[i] > score[best]) best = i;
+            }
+            if (best < 0) break;
+            tried[best] = 1;
+            long sz = 0;
+            unsigned char* buf = read_file_bytes(fpl->paths[best], &sz);
+            if (!buf) continue;
+            if (sz > 64 && luna_font_blob_is_mono(buf)) {
+                fprintf(stderr, "[luna-ui] mono font loaded: %s\n", fpl->paths[best]);
+                if (out_sz) *out_sz = sz;
+                found = buf;
+            } else free(buf);
+        }
+    }
+    free(score); free(tried);
+    return found;
 }
 
 // ------------------------------------------------------------------
@@ -16787,6 +17049,7 @@ int luna_set_skin_font(const char* family, const char* path) {
     }
     memset(g_font_pick, 0, sizeof g_font_pick);
     memset(g_advance_memo, 0, sizeof g_advance_memo);
+    g_line_memo_epoch++;
     dyn_atlas_reset();
     return g_skin_font_info_ok;
 }
@@ -16797,6 +17060,7 @@ int luna_prepare_font_metrics(void) {
     g_mono_font_info_ok = g_icon_font_info_ok = g_brand_font_info_ok = 0;
     memset(g_font_pick, 0, sizeof g_font_pick);
     memset(g_advance_memo, 0, sizeof g_advance_memo);
+    g_line_memo_epoch++;
     FontPathList reg = {0};
     FontPathList bold_list = {0};
     unsigned char* reg_buf = NULL;
@@ -16805,6 +17069,19 @@ int luna_prepare_font_metrics(void) {
 #if LUNA_UI_ENABLE_FONT_SCAN
     scan_fonts_dir("/usr/share/fonts", &reg, &bold_list);
     scan_fonts_dir("/usr/local/share/fonts", &reg, &bold_list);
+    {   /* Per-user fonts: where a user without root puts a Japanese face. */
+        const char* home = getenv("HOME");
+        const char* xdg = getenv("XDG_DATA_HOME");
+        char dir[1024];
+        if (xdg && xdg[0] && snprintf(dir, sizeof dir, "%s/fonts", xdg) < (int)sizeof dir)
+            scan_fonts_dir(dir, &reg, &bold_list);
+        if (home && home[0]) {
+            if (snprintf(dir, sizeof dir, "%s/.local/share/fonts", home) < (int)sizeof dir)
+                scan_fonts_dir(dir, &reg, &bold_list);
+            if (snprintf(dir, sizeof dir, "%s/.fonts", home) < (int)sizeof dir)
+                scan_fonts_dir(dir, &reg, &bold_list);
+        }
+    }
 #endif
     scan_fonts_dir("ui/fonts", &reg, &bold_list);
     scan_fonts_dir("skins/fonts", &reg, &bold_list);
@@ -16905,7 +17182,11 @@ int luna_prepare_font_metrics(void) {
                                                   &cjk_sz, "CJK font");
     }
 #endif
+#if LUNA_UI_ENABLE_FONT_SCAN
+    if (!g_cjk_font_ttf) g_cjk_font_ttf = luna_pick_cjk_font(&reg, &cjk_sz);
+#else
     if (!g_cjk_font_ttf) g_cjk_font_ttf = try_load_font_list(&reg, font_path_score, &cjk_sz);
+#endif
 #if defined(_WIN32)
     if (!g_cjk_font_ttf) g_cjk_font_ttf = luna_try_windows_font(LUNA_FONT_CJK, &cjk_sz);
 #endif
@@ -16924,7 +17205,11 @@ int luna_prepare_font_metrics(void) {
                                                    &mono_sz, "mono font");
     }
 #endif
+#if LUNA_UI_ENABLE_FONT_SCAN
+    if (!g_mono_font_ttf) g_mono_font_ttf = luna_pick_mono_font(&reg, &mono_sz);
+#else
     if (!g_mono_font_ttf) g_mono_font_ttf = try_load_font_list(&reg, font_path_score_mono, &mono_sz);
+#endif
 #if defined(_WIN32)
     if (!g_mono_font_ttf) g_mono_font_ttf = luna_try_windows_font(LUNA_FONT_MONO, &mono_sz);
 #endif
@@ -17049,7 +17334,7 @@ static float atlas_nominal_size(FontAtlas* atlas) {
     return 16.0f;
 }
 
-static void text_metrics_begin(float css_px, int bold, int face, FontAtlas* atlas) {
+LUNA_UI_INTERNAL void text_metrics_begin(float css_px, int bold, int face, FontAtlas* atlas) {
     g_text_css_px = css_px > 0.0f ? css_px : 16.0f;
     g_font_face_hint = face;
     g_font_bold_hint = (bold && bold_font_loaded) ? 1 : 0;
@@ -17060,7 +17345,7 @@ static void text_metrics_begin(float css_px, int bold, int face, FontAtlas* atla
                            text_device_scale() > 1.01f;
 }
 
-static void text_metrics_end(void) {
+LUNA_UI_INTERNAL void text_metrics_end(void) {
     g_text_css_px = 0.0f;
     g_font_face_hint = 0;
     g_font_bold_hint = 0;
@@ -17281,8 +17566,7 @@ static GLuint load_texture_tinted(const char* path0, unsigned tint) {
         key = keybuf;
     }
     const char* path = luna_expand_path(path0);
-    for (int i = 0; i < g_tex_count; i++)
-        if (strcmp(g_tex_cache[i].path, key) == 0) return g_tex_cache[i].tex;
+    { int hit = tex_find(key); if (hit >= 0) return g_tex_cache[hit].tex; }
     if (g_tex_count == g_tex_cap) {
         int cap = g_tex_cap ? g_tex_cap * 2 : 64;
         TexEntry* g = (TexEntry*)realloc(g_tex_cache, sizeof(*g) * (size_t)cap);
@@ -17354,6 +17638,7 @@ static GLuint load_texture_tinted(const char* path0, unsigned tint) {
 
     strncpy(g_tex_cache[g_tex_count].path, key, sizeof(g_tex_cache[0].path) - 1);
     g_tex_cache[g_tex_count].path[sizeof(g_tex_cache[0].path) - 1] = '\0';
+    g_tex_cache[g_tex_count].h = tex_key_hash(g_tex_cache[g_tex_count].path);
     g_tex_cache[g_tex_count].tex = tex;
     g_tex_cache[g_tex_count].tw = w;
     g_tex_cache[g_tex_count].th = h;
@@ -17362,8 +17647,14 @@ static GLuint load_texture_tinted(const char* path0, unsigned tint) {
 }
 
 static int tex_cache_dims(GLuint tex, int* out_w, int* out_h) {
+    if (g_tex_dims_hint < g_tex_count && g_tex_cache[g_tex_dims_hint].tex == tex) {
+        if (out_w) *out_w = g_tex_cache[g_tex_dims_hint].tw;
+        if (out_h) *out_h = g_tex_cache[g_tex_dims_hint].th;
+        return 1;
+    }
     for (int i = 0; i < g_tex_count; i++) {
         if (g_tex_cache[i].tex != tex) continue;
+        g_tex_dims_hint = i;
         if (out_w) *out_w = g_tex_cache[i].tw;
         if (out_h) *out_h = g_tex_cache[i].th;
         return 1;
@@ -17438,7 +17729,6 @@ static void draw_image(float x, float y, float w, float h, float radius, GLuint 
     glUniform1i_(img_loc.uImage, 0);
     luna_bind_vao(g_rect_vao);
     glDrawArrays(GL_TRIANGLES, 0, 6);
-    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 /* One piece of a nine-slice: the source rectangle (image pixels, top-left
@@ -17512,7 +17802,6 @@ static void draw_border_image(float x, float y, float w, float h, float scale,
                              sxs[c], sys[r], sws[c], shs[r], tw, th,
                              e->border_image_tex, alpha);
         }
-    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 /* CSS lengths on gradient stops are measured on the gradient line, not on an
@@ -17837,7 +18126,9 @@ static void flush_text_batch(GLuint tex, float* batch_buf, int* batch_count) {
     /* LUNA_UI_TRACE_TEXT: what the text pass actually submitted.  Text is the
      * one pass that can fail while every box still paints, so "were quads
      * issued, and against which atlas" is the first question to settle. */
-    if (getenv("LUNA_UI_TRACE_TEXT")) {
+    static int trace_text = -1;
+    if (trace_text < 0) trace_text = getenv("LUNA_UI_TRACE_TEXT") != NULL;
+    if (trace_text) {
         static int n;
         if (n++ < 8)
             fprintf(stderr, "[luna-ui] text batch: %d glyphs tex=%u "
@@ -17961,7 +18252,6 @@ void render_text_pass(FontAtlas* atlas, const char* text,
     }
     /* Flush remaining glyphs */
     if (batch_count > 0) flush_text_batch(batch_tex, batch_buf, &batch_count);
-    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 
@@ -17985,9 +18275,9 @@ static int cjk_break_at(const char* p, int take) {
     return cjk_wrappable_cp(prev) && cjk_wrappable_cp(next);
 }
 
-static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
-                            float line_h, int max_lines,
-                            int white_space, int text_overflow, int overflow_wrap) {
+static int count_text_lines_uncached(FontAtlas* atlas, const char* text, float box_w,
+                                     float line_h, int max_lines,
+                                     int white_space, int text_overflow, int overflow_wrap) {
     (void)line_h;
     const char* p = text;
     int line_no = 0;
@@ -17995,12 +18285,13 @@ static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
         while (*p == ' ' || *p == '\t') p++;
         if (!*p) break;
 
-        int remaining = (int)strlen(p);
+        /* One scan to the paragraph end; the old strlen of the whole rest of
+         * the string made N lines cost O(N x length). */
         int hard_break = -1;
-        for (int i = 0; i < remaining; i++) {
-            if (p[i] == '\n' || p[i] == '\r') { hard_break = i; break; }
-        }
-        int para_len = hard_break >= 0 ? hard_break : remaining;
+        int para_scan = 0;
+        while (p[para_scan] && p[para_scan] != '\n' && p[para_scan] != '\r') para_scan++;
+        if (p[para_scan]) hard_break = para_scan;
+        int para_len = para_scan;
         if (para_len <= 0) { p += 1; continue; }
 
         int take = para_len;
@@ -18052,6 +18343,52 @@ static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
         if (hard_break >= 0 && take >= hard_break) p++;
     }
     return line_no;
+}
+
+/* Line counts are asked for twice per text element per frame (layout and
+ * paint) and depend only on the text and the measuring context, so a small
+ * direct-mapped cache removes the repeated wrap/measure work for static text.
+ * Everything that changes a measurement is folded into the key; the font set
+ * signature covers a font arriving after the first measurement. */
+typedef struct { unsigned long long key; int lines; } LineCountMemo;
+static LineCountMemo g_line_memo[512];
+static unsigned long long lc_mix(unsigned long long h, unsigned long long v) {
+    h ^= v; h *= 1099511628211ull; h ^= h >> 29; return h;
+}
+static unsigned lc_fbits(float f) { unsigned u; memcpy(&u, &f, sizeof u); return u; }
+static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
+                            float line_h, int max_lines,
+                            int white_space, int text_overflow, int overflow_wrap) {
+    unsigned long long h = 1469598103934665603ull;
+    for (const unsigned char* q = (const unsigned char*)text; *q; q++)
+        h = (h ^ *q) * 1099511628211ull;
+    h = lc_mix(h, (unsigned long long)(size_t)atlas);
+    h = lc_mix(h, lc_fbits(box_w));
+    h = lc_mix(h, lc_fbits(g_text_css_px));
+    h = lc_mix(h, lc_fbits(g_text_letter_spacing));
+    h = lc_mix(h, lc_fbits(text_device_scale()));
+    h = lc_mix(h, (unsigned long long)(unsigned)max_lines |
+                  (unsigned long long)(white_space & 7) << 32 |
+                  (unsigned long long)(text_overflow & 3) << 36 |
+                  (unsigned long long)(overflow_wrap & 3) << 38 |
+                  (unsigned long long)(g_font_face_hint & 7) << 40 |
+                  (unsigned long long)(g_font_bold_hint & 1) << 43 |
+                  (unsigned long long)(g_text_dynamic_ascii & 1) << 44 |
+                  (unsigned long long)(g_font_info_ok & 1) << 45 |
+                  (unsigned long long)(g_bold_font_info_ok & 1) << 46 |
+                  (unsigned long long)(g_cjk_font_info_ok & 1) << 47 |
+                  (unsigned long long)(g_mono_font_info_ok & 1) << 48 |
+                  (unsigned long long)(g_icon_font_info_ok & 1) << 49 |
+                  (unsigned long long)(g_brand_font_info_ok & 1) << 50 |
+                  (unsigned long long)(g_skin_font_info_ok & 1) << 51);
+    h = lc_mix(h, g_line_memo_epoch);
+    if (!h) h = 1;
+    LineCountMemo* m = &g_line_memo[h & 511u];
+    if (m->key == h) return m->lines;
+    int n = count_text_lines_uncached(atlas, text, box_w, line_h, max_lines,
+                                      white_space, text_overflow, overflow_wrap);
+    m->key = h; m->lines = n;
+    return n;
 }
 
 static void apply_text_transform_buf(char* buf, int transform) {
@@ -18175,12 +18512,13 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
         while (*p == ' ' || *p == '\t') p++;
         if (!*p) break;
 
-        int remaining = (int)strlen(p);
+        /* One scan to the paragraph end; the old strlen of the whole rest of
+         * the string made N lines cost O(N x length). */
         int hard_break = -1;
-        for (int i = 0; i < remaining; i++) {
-            if (p[i] == '\n' || p[i] == '\r') { hard_break = i; break; }
-        }
-        int para_len = hard_break >= 0 ? hard_break : remaining;
+        int para_scan = 0;
+        while (p[para_scan] && p[para_scan] != '\n' && p[para_scan] != '\r') para_scan++;
+        if (p[para_scan]) hard_break = para_scan;
+        int para_len = para_scan;
         if (para_len <= 0) { p += 1; continue; }
 
         int take = para_len;
@@ -20466,7 +20804,7 @@ static GLuint compile_shader(const char* src, GLenum type, const char* label) {
     return shader;
 }
 
-static GLuint create_shader_program(const char* vertex_src, const char* fragment_src,
+LUNA_UI_INTERNAL GLuint create_shader_program(const char* vertex_src, const char* fragment_src,
                                     const char* label) {
     GLuint vs = compile_shader(vertex_src, GL_VERTEX_SHADER, label);
     GLuint fs; GLuint program; GLint ok = 0;
@@ -20657,8 +20995,8 @@ void luna_set_position(int i, float left, float top) {
 }
 int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char* pixels) {
     if (!key || !*key || strlen(key) >= sizeof(g_tex_cache[0].path) || !pixels || w <= 0 || h <= 0) return 0;
-    int slot = 0;
-    while (slot < g_tex_count && strcmp(g_tex_cache[slot].path, key) != 0) slot++;
+    int slot = tex_find(key);
+    if (slot < 0) slot = g_tex_count;
     if (slot == g_tex_count) {
         if (g_tex_count == g_tex_cap) {
             int cap = g_tex_cap ? g_tex_cap * 2 : 64;
@@ -20668,6 +21006,7 @@ int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char*
         }
         memset(&g_tex_cache[slot], 0, sizeof(g_tex_cache[slot]));
         strcpy(g_tex_cache[slot].path, key);
+        g_tex_cache[slot].h = tex_key_hash(key);
         glGenTextures(1, &g_tex_cache[slot].tex);
         g_tex_count++;
     }
@@ -20696,8 +21035,8 @@ int luna_update_texture_rgba(const char* key, int w, int h, const unsigned char*
 int luna_update_texture_rgba_rect(const char* key, int w, int h, const unsigned char* pixels,
                                   int x, int y, int rw, int rh) {
     if (!key || !*key || !pixels || w <= 0 || h <= 0) return 0;
-    int slot = 0;
-    while (slot < g_tex_count && strcmp(g_tex_cache[slot].path, key) != 0) slot++;
+    int slot = tex_find(key);
+    if (slot < 0) slot = g_tex_count;
     if (slot == g_tex_count || !g_tex_cache[slot].tex || g_tex_cache[slot].tw != w || g_tex_cache[slot].th != h ||
         x < 0 || y < 0 || rw <= 0 || rh <= 0 || x + rw > w || y + rh > h)
         return luna_update_texture_rgba(key, w, h, pixels);
@@ -20715,12 +21054,13 @@ int luna_update_texture_rgba_rect(const char* key, int w, int h, const unsigned 
 void luna_invalidate_texture(const char* path) {
     if (!path || !*path) return;
     g_probe_prepared = 0;
-    for (int i = 0; i < g_tex_count; i++) {
-        if (strcmp(g_tex_cache[i].path, path) != 0) continue;
-        if (g_tex_cache[i].tex) glDeleteTextures(1, &g_tex_cache[i].tex);
-        g_tex_cache[i] = g_tex_cache[g_tex_count - 1];
-        g_tex_count--;
-        break;
+    {
+        int i = tex_find(path);
+        if (i >= 0) {
+            if (g_tex_cache[i].tex) glDeleteTextures(1, &g_tex_cache[i].tex);
+            g_tex_cache[i] = g_tex_cache[g_tex_count - 1];
+            g_tex_count--;
+        }
     }
     for (int i = 0; i < elem_count; i++) {
         if (elements[i].bg_image_path[0] && strcmp(elements[i].bg_image_path, path) == 0) {
@@ -20841,9 +21181,7 @@ static int persistent_texture_key(const char* key) {
 }
 int luna_has_texture(const char* key) {
     if (!key) return 0;
-    for (int i = 0; i < g_tex_count; i++)
-        if (g_tex_cache[i].tex && strcmp(g_tex_cache[i].path, key) == 0) return 1;
-    return 0;
+    { int i = tex_find(key); return i >= 0 && g_tex_cache[i].tex; }
 }
 void luna_reset_document(void) {
     /* Texture keys include relative paths. They belong to this document's
@@ -21602,6 +21940,19 @@ void luna_inject_body_background(void) {
     g_render_order_dirty = 1;
 }
 
+/* Caret blink: visible for the first 0.55 s of every second. */
+static int g_blink_phase_seen = -1;
+static int luna_caret_phase(void) { return fmod(luna_now(), 1.0) < 0.55; }
+
+double luna_next_wake_seconds(void) {
+    if (g_focused_element_idx < 0 || g_focused_element_idx >= elem_count ||
+        !elements[g_focused_element_idx].is_input)
+        return -1.0;
+    double f = fmod(luna_now(), 1.0);
+    double d = (f < 0.55 ? 0.55 : 1.0) - f;
+    return d < 0.001 ? 0.001 : d;
+}
+
 static void luna_update_prepare(double now, double dt) {
     luna_dom_flush_restyle();
     g_probe_prepared = 0;
@@ -21632,8 +21983,12 @@ int luna_needs_redraw(double now, double dt) {
     if (layout) mask |= LUNA_REDRAW_LAYOUT | LUNA_REDRAW_PAINT;
     if (settling || css_anim) mask |= LUNA_REDRAW_ANIM | LUNA_REDRAW_PAINT;
     if (g_focused_element_idx >= 0 && g_focused_element_idx < elem_count &&
-        elements[g_focused_element_idx].is_input)
-        mask |= LUNA_REDRAW_PAINT;
+        elements[g_focused_element_idx].is_input) {
+        int ph = luna_caret_phase();
+        if (ph != g_blink_phase_seen) { g_blink_phase_seen = ph; mask |= LUNA_REDRAW_PAINT; }
+    } else {
+        g_blink_phase_seen = -1;
+    }
     /* Event-driven hosts may sleep after the current swap.  Queue exactly one
        wake-up while visual interpolation/keyframes are live; static pages do
        not pay for a timer or a continuous render loop. */
@@ -22480,9 +22835,12 @@ void luna_render(int fbw, int fbh) {
             glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
                                 GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         }
-        glDisable(GL_SCISSOR_TEST);
-        rc_scissor_reset();
+        /* The scissor is left as is: the next element's rc_set_element_scissor()
+         * only reprograms it when its rect differs, so a run of siblings in one
+         * clipping container costs one glScissor instead of one per element. */
     }
+    glDisable(GL_SCISSOR_TEST);
+    rc_scissor_reset();
     g_bg_clip_enabled = 0;
     repaint_stuck_sticky_layers(fbw, fbh);
     if (g_render_root == -1) { ds_draw(fbw, fbh); ctx_menu_draw(); }
@@ -22491,6 +22849,10 @@ void luna_render(int fbw, int fbh) {
      * a compositor drawing its own quad disabled attribute 0 of the rect VAO,
      * and every later pass drew nothing without raising a GL error. */
     luna_bind_vao(0);
+    /* Image and text draws bind their own texture and no longer unbind it
+     * after every draw; hand the host an unbound unit 0 once, here. */
+    if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 static int sticky_is_stuck_in_scroll(int idx) {

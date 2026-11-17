@@ -1126,7 +1126,11 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
 
         if (cfg.on_frame && cfg.frame_interval <= 0.0) timeout_ms = 0;
         else if (cfg.on_frame) timeout_ms = (int)(cfg.frame_interval * 1000.0);
-        else timeout_ms = redraw ? 0 : -1;
+        else if (redraw) timeout_ms = 0;
+        else {
+            double wake = luna_next_wake_seconds();
+            timeout_ms = wake > 0.0 ? (int)(wake * 1000.0) + 1 : -1;
+        }
         luna_kms_host_wait_events(timeout_ms, NULL, 0);
         if (luna_kms.event_seq != before) redraw = 1;
         if (luna_kms.should_close) break;
@@ -1136,7 +1140,6 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
         previous = now;
         if (dt < 0.0 || dt > 0.25) dt = 1.0 / 60.0;
         if (cfg.on_frame) cfg.on_frame(dt, cfg.userdata);
-        luna_update(now, dt);
         if (luna_needs_redraw(now, dt)) redraw = 1;
         if (!redraw) continue;
 

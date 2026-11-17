@@ -756,7 +756,6 @@ int luna_app_run(const LunaAppConfig* user_cfg) {
             previous = now;
             if (dt < 0.0 || dt > 0.25) dt = 1.0 / 60.0;
             if (cfg.on_frame) cfg.on_frame(dt, cfg.userdata);
-            luna_update(now, dt);
             (void)luna_needs_redraw(now, dt);   /* steps CSS transitions and animations */
             GetClientRect(luna_win.hwnd, &r);
             if (r.right > r.left && r.bottom > r.top) {
