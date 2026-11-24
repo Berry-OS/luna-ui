@@ -1460,7 +1460,7 @@ CSSStyleSheet *css_parse_file(const char *path) {
     rewind(f);
     char *buf = malloc(sz + 1);
     if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, sz, f);
+    if (fread(buf, 1, sz, f) != (size_t)sz) { free(buf); fclose(f); return NULL; }
     buf[sz] = '\0';
     fclose(f);
     CSSStyleSheet *sheet = css_parse(buf, (size_t)sz);

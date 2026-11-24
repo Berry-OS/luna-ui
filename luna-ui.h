@@ -1056,7 +1056,7 @@ extern char  luna_doc_title[128];
 extern int   luna_css_from_document;
 
 #if defined(LUNA_UI_SHARED_CLIENT) && !defined(LUNA_UI_IMPLEMENTATION)
-/* An app linked against the shared luna-ui-impl.o: types, the GL loader
+/* An app linked against the shared luna-apps.o: types, the GL loader
  * pointers and a few internals only; no implementation is compiled here. */
 #include <stdlib.h>
 #include <string.h>
@@ -4497,7 +4497,7 @@ typedef struct {
 } FontAtlas;
 
 /* Internals shared with the bundled apps (luna-term/view/editor).  Exported
- * only by a LUNA_UI_EXPORT_INTERNALS build (luna-ui-impl.c); otherwise static. */
+ * only by a LUNA_UI_EXPORT_INTERNALS build (luna-apps.c); otherwise static. */
 LUNA_UI_INTERNAL int   utf8_decode(const char** pp);
 LUNA_UI_INTERNAL int   utf8_encode(int cp, char* out);
 LUNA_UI_INTERNAL float glyph_advance(FontAtlas* atlas, int cp, float css_px);
@@ -6750,7 +6750,7 @@ static const char* class_next_token(const char* p, char* out, size_t out_n) {
     return p;
 }
 
-int element_has_class(LunaElement* e, const char* cls) {
+int element_has_class(const LunaElement* e, const char* cls) {
     if (!e || !cls || !*cls) return 0;
     size_t wanted = strlen(cls);
     const char* p = e->class_name;
