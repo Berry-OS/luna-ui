@@ -37,6 +37,11 @@
 #    include <TargetConditionals.h>
 #    if TARGET_OS_IPHONE
 #      include "luna_ios.h"
+#    elif defined(LUNA_UI_BACKEND_GLFW)
+/* GLFW with an EGL (ANGLE) context: for programs that also render through
+ * ANGLE elsewhere, where Cocoa's desktop GL would clash with its symbols. */
+#      define GL_SILENCE_DEPRECATION
+#      include "luna_glfw.h"
 #    else
 #      include "luna_macos.h"
 #    endif
@@ -837,6 +842,10 @@ void luna_update(double now, double dt);
  * must call luna_dom_flush_restyle() (luna_update does).  Off by default. */
 void luna_dom_defer_restyle(int enabled);
 void luna_dom_flush_restyle(void);
+/* Frees the elements with drop[i] set (and everything under them, and their
+ * scrollbars): detached nodes nobody refers to any more.  Indices change;
+ * uids do not.  Returns how many were freed. */
+int luna_dom_compact(const unsigned char* drop);
 /* Forget cached OpenGL bindings before a host/custom renderer hands control
  * back to Luna UI. Safe to call once at the start of every frame. */
 void luna_invalidate_gl_state(void);
@@ -2980,6 +2989,14 @@ struct LunaElement {
      * that was removed from, or never inserted into, the document. */
     unsigned dom_uid;
     int dom_detached;
+    /* Pending restyle (luna_dom_*): 1 this element and its subtree, 2 this
+     * element alone, 3 no restyle, only its ::before/::after.  Cleared by
+     * the next flush. */
+    unsigned char restyle_mark;
+    /* Its children's turn (their positions changed): 1 each child itself,
+     * 2 each child's subtree. */
+    unsigned char restyle_kids;
+    unsigned char style_unset;      /* created unstyled; the next flush styles it */
     char* dom_attrs;
     /* Script/style source belongs to the DOM, without the display text's
        fixed-size limit or HTML entity decoding. */
@@ -3073,6 +3090,11 @@ typedef struct {
        refinement. */
     int specificity, source_order;
     int index_bucket;              /* immutable target key, computed at ingestion */
+    /* class_bloom bits every ancestor-side class needs (`.a .b > .c`): an
+     * element whose ancestors' classes lack one cannot match.  anc_mask_ready
+     * once computed (the rule's ancestors are final by then). */
+    uint64_t anc_mask;
+    int anc_mask_ready;
     int is_hover, is_active, is_focus, is_focus_visible, is_focus_within;
 
     int has_bg;     float bg_r, bg_g, bg_b, bg_a;
@@ -3477,6 +3499,14 @@ static int luna_ensure_rule_capacity(int needed) {
  * selectors exist.  Most application stylesheets do not use them. */
 static int g_has_structural_selectors = 0;
 static int g_restyle_deferred = 0, g_restyle_pending = 0, g_pseudo_pending = 0;
+/* What a DOM change has to restyle beyond the changed subtree, from the rules
+ * the stylesheet holds:  g_restyle_sib_deep, a structural pseudo-class or a
+ * sibling combinator in an ancestor compound (`li:first-child a`, `.a + .b
+ * .c`): the siblings' whole subtrees;  g_restyle_has, a :has() on a target:
+ * the ancestors themselves;  g_restyle_full, :has() in an ancestor compound:
+ * the whole document, as before.  g_restyle_marks: some element carries a
+ * restyle_mark. */
+static int g_restyle_sib_deep = 0, g_restyle_has = 0, g_restyle_full = 0, g_restyle_marks = 0;
 /* Bumped whenever the tree's shape may have changed (sibling-index cache key). */
 static unsigned g_dom_struct_ver = 1;
 CssKeyframe* g_keyframes;          /* grows with the @keyframes a page declares */
@@ -3563,6 +3593,8 @@ static int* g_rule_list_off;     /* 3 * BUCKETS + 1 offsets into g_rule_lists */
 #define LUNA_RULE_WORDS g_rule_words
 #define g_rule_any    (g_rule_bits)
 static int g_rule_index_ready = 0;
+static int* g_pseudo_rules;      /* orders of the ::before / ::after rules */
+static int g_pseudo_rule_n;
 
 static unsigned rule_hash_span(const char* s, size_t n) {
     uint32_t h = 2166136261u;
@@ -3632,6 +3664,12 @@ static void rebuild_rule_index(void) {
         if (k >= 0) lists[fill[k]++] = order;
     }
     free(fill);
+    int* pr = (int*)realloc(g_pseudo_rules, ((size_t)rule_count + 1) * sizeof(int));
+    if (!pr) abort();
+    g_pseudo_rules = pr;
+    g_pseudo_rule_n = 0;
+    for (int order = 0; order < rule_count; order++)
+        if (css_rules[g_rule_order[order]].pseudo_elem) g_pseudo_rules[g_pseudo_rule_n++] = order;
     g_rule_index_ready = 1;
 }
 
@@ -6734,7 +6772,9 @@ static void apply_element_inline_style(LunaElement* e, int* am) {
     free(buf);
     apply_style_rule(e, &rule, am);
     rule_bg_layers_release(rule.bg_layers);
-    LUNA_LAYOUT_DIRTY(); g_render_order_dirty = 1;
+    /* whether boxes move is for the caller's before/after comparison
+     * (restyle_element_checked); a repaint-only style="" costs no layout */
+    g_render_order_dirty = 1;
 }
 
 static const char* class_next_token(const char* p, char* out, size_t out_n) {
@@ -7126,8 +7166,75 @@ static int attr_selector_matches(const LunaElement* e, const char* name, char op
 
 /* Position of e among its siblings: counted from the start and from the end,
  * over all siblings or only those of its type. */
+/* :nth-of-type positions, from the start and from the end, for every element:
+ * one pass each way over the document, reused until the tree changes (a
+ * per-element sibling walk made a long list of rows quadratic). */
+static int* g_tpos_fwd;
+static int* g_tpos_back;
+static int g_tpos_cap, g_tpos_n = -1;
+static unsigned g_tpos_ver;
+
+static int element_type_table(void) {
+    if (g_tpos_n == elem_count && g_tpos_ver == g_dom_struct_ver) return 1;
+    int n = elem_count;
+    if (n + 1 > g_tpos_cap) {
+        int cap = (n + 1) * 2;
+        int* a = (int*)realloc(g_tpos_fwd, sizeof(int) * (size_t)cap);
+        if (a) g_tpos_fwd = a;
+        int* b = (int*)realloc(g_tpos_back, sizeof(int) * (size_t)cap);
+        if (b) g_tpos_back = b;
+        if (!a || !b) { g_tpos_n = -1; return 0; }
+        g_tpos_cap = cap;
+    }
+    /* (parent, type) -> the last element seen with them */
+    unsigned hcap = 64;
+    while (hcap < (unsigned)n * 2u) hcap <<= 1;
+    int* last = (int*)malloc(sizeof(int) * hcap);
+    if (!last) { g_tpos_n = -1; return 0; }
+    for (int pass = 0; pass < 2; pass++) {
+        int* out = pass ? g_tpos_back : g_tpos_fwd;
+        for (unsigned k = 0; k < hcap; k++) last[k] = -1;
+        for (int j = 0; j < n; j++) {
+            int i = pass ? n - 1 - j : j;
+            const LunaElement* e = &elements[i];
+            if (e->luna_internal) { out[i] = 0; continue; }
+            int par = e->parent_idx < 0 || e->parent_idx >= n ? -1 : e->parent_idx;
+            uint32_t h = 2166136261u ^ (uint32_t)(par + 1) * 2654435761u;
+            for (const char* t = e->type; *t; t++) h = (h ^ (unsigned char)*t) * 16777619u;
+            unsigned k = h & (hcap - 1);
+            for (;;) {
+                int o = last[k];
+                if (o < 0) { out[i] = 1; break; }
+                int opar = elements[o].parent_idx < 0 || elements[o].parent_idx >= n ? -1 : elements[o].parent_idx;
+                if (opar == par && !strcmp(elements[o].type, e->type)) { out[i] = out[o] + 1; break; }
+                k = (k + 1) & (hcap - 1);
+            }
+            last[k] = i;
+        }
+    }
+    free(last);
+    g_tpos_n = n;
+    g_tpos_ver = g_dom_struct_ver;
+    return 1;
+}
+
+/* Position of e among its siblings: counted from the start and from the end,
+ * over all siblings or only those of its type. */
 static void element_type_pos(const LunaElement* e, int of_type, int* from_start, int* from_end) {
     int self = (int)(e - elements), pos = 0, total = 0;
+    if (self >= 0 && self < elem_count && !e->luna_internal) {
+        if (!of_type) {
+            element_sibling_info(e, &pos, &total);
+            *from_start = pos;
+            *from_end = pos ? total - pos + 1 : 0;
+            return;
+        }
+        if (element_type_table()) {
+            *from_start = g_tpos_fwd[self];
+            *from_end = g_tpos_back[self];
+            return;
+        }
+    }
     int parent = e->parent_idx;
     if (parent >= 0 && parent < elem_count) {
         LUNA_FOR_KIDS(c, parent) {
@@ -7226,9 +7333,7 @@ static int has_selector_matches(int idx, const HasSelT* h) {
 
 
 int simple_selector_matches(SimpleSelector* s, LunaElement* e) {
-    if (s->sel_type[0] && strcmp(s->sel_type, e->type) != 0 &&
-        !(is_document_root(e) && html_compound(s))) return 0;
-    if (s->sel_id[0]   && strcmp(s->sel_id,   e->id)   != 0) return 0;
+    /* cheapest rejections first: the class bloom, then a first character */
     if (s->sel_class_count) {
         if (!s->sel_class_mask_ready) {
             uint64_t m = 0;
@@ -7238,6 +7343,9 @@ int simple_selector_matches(SimpleSelector* s, LunaElement* e) {
         }
         if (s->sel_class_mask & ~e->class_bloom) return 0;
     }
+    if (s->sel_id[0] && (s->sel_id[0] != e->id[0] || strcmp(s->sel_id, e->id) != 0)) return 0;
+    if (s->sel_type[0] && (s->sel_type[0] != e->type[0] || strcmp(s->sel_type, e->type) != 0) &&
+        !(is_document_root(e) && html_compound(s))) return 0;
     for (int i = 0; i < s->sel_class_count; i++)
         if (!element_has_class(e, s->sel_classes[i])) return 0;
     if (s->is_first_child || s->is_last_child || s->has_nth) {
@@ -7295,6 +7403,9 @@ int simple_selector_matches(SimpleSelector* s, LunaElement* e) {
  * Share those results within that sweep only: DOM/attribute/hover changes
  * between sweeps must never reuse a previous answer. */
 #define LUNA_CHAIN_CACHE_SIZE 65536u
+/* The union of the class blooms above the element being styled. */
+static const LunaElement* g_anc_bloom_elem;
+static uint64_t g_anc_bloom;
 static struct {
     const StyleRule* rule;
     unsigned epoch;
@@ -7381,6 +7492,21 @@ int selector_matches(StyleRule* r, LunaElement* e) {
     }
     if (e->generated_pseudo) return 0;
     if (!simple_selector_matches(&r->target, e)) return 0;
+    if (r->ancestor_count && e == g_anc_bloom_elem) {
+        if (!r->anc_mask_ready) {
+            uint64_t m = 0;
+            for (int a = 0; a < r->ancestor_count; a++) {
+                const SimpleSelector* an = &r->ancestors[a];
+                if (an->rel != LUNA_REL_DESC && an->rel != LUNA_REL_CHILD) break;
+                if (html_compound(an)) break;
+                for (int i = 0; i < an->sel_class_count; i++)
+                    m |= class_bit(an->sel_classes[i], strlen(an->sel_classes[i]));
+            }
+            r->anc_mask = m;
+            r->anc_mask_ready = 1;
+        }
+        if (r->anc_mask & ~g_anc_bloom) return 0;
+    }
     return match_selector_chain(r, 0, (int)(e - elements));
 }
 
@@ -9510,8 +9636,14 @@ static void ingest_parsed_rule(const CSSRule *pr) {
             if (root >= 1.0f && root <= 200.0f) g_rem_px = root;
         }
         if (selector_is_structural(&rule.target)) g_has_structural_selectors = 1;
-        for (int a = 0; a < rule.ancestor_count; a++)
-            if (selector_is_structural(&rule.ancestors[a])) g_has_structural_selectors = 1;
+        if (rule.target.has_count) g_restyle_has = 1;
+        for (int a = 0; a < rule.ancestor_count; a++) {
+            const SimpleSelector* an = &rule.ancestors[a];
+            if (selector_is_structural(an)) g_has_structural_selectors = 1;
+            if (selector_is_structural(an) || an->rel == LUNA_REL_ADJ || an->rel == LUNA_REL_SIB)
+                g_restyle_sib_deep = 1;
+            if (an->has_count) g_restyle_full = 1;
+        }
 
         rule.source_order = rule_count;
         rule.index_bucket = rule_bucket_of(&rule.target);
@@ -11025,6 +11157,14 @@ void update_element_style(LunaElement* e) {
     if (!g_rule_index_ready) rebuild_rule_index();
     LUNA_SCRATCH(uint64_t, rule_candidates, g_rule_words);
     build_rule_candidates(e, rule_candidates);
+    {
+        uint64_t bloom = 0;
+        int depth = 0;
+        for (int p = e->parent_idx; p >= 0 && p < elem_count && depth < 4096; p = elements[p].parent_idx, depth++)
+            bloom |= elements[p].class_bloom;
+        g_anc_bloom = bloom;
+        g_anc_bloom_elem = e;
+    }
     /* Both custom-property collection and the declaration cascade need the
        same selectors. Match once, retaining cascade order in the bit set. */
     for (int order = rule_candidate_next(rule_candidates, -1); order >= 0;
@@ -11032,6 +11172,7 @@ void update_element_style(LunaElement* e) {
         if (!style_rule_applies(&css_rules[g_rule_order[order]], e))
             rule_candidates[(unsigned)order >> 6] &= ~(UINT64_C(1) << ((unsigned)order & 63u));
     }
+    g_anc_bloom_elem = NULL;
 
     /* Custom properties first: every var() below sees the element's final
      * values, whichever rule declared them. */
@@ -11308,27 +11449,37 @@ static int restyle_element_checked(LunaElement* e) {
 
 /* Spawn synthetic LunaElement nodes for ::before and ::after pseudo-elements.
    Called once at the end of parse_html after all real DOM nodes exist. */
-static void generate_pseudo_elements(void) {
+/* only: when non-NULL, the hosts to consider (elements restyled by a partial
+ * flush); the others keep the pseudo nodes they have. */
+static void generate_pseudo_elements_for(const unsigned char* only) {
     /* Iterate DOM elements (fixed count — we will append new ones) */
     int dom_count = elem_count;
+    if (!g_rule_index_ready) rebuild_rule_index();
+    if (!g_pseudo_rule_n) return;
+    /* which hosts already have a ::before (bit 1) / ::after (bit 2) node */
+    static unsigned char* have = NULL;
+    static int have_cap = 0;
+    if (dom_count > have_cap) {
+        unsigned char* g = (unsigned char*)realloc(have, (size_t)dom_count);
+        if (!g) return;
+        have = g; have_cap = dom_count;
+    }
+    memset(have, 0, (size_t)dom_count);
+    for (int xi = 0; xi < dom_count; xi++) {
+        int par = elements[xi].parent_idx, gp = elements[xi].generated_pseudo;
+        if (gp && par >= 0 && par < dom_count) have[par] |= (unsigned char)(1u << (gp & 7));
+    }
     for (int ei = 0; ei < dom_count && elem_count < MAX_ELEMENTS; ei++) {
+        if (only && !only[ei]) continue;
         LunaElement* host = &elements[ei];
         if (host->luna_internal) continue;
         if (host->generated_pseudo) continue;
 
-        /* Check only rules whose target key can match this host. */
-        if (!g_rule_index_ready) rebuild_rule_index();
-        LUNA_SCRATCH(uint64_t, rule_candidates, g_rule_words);
-        build_rule_candidates(host, rule_candidates);
-        for (int order = rule_candidate_next(rule_candidates, -1);
-             order >= 0 && elem_count < MAX_ELEMENTS;
-             order = rule_candidate_next(rule_candidates, order)) {
-            StyleRule* r = &css_rules[g_rule_order[order]];
-            if (!r->pseudo_elem) continue; /* not a pseudo-element rule */
+        for (int pi = 0; pi < g_pseudo_rule_n && elem_count < MAX_ELEMENTS; pi++) {
+            StyleRule* r = &css_rules[g_rule_order[g_pseudo_rules[pi]]];
             /* Skip hover/focus/active-only pseudo rules for now */
             if (r->is_hover || r->is_active || r->is_focus) continue;
-
-            if (!selector_matches_pseudo(r, host)) continue;
+            if (have[ei] & (1u << (r->pseudo_elem & 7))) continue; /* already created */
 
             /* Skip rules with no visible effect (e.g. CSS resets like
                `*, *::before, *::after { box-sizing: border-box; }`) */
@@ -11338,15 +11489,8 @@ static void generate_pseudo_elements(void) {
                 !(r->has_display && !r->display_none))
                 continue;
 
-            /* We found a match — look for an existing pseudo node (including
-             * ones created by earlier CSS reloads / parse passes). */
-            int existing = -1;
-            for (int xi = 0; xi < elem_count; xi++) {
-                if (elements[xi].parent_idx == ei &&
-                    elements[xi].generated_pseudo == r->pseudo_elem)
-                    { existing = xi; break; }
-            }
-            if (existing >= 0) continue; /* already created */
+            if (!selector_matches_pseudo(r, host)) continue;
+            have[ei] |= (unsigned char)(1u << (r->pseudo_elem & 7));
 
             /* Spawn a synthetic element. realloc may move the DOM, so refresh
              * host after growing before any further host access. */
@@ -11393,6 +11537,8 @@ static void generate_pseudo_elements(void) {
     }
     if (elem_count > dom_count) g_render_order_dirty = 1;
 }
+
+static void generate_pseudo_elements(void) { generate_pseudo_elements_for(NULL); }
 
 // ============================================================
 // HTML parsing
@@ -11555,6 +11701,12 @@ static void append_direct_text(int parent_idx, const char* start, const char* en
 
 static unsigned g_dom_uid_seq = 0;
 static int g_dom_uid_dirty = 1;
+static int g_parse_unstyled = 0;
+/* The uid map is current below this element index: appends and reorders
+ * only stale what they touched, so a lookup after appendChild rescans the
+ * moved span, not the document. */
+static int g_dom_uid_from = 0;
+static void dom_uid_stale_from(int i) { if (i < g_dom_uid_from) g_dom_uid_from = i < 0 ? 0 : i; }
 
 /* The source attributes of a start tag: everything after the tag name. */
 static char* dom_attrs_from_tag(const char* tag_buf) {
@@ -11642,12 +11794,13 @@ static void parse_html_into(const char* html, int root_parent) {
 
 static void parse_html_markup(const char* html, int root_parent) {
     g_dom_struct_ver++;
+    int first_new = elem_count;
     int parent_stack[64];
     int stack_ptr = 0;
     int current_parent = root_parent;
     const char* p = html;
     int pending_ws = 0;
-    g_dom_uid_dirty = 1;
+    dom_uid_stale_from(first_new);
     if (root_parent == -1) {            /* quirks mode = no doctype before the first element */
         const char* q = html;
         for (;;) {
@@ -12094,7 +12247,14 @@ static void parse_html_markup(const char* html, int root_parent) {
             }
         }
         elements[elem_count] = e;
-        update_element_style(&elements[elem_count]);
+        if (g_parse_unstyled) {
+            /* createElement: the node is styled once its attributes are set
+             * and it is placed, by the next flush, not now and again then */
+            elements[elem_count].style_unset = 1;
+            elements[elem_count].restyle_mark = 1;
+            g_restyle_marks = 1;
+        } else
+            update_element_style(&elements[elem_count]);
 
         LunaElement* ne = &elements[elem_count];
         ne->cur_r = ne->r; ne->cur_g = ne->g; ne->cur_b = ne->b; ne->cur_a = ne->a;
@@ -12115,9 +12275,24 @@ static void parse_html_markup(const char* html, int root_parent) {
        none; parent-before-child parsing already produced final computed style. */
     if (g_restyle_deferred) {
         /* the host flushes once, before it reads style or layout */
-        if (g_has_structural_selectors) g_restyle_pending = 2;   /* 2: also settle cur_* */
+        if (g_has_structural_selectors) {
+            if (first_new == 0) g_restyle_pending = 2;        /* 2: also settle cur_* */
+            else if (!(g_restyle_full && g_restyle_pending)) {
+                /* a fragment (createElement, innerHTML): only the new nodes
+                 * have unsettled structure; whoever inserts them restyles
+                 * their new siblings */
+                for (int i = first_new; i < elem_count; i++) elements[i].restyle_mark = 1;
+                if (first_new < elem_count) g_restyle_marks = 1;
+            }
+        } else if (first_new > 0) {
+            /* styled as parsed; only their pseudo-elements are owed */
+            for (int i = first_new; i < elem_count; i++)
+                if (!elements[i].restyle_mark) elements[i].restyle_mark = 3;
+            if (first_new < elem_count) g_restyle_marks = 1;
+        }
         g_pseudo_pending = 1;
-        LUNA_LAYOUT_DIRTY();
+        /* a fragment for a detached node (createElement) lays nothing out */
+        if (first_new == 0 || (root_parent >= 0 && luna_dom_is_connected(root_parent))) LUNA_LAYOUT_DIRTY();
         return;
     }
     if (g_has_structural_selectors) {
@@ -21156,6 +21331,7 @@ void luna_reset_css(void) {
     g_css_from_document = 0;
     g_rule_index_ready = 0;
     g_has_structural_selectors = 0;
+    g_restyle_sib_deep = g_restyle_has = g_restyle_full = 0;
     g_restyle_pending = 0; g_pseudo_pending = 0;
     g_css_generation++;
     if (!g_css_generation) g_css_generation = 1;
@@ -21264,22 +21440,25 @@ static unsigned g_dom_uid_map_cap = 0;
 static int dom_valid(int idx) { return idx >= 0 && idx < elem_count; }
 
 static void dom_uid_map_sync(void) {
-    if (!g_dom_uid_dirty) return;
+    if (!g_dom_uid_dirty && g_dom_uid_from >= elem_count) return;
     unsigned need = g_dom_uid_seq + 1u;
     if (need > g_dom_uid_map_cap) {
         unsigned cap = g_dom_uid_map_cap ? g_dom_uid_map_cap : 256u;
         while (cap < need) cap *= 2u;
         int* grown = (int*)realloc(g_dom_uid_map, sizeof(int) * cap);
-        if (!grown) return;
+        if (!grown) { g_dom_uid_dirty = 1; return; }
+        memset(grown + g_dom_uid_map_cap, 0, sizeof(int) * (cap - g_dom_uid_map_cap));
         g_dom_uid_map = grown;
         g_dom_uid_map_cap = cap;
     }
-    memset(g_dom_uid_map, 0, sizeof(int) * need);
-    for (int i = 0; i < elem_count; i++) {
+    int start = g_dom_uid_dirty ? 0 : g_dom_uid_from;
+    if (!start) memset(g_dom_uid_map, 0, sizeof(int) * g_dom_uid_map_cap);
+    for (int i = start; i < elem_count; i++) {
         unsigned uid = elements[i].dom_uid;
         if (uid && uid < need) g_dom_uid_map[uid] = i + 1;
     }
     g_dom_uid_dirty = 0;
+    g_dom_uid_from = elem_count;
 }
 
 unsigned luna_dom_uid(int idx) { return dom_valid(idx) ? elements[idx].dom_uid : 0u; }
@@ -21325,7 +21504,7 @@ int luna_dom_create_text(const char* text) {
     t->dom_uid = ++g_dom_uid_seq;
     elem_count++;
     update_element_style(t);
-    g_dom_uid_dirty = 1;
+    dom_uid_stale_from(idx);
     return idx;
 }
 
@@ -21357,7 +21536,6 @@ static void dom_invalidate_index_state(void) {
     g_activity_registry_dirty = 1;
     g_id_map_ready = 0;
     g_id_map_built = 0;
-    g_dom_uid_dirty = 1;
     LUNA_AUX_ZERO(g_intrinsic_width_valid);
     LUNA_AUX_ZERO(g_min_content_width_valid);
     LUNA_LAYOUT_DIRTY();
@@ -21398,6 +21576,7 @@ static int dom_apply_order(const int* order) {
     if (!remap || !moved || !slots) { free(remap); free(moved); free(slots); return 0; }
     for (int k = 0; k < n; k++) remap[k] = k;
     for (int k = lo; k <= hi; k++) { remap[order[k]] = k; moved[k - lo] = elements[order[k]]; }
+    dom_uid_stale_from(lo);
     memcpy(elements + lo, moved, sizeof(LunaElement) * (size_t)(hi - lo + 1));
     free(moved);
 #define DOM_RM(v) (((v) >= 0 && (v) < n) ? remap[(v)] : (v))
@@ -21432,31 +21611,45 @@ static int dom_apply_order(const int* order) {
     return 1;
 }
 
-/* Restyles idx and its subtree (selectors see ancestors and siblings). */
+static void dom_mark_kids(int idx, unsigned char m) {
+    if (elements[idx].restyle_kids < m) elements[idx].restyle_kids = m;
+    g_restyle_marks = 1;
+}
+
+static void dom_mark_restyle(int idx, unsigned char m) {
+    static const unsigned char rank[4] = { 0, 3, 2, 1 };   /* 1 > 2 > 3 > none */
+    if (rank[elements[idx].restyle_mark & 3] >= rank[m & 3]) return;
+    elements[idx].restyle_mark = m;
+    g_restyle_marks = 1;
+}
+
+/* Restyles idx and its subtree (selectors see ancestors and siblings).
+ *
+ * The work is recorded as marks and done by the next flush, so a script that
+ * changes a hundred nodes and then reads one box pays for one restyle of what
+ * changed, not a hundred restyles of the whole document. */
 static void dom_restyle_subtree(int idx) {
     if (!dom_valid(idx)) return;
-    if (g_has_structural_selectors && g_restyle_deferred) {
+    if (g_restyle_full && g_has_structural_selectors) {
         if (!g_restyle_pending) g_restyle_pending = 1;
-        LUNA_LAYOUT_DIRTY();
-        g_probe_prepared = 0;
-        return;
-    }
-    if (g_has_structural_selectors) {
-        for (int i = 0; i < elem_count; i++)
-            if (!elements[i].luna_internal) (void)restyle_element_checked(&elements[i]);
     } else {
-        (void)restyle_element_checked(&elements[idx]);
-        for (int i = 0; i < elem_count; i++)
-            if (!elements[i].luna_internal && dom_is_ancestor(idx, i))
-                (void)restyle_element_checked(&elements[i]);
+        dom_mark_restyle(idx, 1);
+        int p = elements[idx].parent_idx;
+        if (p >= 0 && (g_has_structural_selectors || g_restyle_sib_deep)) {
+            /* :first-child, :nth-child(), :empty, `+` and `~` see siblings */
+            dom_mark_restyle(p, 2);
+            dom_mark_kids(p, g_restyle_sib_deep ? 2 : 1);
+        }
+        if (g_restyle_has)
+            for (int a = p; a >= 0; a = elements[a].parent_idx) dom_mark_restyle(a, 2);
     }
-    if (g_restyle_deferred) g_pseudo_pending = 1;
-    else generate_pseudo_elements();
-    LUNA_AUX_ZERO(g_intrinsic_width_valid);
-    LUNA_LAYOUT_DIRTY();
-    g_render_order_dirty = 1;
-    g_visual_scan_needed = 1;
+    /* No layout yet: restyle_element_checked() asks for one when a box's
+     * layout inputs changed.  A colour or a class that only repaints must
+     * not cost a script's next getBoundingClientRect() a whole layout. */
     g_probe_prepared = 0;
+    g_visual_scan_needed = 1;
+    if (g_restyle_deferred) { g_pseudo_pending = 1; return; }
+    luna_dom_flush_restyle();
 }
 
 void luna_dom_restyle(int idx) { dom_restyle_subtree(idx); }
@@ -21466,26 +21659,85 @@ void luna_dom_defer_restyle(int enabled) {
     g_restyle_deferred = enabled != 0;
 }
 
+/* The marked elements and the subtrees under a 1-mark, in document order
+ * (parents first, so inherited values are current). */
+static const unsigned char* dom_restyle_marked(void) {
+    static unsigned char* in = NULL;
+    static int cap = 0;
+    int n = elem_count;
+    if (n > cap) {
+        unsigned char* grown = (unsigned char*)realloc(in, (size_t)n);
+        if (!grown) {               /* fall back on everything */
+            for (int i = 0; i < n; i++) {
+                if (!elements[i].luna_internal) (void)restyle_element_checked(&elements[i]);
+                elements[i].restyle_mark = 0;
+            }
+            return NULL;
+        }
+        in = grown; cap = n;
+    }
+    for (int i = 0; i < n; i++) {
+        LunaElement* e = &elements[i];
+        int par = e->parent_idx, inside = e->restyle_mark == 1;
+        if (!inside && par >= 0 && par < n) {
+            if (elements[par].restyle_kids == 2) inside = 1;
+            else if (par < i) inside = in[par];
+            else for (int a = par; a >= 0 && !inside; a = elements[a].parent_idx)
+                inside = elements[a].restyle_mark == 1 || elements[a].restyle_kids == 2;
+        }
+        in[i] = (unsigned char)inside;
+    }
+    for (int i = 0; i < n; i++) {
+        LunaElement* e = &elements[i];
+        int par = e->parent_idx;
+        int restyle = in[i] || e->restyle_mark == 2 || e->style_unset ||
+                      (par >= 0 && par < n && elements[par].restyle_kids);
+        if (restyle && !e->luna_internal) (void)restyle_element_checked(e);
+        if (e->style_unset) {
+            e->style_unset = 0;
+            e->cur_r = e->r; e->cur_g = e->g; e->cur_b = e->b; e->cur_a = e->a;
+            e->cur_bd_r = e->bd_r; e->cur_bd_g = e->bd_g;
+            e->cur_bd_b = e->bd_b; e->cur_bd_a = e->bd_a;
+        }
+        in[i] = (unsigned char)(restyle || e->restyle_mark == 3);  /* now: owes pseudo-elements */
+        e->restyle_mark = 0;
+    }
+    for (int i = 0; i < n; i++) elements[i].restyle_kids = 0;
+    return in;
+}
+
 void luna_dom_flush_restyle(void) {
-    if (!g_restyle_pending && !g_pseudo_pending) return;
-    int full = g_restyle_pending;
-    g_restyle_pending = 0; g_pseudo_pending = 0;
+    if (!g_restyle_pending && !g_pseudo_pending && !g_restyle_marks) return;
+    int full = g_restyle_pending, marked = g_restyle_marks, pseudo = g_pseudo_pending;
+    g_restyle_pending = 0; g_pseudo_pending = 0; g_restyle_marks = 0;
     style_match_begin();
-    if (full)
+    if (full) {
         for (int i = 0; i < elem_count; i++) {
             LunaElement* e = &elements[i];
+            e->restyle_mark = 0;
+            e->restyle_kids = 0;
             if (e->luna_internal) continue;
             (void)restyle_element_checked(e);
-            if (full == 2) {
+            if (full == 2 || e->style_unset) {
+                e->style_unset = 0;
                 e->cur_r = e->r; e->cur_g = e->g; e->cur_b = e->b; e->cur_a = e->a;
                 e->cur_bd_r = e->bd_r; e->cur_bd_g = e->bd_g;
                 e->cur_bd_b = e->bd_b; e->cur_bd_a = e->bd_a;
             }
         }
+    }
+    const unsigned char* only = NULL;
+    if (!full && marked) {
+        only = dom_restyle_marked();
+        if (!only) full = 1;
+    }
     style_match_end();
-    generate_pseudo_elements();
-    LUNA_AUX_ZERO(g_intrinsic_width_valid);
-    LUNA_LAYOUT_DIRTY();
+    int before_pseudo = elem_count;
+    if (full || only || (pseudo && !marked)) generate_pseudo_elements_for(only);
+    if (full || elem_count != before_pseudo) {
+        LUNA_AUX_ZERO(g_intrinsic_width_valid);
+        LUNA_LAYOUT_DIRTY();
+    }
     g_render_order_dirty = 1;
     g_visual_scan_needed = 1;
     g_probe_prepared = 0;
@@ -21510,13 +21762,15 @@ int luna_dom_create(const char* tag, const char* attrs) {
        not rendered elements; a caller keeps those itself. */
     if (luna_strcasecmp(tag, "body") == 0 || is_ignored_element(tag) ||
         is_semantic_shell_element(tag)) { free(html); return -1; }
+    g_parse_unstyled = g_restyle_deferred;
     parse_html_into(html, -1);
+    g_parse_unstyled = 0;
     free(html);
     if (elem_count == before) return -1;
     int idx = before;
     elements[idx].parent_idx = -1; g_dom_struct_ver++;
     elements[idx].dom_detached = 1;
-    g_dom_uid_dirty = 1;
+    dom_uid_stale_from(idx);
     g_id_map_ready = 0;
     g_probe_prepared = 0;
     return idx;
@@ -21578,6 +21832,7 @@ int luna_dom_insert(int parent, int child, int before) {
     free(order);
     if (new_child < 0) return -1;
     dom_restyle_subtree(new_child);
+    if (luna_dom_is_connected(new_child)) LUNA_LAYOUT_DIRTY();
     return new_child;
 }
 
@@ -21586,19 +21841,122 @@ int luna_dom_remove(int idx) {
     if (g_focused_element_idx == idx || (g_focused_element_idx >= 0 &&
                                           dom_is_ancestor(idx, g_focused_element_idx)))
         g_focused_element_idx = -1;
+    int old_parent = elements[idx].parent_idx;
+    if (luna_dom_is_connected(idx)) LUNA_LAYOUT_DIRTY();
     elements[idx].parent_idx = -1;
     elements[idx].dom_detached = 1;
+    if (old_parent >= 0 && (g_has_structural_selectors || g_restyle_sib_deep || g_restyle_has)) {
+        /* the remaining siblings' positions, and :empty / :has() above */
+        g_dom_struct_ver++;
+        if (g_restyle_full && g_has_structural_selectors) {
+            if (!g_restyle_pending) g_restyle_pending = 1;
+        } else {
+            for (int a = old_parent; a >= 0; a = elements[a].parent_idx) {
+                dom_mark_restyle(a, 2);
+                if (!g_restyle_has) break;
+            }
+            if (g_has_structural_selectors || g_restyle_sib_deep)
+                dom_mark_kids(old_parent, g_restyle_sib_deep ? 2 : 1);
+        }
+        LUNA_LAYOUT_DIRTY();
+        if (g_restyle_deferred) g_pseudo_pending = 1;
+        else luna_dom_flush_restyle();
+    }
     g_hover_chain_count = 0;
     dom_invalidate_index_state();
     return 0;
 }
 
+int luna_dom_compact(const unsigned char* drop_in) {
+    int n = elem_count;
+    if (n <= 0 || !drop_in) return 0;
+    unsigned char* drop = (unsigned char*)malloc((size_t)n);
+    int* order = (int*)malloc(sizeof(int) * (size_t)n);
+    if (!drop || !order) { free(drop); free(order); return 0; }
+    memcpy(drop, drop_in, (size_t)n);
+    /* a dropped node takes its subtree, pseudo-elements and scrollbars along */
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < n; i++) {
+            if (drop[i]) continue;
+            int p = elements[i].parent_idx;
+            if (p >= 0 && p < n && drop[p]) drop[i] = 1;
+            else if (elements[i].luna_internal && elements[i].sb_host_idx >= 0 &&
+                     elements[i].sb_host_idx < n && drop[elements[i].sb_host_idx]) drop[i] = 1;
+            else if (p >= n || (p >= 0 && p > i))
+                for (int a = p; a >= 0 && a < n; a = elements[a].parent_idx)
+                    if (drop[a]) { drop[i] = 1; break; }
+        }
+    int k = 0;
+    for (int i = 0; i < n; i++) if (!drop[i]) order[k++] = i;
+    int kept = k;
+    for (int i = 0; i < n; i++) if (drop[i]) order[k++] = i;
+    free(drop);
+    if (kept == n || !dom_apply_order(order)) { free(order); return 0; }
+    free(order);
+    for (int i = kept; i < n; i++) {
+        LunaElement* e = &elements[i];
+        free(e->bg_layers);
+        free(e->inline_style_ext);
+        free(e->dom_attrs);
+        free(e->dom_raw_text);
+        free(e->css_vars);
+        css_vars_reset(e);
+        memset(e, 0, sizeof(*e));
+    }
+    elem_count = kept;
+#define DOM_GONE(v) do { if ((v) >= kept) (v) = -1; } while (0)
+    DOM_GONE(g_focused_idx);
+    DOM_GONE(g_focused_element_idx);
+    DOM_GONE(g_focus_before_trap);
+    DOM_GONE(drag_target_idx);
+    DOM_GONE(g_scroll_drag_idx);
+    DOM_GONE(g_scroll_hover_idx);
+    DOM_GONE(g_input_drag_idx);
+    DOM_GONE(g_click_idx);
+    for (int i = 0; i < g_focus_trap_count; i++) DOM_GONE(g_focus_traps[i].idx);
+    for (int i = 0; i < g_dom_tracked_n; i++) DOM_GONE(*g_dom_tracked[i]);
+#undef DOM_GONE
+    g_hover_chain_count = 0;
+    for (int i = kept; i < n && i < g_aux_cap; i++)
+        for (int a = 0; a < 4; a++) g_sb_slots[i][a] = 0;
+    for (int i = 0; i < kept && i < g_aux_cap; i++)
+        for (int a = 0; a < 4; a++)
+            if (g_sb_slots[i][a] >= kept) g_sb_slots[i][a] = 0;
+    g_dom_uid_dirty = 1;
+    g_id_map_ready = 0;
+    g_id_map_built = 0;
+    dom_invalidate_index_state();
+    LUNA_AUX_ZERO(g_intrinsic_width_valid);
+    LUNA_LAYOUT_DIRTY();
+    g_render_order_dirty = 1;
+    g_probe_prepared = 0;
+    return n - kept;
+}
+
 int luna_dom_set_inner_html(int idx, const char* html) {
     if (!dom_valid(idx)) return -1;
-    int kids[256];
-    int nk;
-    while ((nk = luna_dom_children(idx, kids, 256)) > 0)
-        for (int i = 0; i < nk && i < 256; i++) luna_dom_remove(kids[i]);
+    {
+        /* the child list, not a scan of every element per 256 children */
+        int nk = 0, cap = 64;
+        int* kids = (int*)malloc(sizeof(int) * (size_t)cap);
+        LUNA_FOR_KIDS(c, idx) {
+            if (elements[c].luna_internal || elements[c].generated_pseudo) continue;
+            if (nk == cap) {
+                int* g = kids ? (int*)realloc(kids, sizeof(int) * (size_t)(cap *= 2)) : NULL;
+                if (!g) { free(kids); kids = NULL; nk = 0; break; }
+                kids = g;
+            }
+            if (kids) kids[nk++] = c;
+        }
+        for (int i = 0; i < nk; i++) luna_dom_remove(kids[i]);
+        int short_of_memory = !kids;
+        free(kids);
+        if (short_of_memory) {
+            int more[256], nm;
+            while ((nm = luna_dom_children(idx, more, 256)) > 0)
+                for (int i = 0; i < nm && i < 256; i++) luna_dom_remove(more[i]);
+        }
+    }
     elements[idx].text[0] = '\0';
     elements[idx].direct_text_before_children = 0;
     if (!html || !html[0]) { LUNA_LAYOUT_DIRTY(); g_probe_prepared = 0; return 0; }
@@ -21776,12 +22134,23 @@ static void dom_attr_apply(int idx, const char* name, const char* value) {
     }
 }
 
+/* Attributes that reach layout only through the cascade (which detects a
+ * layout change itself); any other may change a box directly. */
+static int dom_attr_style_only(const char* name) {
+    static const char* const names[] = { "id", "class", "style", "role", "tabindex", "title", "href",
+        "target", "rel", "name", "for", "lang", "dir", "draggable", "translate", "itemprop", NULL };
+    if (!luna_strncasecmp(name, "data-", 5) || !luna_strncasecmp(name, "aria-", 5)) return 1;
+    for (int i = 0; names[i]; i++) if (!luna_strcasecmp(name, names[i])) return 1;
+    return 0;
+}
+
 int luna_dom_set_attr(int idx, const char* name, const char* value) {
     if (!dom_valid(idx) || !name || !name[0] || strlen(name) >= 64) return -1;
     if (!value) value = "";
     if (dom_attr_write(idx, name, value) != 0) return -1;
     dom_attr_apply(idx, name, value);
     dom_restyle_subtree(idx);
+    if (!dom_attr_style_only(name)) LUNA_LAYOUT_DIRTY();
     return 0;
 }
 
@@ -21791,6 +22160,7 @@ int luna_dom_remove_attr(int idx, const char* name) {
     if (dom_attr_write(idx, name, NULL) != 0) return -1;
     dom_attr_apply(idx, name, NULL);
     dom_restyle_subtree(idx);
+    if (!dom_attr_style_only(name)) LUNA_LAYOUT_DIRTY();
     return 0;
 }
 void luna_parse_css(const char* c) {
@@ -23472,6 +23842,8 @@ void luna_context_touch(LunaContext* ctx, const LunaTouchEvent* event) {
 #  elif defined(__APPLE__)
 #    if TARGET_OS_IPHONE
 #      include "luna_ios.h"
+#    elif defined(LUNA_UI_BACKEND_GLFW)
+#      include "luna_glfw.h"
 #    else
 #      include "luna_macos.h"
 #    endif
