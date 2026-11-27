@@ -33,6 +33,7 @@
  */
 #define CSS_MAX_SELECTORS  4096   /* per rule: a sanity bound, not storage */
 #define CSS_MAX_PARTS         6
+#define CSS_MAX_COMPOUNDS     8
 #define CSS_MAX_DECLS      4096   /* per rule: a sanity bound, not storage */
 #define CSS_MAX_RULES       512
 #define CSS_MAX_ATRULES      64
@@ -103,7 +104,7 @@ typedef struct {
 
 /* One full selector (chain of compounds) */
 typedef struct {
-    CSSCompound compounds[CSS_MAX_PARTS];
+    CSSCompound compounds[CSS_MAX_COMPOUNDS];
     int compound_count;
     int specificity;
 } CSSSelector;
@@ -521,7 +522,7 @@ static int parse_one_selector(Lexer *l, CSSSelector *sel) {
         while (!lex_eof(l) && c != ',' && c != '{' && c != ')' &&
                c != ' ' && c != '\t' && c != '\n' && c != '\r' &&
                c != '>' && c != '+' && c != '~') {
-            if (pi >= CSS_MAX_PARTS) break;
+            if (pi >= CSS_MAX_PARTS) goto too_complex;
             parse_selector_part(l, &cmp->parts[pi++]);
             c = lex_peek(l);
         }
@@ -543,12 +544,26 @@ static int parse_one_selector(Lexer *l, CSSSelector *sel) {
         cmp->specificity = (sa << 16) | (sb << 8) | sc;
 
         if (pi == 0) break;
-        if (++ci >= CSS_MAX_PARTS) break;
+        if (++ci == CSS_MAX_COMPOUNDS) {
+            lex_skip_ws(l);
+            c = lex_peek(l);
+            if (!lex_eof(l) && c != ',' && c != '{' && c != ')') goto too_complex;
+            break;
+        }
     }
 
     sel->compound_count = ci;
     sel->specificity = calc_specificity(sel);
     return ci > 0 || (sel->compound_count == 1 && sel->compounds[0].part_count == 0) ? 1 : 0;
+
+too_complex:
+    /* Consume the rest of this selector so its suffix cannot become a
+     * separate selector with fewer restrictions. */
+    {
+        char discard[1];
+        lex_until(l, discard, sizeof discard, ",{)");
+    }
+    return 0;
 }
 
 /* The next free selector / declaration of a rule, grown on demand (NULL

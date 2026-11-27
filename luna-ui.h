@@ -2684,6 +2684,8 @@ struct LunaElement {
     int drag_mode; // 0=none, 1=move parent window, 2=drag self (slider thumb)
 
     int pct_w, pct_h, pct_left, pct_top, pct_bottom, pct_right;
+    int width_ch, width_has_cap;
+    float width_cap;
     float raw_w, raw_h, raw_left, raw_top, raw_bottom, raw_right;
     float raw_w_off, raw_h_off, raw_left_off, raw_top_off, raw_bottom_off, raw_right_off;
     int has_bottom, has_right;
@@ -2904,7 +2906,9 @@ struct LunaElement {
     float tf_oxpx, tf_oypx;         /* ... plus a length in px */
     float transform_tx, transform_ty;
     float transform_rotate;
+    float flow_float_inset[2], flow_float_bottom[2];
     float raw_transform_tx, raw_transform_ty;
+    float transform_tx_offset, transform_ty_offset;
     int transform_tx_pct, transform_ty_pct;
     float cur_tx, cur_ty;
     float anim_speed;
@@ -3005,6 +3009,7 @@ struct LunaElement {
      * run materialized between element siblings; ws_before records source
      * whitespace before the box, which an inline line renders as a space. */
     int anon_text;
+    float flow_first_indent;
     int ws_before;
     /* The custom properties this element declares ("--name:value\n"...,
      * malloc'd; NULL for none).  Lookups walk up the parents: inheritance. */
@@ -3031,7 +3036,7 @@ struct LunaElement {
 // --- CSS Rule ---
 
 #define MAX_SEL_CLASSES   4
-#define MAX_SEL_ANCESTORS 3
+#define MAX_SEL_ANCESTORS (CSS_MAX_COMPOUNDS - 1)
 
 /* Relation of the compound BELOW an ancestor entry (towards the target). */
 #define LUNA_REL_DESC  0   /* descendant: "A B"  */
@@ -3118,6 +3123,8 @@ typedef struct {
     /* width/height: auto (and the content keywords): a later rule's reset of
      * an earlier length, so layout sizes the box itself. */
     unsigned char width_auto, height_auto;
+    unsigned char width_ch, width_has_cap;
+    float width_cap;
     int has_padding; int has_pad_t, has_pad_r, has_pad_b, has_pad_l; float padding;
     float pad_t, pad_r, pad_b, pad_l;
     int has_margin; int has_margin_top, has_margin_right, has_margin_bottom, has_margin_left;
@@ -3640,7 +3647,10 @@ static int rule_bucket_of(const SimpleSelector* t) {
     return -1;
 }
 
+static void rebuild_rule_order(void);
+
 static void rebuild_rule_index(void) {
+    rebuild_rule_order();
     int words = (rule_count + 63) / 64 + 1;
     const size_t nb = 3 * (size_t)LUNA_RULE_BUCKETS;
     uint64_t* bits = (uint64_t*)realloc(g_rule_bits, (size_t)words * sizeof(uint64_t));
@@ -6135,6 +6145,61 @@ static void parse_scroll_padding_shorthand(const char* val, StyleRule* rule) {
     }
 }
 
+/* Read one length argument without stopping at the parentheses of calc(). */
+static const char* parse_translate_argument(const char* p, float* number, int* pct, float* offset) {
+    const char* end = p;
+    int depth = 0;
+    while (*end) {
+        if (!depth && (*end == ',' || *end == ')')) break;
+        if (*end == '(') ++depth;
+        else if (*end == ')') --depth;
+        ++end;
+    }
+    char length[128];
+    snprintf(length, sizeof(length), "%.*s", (int)(end - p), p);
+    parse_length_calc(length, number, pct, offset);
+    return end;
+}
+
+/* A width bounded by both its containing block and an absolute length. */
+static void parse_css_width(const char* value, StyleRule* rule) {
+    rule->has_width = 1;
+    rule->width_ch = rule->width_has_cap = rule->pct_w = 0;
+    rule->raw_w_off = 0.0f;
+    rule->width_auto = !strcmp(value, "auto") || !strcmp(value, "fit-content") ||
+                       !strcmp(value, "min-content") || !strcmp(value, "max-content");
+    if (rule->width_auto) return;
+    char* end;
+    float number = strtof(value, &end);
+    if (end != value && !strcmp(end, "ch")) {
+        rule->width_ch = 1;
+        rule->width = fmaxf(0.0f, number);
+        return;
+    }
+    if (!strncmp(value, "min(", 4)) {
+        float first, second, first_offset, second_offset;
+        int first_pct, second_pct;
+        const char* comma = parse_translate_argument(value + 4, &first, &first_pct, &first_offset);
+        const char* close = *comma == ','
+            ? parse_translate_argument(comma + 1, &second, &second_pct, &second_offset) : comma;
+        if (*comma != ',' || *close != ')' || close[1] || (first_pct && second_pct)) {
+            rule->width_auto = 1;
+            return;
+        }
+        if (!first_pct && !second_pct) {
+            rule->width = fminf(first, second);
+            return;
+        }
+        rule->pct_w = rule->width_has_cap = 1;
+        rule->raw_w = first_pct ? first : second;
+        rule->raw_w_off = first_pct ? first_offset : second_offset;
+        rule->width_cap = first_pct ? second : first;
+        return;
+    }
+    parse_length_calc(value, &rule->width, &rule->pct_w, &rule->raw_w_off);
+    if (rule->pct_w) rule->raw_w = rule->width;
+}
+
 // Parse transform: scale(), translate(x,y), translateX(), translateY() (may be combined)
 static void parse_transform(const char* val, StyleRule* rule) {
     const char* p = val;
@@ -6166,49 +6231,32 @@ static void parse_transform(const char* val, StyleRule* rule) {
                 rule->has_transform = 1;
                 rule->transform_scale = s;
             }
-        } else if (strncmp(p, "translate(", 10) == 0) {
-            const char* arg = p + 10;
-            char* endp;
-            float tx = strtof(arg, &endp);
-            int tx_pct = 0;
-            if (*endp == '%') { tx_pct = 1; tx /= 100.0f; endp++; }
-            /* find comma */
-            while (*endp && *endp != ',' && *endp != ')') endp++;
-            float ty = 0.0f;
-            int ty_pct = 0;
-            if (*endp == ',') {
-                endp++;
-                while (*endp == ' ') endp++;
-                char* endp2;
-                ty = strtof(endp, &endp2);
-                if (*endp2 == '%') { ty_pct = 1; ty /= 100.0f; }
+        } else if (strncmp(p, "translate(", 10) == 0 ||
+                   strncmp(p, "translateX(", 11) == 0 ||
+                   strncmp(p, "translateY(", 11) == 0) {
+            int both = p[9] == '(';
+            int x = both || p[9] == 'X';
+            int y = both || p[9] == 'Y';
+            const char* end = p + (both ? 10 : 11);
+            if (x) {
+                float length, offset;
+                end = parse_translate_argument(end, &length, &rule->transform_tx_pct, &offset);
+                rule->has_transform_tx = 1;
+                rule->raw_transform_tx = rule->transform_tx_pct ? length : 0.0f;
+                rule->transform_tx = rule->transform_tx_pct ? offset : length;
             }
-            rule->has_transform_tx = 1;
-            rule->has_transform_ty = 1;
-            rule->transform_tx_pct = tx_pct;
-            rule->transform_ty_pct = ty_pct;
-            if (tx_pct) { rule->raw_transform_tx = tx; rule->transform_tx = 0.0f; }
-            else rule->transform_tx = tx;
-            if (ty_pct) { rule->raw_transform_ty = ty; rule->transform_ty = 0.0f; }
-            else rule->transform_ty = ty;
-        } else if (strncmp(p, "translateX(", 11) == 0) {
-            char* endp;
-            float tx = strtof(p + 11, &endp);
-            int tx_pct = (*endp == '%');
-            if (tx_pct) tx /= 100.0f;
-            rule->has_transform_tx = 1;
-            rule->transform_tx_pct = tx_pct;
-            if (tx_pct) { rule->raw_transform_tx = tx; rule->transform_tx = 0.0f; }
-            else rule->transform_tx = tx;
-        } else if (strncmp(p, "translateY(", 11) == 0) {
-            char* endp;
-            float ty = strtof(p + 11, &endp);
-            int ty_pct = (*endp == '%');
-            if (ty_pct) ty /= 100.0f;
-            rule->has_transform_ty = 1;
-            rule->transform_ty_pct = ty_pct;
-            if (ty_pct) { rule->raw_transform_ty = ty; rule->transform_ty = 0.0f; }
-            else rule->transform_ty = ty;
+            if (y) {
+                float length = 0.0f, offset = 0.0f;
+                rule->transform_ty_pct = 0;
+                if (!both || *end == ',')
+                    end = parse_translate_argument(end + both, &length, &rule->transform_ty_pct, &offset);
+                rule->has_transform_ty = 1;
+                rule->raw_transform_ty = rule->transform_ty_pct ? length : 0.0f;
+                rule->transform_ty = rule->transform_ty_pct ? offset : length;
+            }
+            if (*end != ')') break;
+            p = end + 1;
+            continue;
         } else if (strncmp(p, "rotate(", 7) == 0) {
             char* endp;
             float angle = strtof(p + 7, &endp);
@@ -8233,15 +8281,7 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 }
             }
             else if (strcmp(key, "width") == 0) {
-                if (strcmp(val,"auto")==0 || strcmp(val,"fit-content")==0 || strcmp(val,"max-content")==0 || strcmp(val,"min-content")==0) {
-                    rule->has_width = 1;          /* has_css_width=0: layout computes it */
-                    rule->width_auto = 1;
-                } else {
-                    rule->has_width = 1;
-                    rule->width_auto = 0;
-                    parse_length_calc(val, &rule->width, &rule->pct_w, &rule->raw_w_off);
-                    if (rule->pct_w) rule->raw_w = rule->width;
-                }
+                parse_css_width(val, rule);
             }
             else if (strcmp(key, "height") == 0) {
                 rule->has_height = 1;
@@ -9956,8 +9996,7 @@ void parse_css(const char* css_text) {
     ingest_keyframes_from_sheet(sheet);
 
     css_free(sheet);
-    rebuild_rule_order();
-    rebuild_rule_index();
+    g_rule_index_ready = 0;
 }
 
 // ============================================================
@@ -10304,6 +10343,9 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
     }
     if (r->has_width) {
         e->pct_w = r->pct_w;
+        e->width_ch = r->width_ch;
+        e->width_has_cap = r->width_has_cap;
+        e->width_cap = r->width_cap;
         if (r->width_auto) e->has_css_width = 0;
         else if (r->pct_w) { e->raw_w = r->raw_w; e->raw_w_off = r->raw_w_off; e->has_css_width = 0; }
         else { e->css_width = r->width; e->has_css_width = 1; e->w = r->width; }
@@ -10596,18 +10638,20 @@ static void apply_style_rule(LunaElement* e, const StyleRule* r, int* am) {
         e->transform_tx = r->transform_tx;
         e->transform_tx_pct = r->transform_tx_pct;
         e->raw_transform_tx = r->raw_transform_tx;
+        e->transform_tx_offset = r->transform_tx;
         /* Dynamic pseudo-class restyles are paint-only.  Resolve against
            the already known border-box now so a focus/hover restyle does
            not reset translateX(-50%) to zero until the next layout. */
         if (e->transform_tx_pct && e->w > 0.0f)
-            e->transform_tx = e->raw_transform_tx * e->w;
+            e->transform_tx = e->raw_transform_tx * e->w + e->transform_tx_offset;
     }
     if (r->has_transform_ty) {
         e->transform_ty = r->transform_ty;
         e->transform_ty_pct = r->transform_ty_pct;
         e->raw_transform_ty = r->raw_transform_ty;
+        e->transform_ty_offset = r->transform_ty;
         if (e->transform_ty_pct && e->h > 0.0f)
-            e->transform_ty = e->raw_transform_ty * e->h;
+            e->transform_ty = e->raw_transform_ty * e->h + e->transform_ty_offset;
     }
     if (r->has_transform_rotate) e->transform_rotate = r->transform_rotate;
     if (r->has_transition && r->transition_visual) {
@@ -10881,6 +10925,8 @@ static int el_is_button_like(const LunaElement* e) {
            (strcmp(e->type, "input") == 0 && !e->is_input && e->text[0]);
 }
 
+static float css_ch_width(const LunaElement* e);
+
 void update_element_style(LunaElement* e) {
     /* Preserve an unchanged animation timeline across unrelated hover/focus
      * style resolutions; restart only when its definition changes. */
@@ -11094,7 +11140,11 @@ void update_element_style(LunaElement* e) {
     /* Web documents (luna_set_web_compat): the HTML UA stylesheet's outer
      * display types.  Luna's own UIs predate inline layout and keep every
      * element block-level unless their CSS says otherwise. */
-    if (g_luna_web_compat) { luna_ua_inline_defaults(e); luna_ua_table_defaults(e); }
+    if (g_luna_web_compat) {
+        luna_ua_inline_defaults(e);
+        luna_ua_table_defaults(e);
+        if (e->generated_pseudo) e->inline_level = 1;
+    }
     e->has_text_shadow = 0;
     e->tsh_dx = e->tsh_dy = e->tsh_blur = 0.0f;
     e->tsh_r = e->tsh_g = e->tsh_b = 0.0f; e->tsh_a = 0.0f;
@@ -11114,6 +11164,8 @@ void update_element_style(LunaElement* e) {
     e->pct_w = 0; e->pct_h = 0; e->pct_left = 0; e->pct_top = 0;
     e->pct_bottom = 0; e->pct_right = 0;
     e->raw_w_off = 0.0f; e->raw_h_off = 0.0f;
+    e->width_ch = e->width_has_cap = 0;
+    e->width_cap = 0.0f;
     e->raw_left_off = 0.0f; e->raw_top_off = 0.0f;
     e->raw_bottom_off = 0.0f; e->raw_right_off = 0.0f;
 
@@ -11324,6 +11376,10 @@ void update_element_style(LunaElement* e) {
         e->anim_base_captured = 0;
         e->anim_override_layout = 0;
     }
+    if (e->width_ch && e->has_css_width) {
+        e->css_width *= css_ch_width(e);
+        e->w = e->css_width;
+    }
     if (e->is_input && e->cursor_type == 0) e->cursor_type = 2;
     if (e->is_input && !e->input_multiline) e->white_space = 1;
     /* ::before/::after must not steal clicks; style reset clears the flag. */
@@ -11363,6 +11419,7 @@ static int layout_style_changed(const LunaElement* a, const LunaElement* b) {
     LUNA_LAYOUT_DIFF(css_width); LUNA_LAYOUT_DIFF(css_height);
     LUNA_LAYOUT_DIFF(pct_w); LUNA_LAYOUT_DIFF(pct_h);
     LUNA_LAYOUT_DIFF(raw_w); LUNA_LAYOUT_DIFF(raw_h);
+    LUNA_LAYOUT_DIFF(width_has_cap); LUNA_LAYOUT_DIFF(width_cap);
     LUNA_LAYOUT_DIFF(raw_w_off); LUNA_LAYOUT_DIFF(raw_h_off);
     LUNA_LAYOUT_DIFF(has_min_width); LUNA_LAYOUT_DIFF(has_min_height);
     LUNA_LAYOUT_DIFF(css_min_width); LUNA_LAYOUT_DIFF(css_min_height);
@@ -12333,6 +12390,11 @@ static float css_outer_width(const LunaElement* e, float css_w) {
         : css_w;
 }
 
+static float css_percentage_width(const LunaElement* e, float containing_width) {
+    float width = containing_width * e->raw_w + e->raw_w_off;
+    return e->width_has_cap ? fminf(width, e->width_cap) : width;
+}
+
 static float resolved_max_width(const LunaElement* e, float containing_width) {
     float css_w = e->max_width_pct
         ? containing_width * e->raw_max_width + e->raw_max_width_off
@@ -12587,6 +12649,15 @@ static int utf8_codepoint_count(const char* text) {
 /* Width of the direct text run only (no padding/border).  Keeping this helper
    shared by intrinsic sizing and inline-row placement prevents the two paths
    from disagreeing by the old four-pixel safety fudge. */
+static float css_ch_width(const LunaElement* e) {
+    if (!font_loaded) return e->font_size * 0.5f;
+    FontAtlas* atlas = get_atlas(e->font_size, e->font_bold, NULL);
+    text_metrics_begin(e->font_size, e->font_bold, e->font_face, atlas);
+    float width = measure_text_width(atlas, "0");
+    text_metrics_end();
+    return width > 0.0f ? width : e->font_size * 0.5f;
+}
+
 static float element_text_run_width(const LunaElement* e) {
     if (!e || !e->text[0]) return 0.0f;
     if (font_loaded) {
@@ -12611,7 +12682,7 @@ static float collapse_vertical_margins(float a, float b) {
 }
 
 static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
-                            float line_h, int max_lines,
+                            float first_indent, float line_h, int max_lines,
                             int white_space, int text_overflow, int overflow_wrap);
 
 static float flow_text_available_width(const LunaElement* e) {
@@ -12643,13 +12714,15 @@ static int flow_approx_text_lines(const LunaElement* e, float box_w, int max_lin
     if (advance < 1.0f) advance = 1.0f;
     cols = (int)floorf(box_w / advance);
     if (cols < 1) cols = 1;
+    int first_cols = (int)floorf((box_w - e->flow_first_indent) / advance);
+    if (first_cols < 1) first_cols = 1;
     for (p = e->text; *p && lines < max_lines; p++) {
         if (*p == '\n' || *p == '\r') {
             lines++; col = 0; last_space = -1; continue;
         }
         if (*p == ' ' || *p == '\t') last_space = col;
         col++;
-        if (col > cols) {
+        if (col > (lines == 1 ? first_cols : cols)) {
             lines++;
             col = (last_space >= 0) ? col - last_space - 1 : 1;
             last_space = -1;
@@ -12671,7 +12744,7 @@ static float flow_leaf_text_height(LunaElement* e) {
         FontAtlas* atlas = get_atlas(e->font_size, e->font_bold, NULL);
         text_metrics_begin(e->font_size, e->font_bold, e->font_face, atlas);
         g_text_letter_spacing = e->letter_spacing;
-        lines = count_text_lines(atlas, e->text, box_w, lh, max_lines,
+        lines = count_text_lines(atlas, e->text, box_w, e->flow_first_indent, lh, max_lines,
                                  e->white_space,
                                  (e->text_overflow || e->line_clamp > 0),
                                  e->overflow_wrap);
@@ -12695,6 +12768,7 @@ static float flow_leaf_text_height(LunaElement* e) {
  * pass, no allocation; the same routine measures (place == 0) and places.
  * ------------------------------------------------------------------------ */
 static float intrinsic_content_width(LunaElement* e);
+static float intrinsic_content_width_at(LunaElement* e, float percent_basis);
 static float flow_content_height(LunaElement* e);
 
 /* Does the box containing `idx`'s children have a definite height, so that
@@ -12727,7 +12801,7 @@ typedef struct {
 
 static float flow_float_width(LunaElement* e, float available) {
     float w;
-    if (e->pct_w) w = css_outer_width(e, available * e->raw_w + e->raw_w_off);
+    if (e->pct_w) w = css_outer_width(e, css_percentage_width(e, available));
     else if (e->has_css_width) w = css_outer_width(e, e->css_width);
     else {
         w = intrinsic_content_width(e);
@@ -12760,6 +12834,26 @@ static FlowFloat flow_place_float(const FlowFloat* floats, int n, float availabl
         if (w <= right - left + 0.01f || !isfinite(next))
             return (FlowFloat){side == 2 ? right - w : left, y, w, y + h, side};
         y = next;
+    }
+}
+
+/* Find the free horizontal band for a block following floats. Auto-width
+ * blocks use that band for their text; a box that cannot fit clears the float. */
+static float flow_block_band(const FlowFloat* floats, int n, float available,
+                             float minimum, float* y, float* left) {
+    for (;;) {
+        *left = 0.0f;
+        float right = available, next = INFINITY;
+        for (int i = 0; i < n; ++i) {
+            const FlowFloat* f = &floats[i];
+            if (*y < f->y || *y >= f->bottom) continue;
+            if (f->side == 1) *left = fmaxf(*left, f->x + f->w);
+            else if (f->side == 2) right = fminf(right, f->x);
+            next = fminf(next, f->bottom);
+        }
+        float width = fmaxf(0.0f, right - *left);
+        if (width >= minimum || !isfinite(next)) return width;
+        *y = next;
     }
 }
 
@@ -12821,16 +12915,84 @@ static float inline_item_height(LunaElement* ch) {
     return h;
 }
 
+/* Record the parts of adjacent floats that intrude into an inline
+ * formatting context, in coordinates relative to its content box. */
+static void inline_float_bounds(LunaElement* child, const FlowFloat* floats,
+                                int count, float width, float y) {
+    memset(child->flow_float_inset, 0, sizeof child->flow_float_inset);
+    memset(child->flow_float_bottom, 0, sizeof child->flow_float_bottom);
+    float top = y + child->border_width + child->pad_t;
+    for (int i = 0; i < count; ++i) {
+        const FlowFloat* f = &floats[i];
+        if (f->y > top || f->bottom <= top) continue;
+        int side = f->side == 2;
+        float inset = side ? width - f->x - child->margin_right - child->pad_r :
+                             f->x + f->w - child->margin_left - child->pad_l;
+        child->flow_float_inset[side] = fmaxf(child->flow_float_inset[side], inset - child->border_width);
+        child->flow_float_bottom[side] = fmaxf(child->flow_float_bottom[side], f->bottom - top);
+    }
+}
+
+static int block_wraps_floats(int idx) {
+    const LunaElement* child = &elements[idx];
+    return child->display_mode == DISPLAY_BLOCK &&
+        child->overflow_x == OVERFLOW_VISIBLE && child->overflow_y == OVERFLOW_VISIBLE &&
+        has_inline_children(idx);
+}
+
+/* A chain such as <b><a>words</a></b> can use the same line widths as
+ * a text run. Keep more complex inline content in its existing box. */
+static int inline_indent_child(int idx) {
+    int child = -1;
+    LUNA_FOR_KIDS(c, idx) {
+        const LunaElement* candidate = &elements[c];
+        if (!is_visible(c) || candidate->position_fixed ||
+            candidate->position_mode == POS_ABSOLUTE) continue;
+        if (candidate->anon_text && !candidate->text[0]) continue;
+        if (child >= 0) return -2;
+        child = c;
+    }
+    return child;
+}
+
+static int inline_accepts_first_indent(int idx) {
+    while (idx >= 0) {
+        const LunaElement* e = &elements[idx];
+        if (e->inline_level != 1 || e->is_input || e->css_float || e->white_space ||
+            e->pct_w || e->has_css_width || e->border_width ||
+            e->a > 0.0f || e->has_bg_image || e->has_gradient || e->has_shadow ||
+            e->pad_l || e->pad_r || e->margin_left || e->margin_right ||
+            e->overflow_x != OVERFLOW_VISIBLE || e->overflow_y != OVERFLOW_VISIBLE)
+            return 0;
+        int child = inline_indent_child(idx);
+        if (child == -1) return e->text[0] != '\0';
+        if (child < 0 || e->text[0]) return 0;
+        idx = child;
+    }
+    return 0;
+}
+
 static float inline_flow(int idx, float inner_w, int place) {
     LunaElement* cont = &elements[idx];
+    float percent_basis = inner_w;
+    if (g_luna_web_compat && cont->inline_level == 1) {
+        int p = cont->parent_idx;
+        while (p >= 0 && elements[p].inline_level == 1) p = elements[p].parent_idx;
+        if (p >= 0) {
+            const LunaElement* block = &elements[p];
+            percent_basis = fmaxf(0.0f, block->w - block->pad_l - block->pad_r - block->border_width * 2.0f);
+        }
+    }
     const float x0 = cont->border_width + cont->pad_l;
     const float y0 = cont->border_width + cont->pad_t;
     const float space_w = (cont->font_size > 0 ? cont->font_size : 16.0f) * 0.28f;
     LUNA_SCRATCH(int, line, elem_count + 1);
-    int n = 0;
+    int n = 0, align_line_top = 0;
     float line_x = 0.0f, line_h = 0.0f, y = 0.0f;
+    float line_left = 0.0f, line_width = inner_w;
     LUNA_SCRATCH(FlowFloat, floats, elem_count + 1);
     int float_count = 0;
+    int indent_child = cont->flow_first_indent > 0.0f ? inline_indent_child(idx) : -1;
     int flow_last = 0;
     for (int c = luna_first_kid(idx); !flow_last; c = c >= 0 ? g_kid_next[c] : -1) {
         LunaElement* ch = c >= 0 ? &elements[c] : NULL;
@@ -12844,10 +13006,20 @@ static float inline_flow(int idx, float inner_w, int place) {
             is_br = strcmp(ch->type, "br") == 0;
             is_block = !ch->inline_level || ch->css_float;
         }
+    next_line:
+        if (!n) {
+            line_left = y < cont->flow_float_bottom[0] ? cont->flow_float_inset[0] : 0.0f;
+            float right = y < cont->flow_float_bottom[1] ? cont->flow_float_inset[1] : 0.0f;
+            line_width = fmaxf(0.0f, inner_w - line_left - right);
+        }
         float w = 0.0f, h = 0.0f, sp = 0.0f;
+        int wrap_in_remaining = 0;
+        float shared_indent = 0.0f;
+        float first_indent = c >= 0 && c == indent_child ? cont->flow_first_indent : 0.0f;
         if (ch && !is_block && !is_br) {
-            if (ch->pct_w) w = inner_w * ch->raw_w;
+            if (ch->pct_w) w = css_percentage_width(ch, percent_basis);
             else if (ch->has_css_width && ch->inline_level == 2) w = css_outer_width(ch, ch->css_width);
+            else if (g_luna_web_compat && ch->inline_level == 1) w = intrinsic_content_width_at(ch, percent_basis);
             else w = intrinsic_content_width(ch);
             /* Text controls default to the UA's size="20" / cols="20" box,
                whatever they contain. */
@@ -12855,31 +13027,50 @@ static float inline_flow(int idx, float inner_w, int place) {
                 float fs = ch->font_size > 0 ? ch->font_size : 13.333f;
                 w = fs * 10.25f + ch->pad_l + ch->pad_r + ch->border_width * 2.0f;
             }
-            float avail = inner_w - ch->margin_left - ch->margin_right;
-            if (w > avail) w = avail > 0.0f ? avail : 0.0f;
-            ch->w = w;
-            h = inline_item_height(ch);
+            float avail = line_width - ch->margin_left - ch->margin_right;
+            if (!n && line_width < inner_w && w > avail && min_content_width(ch) > avail) {
+                float next = INFINITY;
+                for (int side = 0; side < 2; ++side)
+                    if (cont->flow_float_bottom[side] > y)
+                        next = fminf(next, cont->flow_float_bottom[side]);
+                if (isfinite(next)) { y = next; goto next_line; }
+            }
             if (n > 0 && (ch->ws_before || inline_leading_ws(c))) sp = space_w;
+            /* The run can wrap inside its own box. Use the rest of this
+             * line when it can fit the longest word and at least half the
+             * line remains, so a very narrow strip cannot squeeze a long run. */
+            float remaining = avail - line_x - sp;
+            if (g_luna_web_compat && n && ch->inline_level == 1 && !ch->is_input &&
+                !ch->pct_w && ch->white_space == 0 && remaining >= avail * 0.5f &&
+                remaining > 0.0f && w > remaining && min_content_width(ch) <= remaining) {
+                if (inline_accepts_first_indent(c)) first_indent = shared_indent = line_x + sp;
+                else avail = remaining;
+                wrap_in_remaining = 1;
+            }
+            if (w > avail || first_indent > 0.0f) w = fmaxf(0.0f, avail);
+            ch->w = w;
+            ch->flow_first_indent = first_indent;
+            h = inline_item_height(ch);
         }
-        float outer_w = ch ? ch->margin_left + w + ch->margin_right : 0.0f;
+        float outer_w = ch ? ch->margin_left + w + ch->margin_right - shared_indent : 0.0f;
         /* Close the current line: at the end, before a block, at <br>, or
            when the next box does not fit. */
-        if (n > 0 && (end || is_block || (line_x + sp + outer_w > inner_w + 0.5f && !is_br))) {
+        if (n > 0 && (end || is_block || (line_x + sp + outer_w > line_width + 0.5f && !is_br))) {
             if (place) {
                 float shift = 0.0f;
-                if (cont->text_align == 1) shift = (inner_w - line_x) * 0.5f;
-                else if (cont->text_align == 2) shift = inner_w - line_x;
+                if (cont->text_align == 1) shift = (line_width - line_x) * 0.5f;
+                else if (cont->text_align == 2) shift = line_width - line_x;
                 if (shift < 0.0f) shift = 0.0f;
                 for (int k = 0; k < n; k++) {
                     LunaElement* it = &elements[line[k]];
                     float oh = it->margin_top + it->h + it->margin_bottom;
                     it->rel_x += shift;
-                    it->rel_y = y0 + y + (line_h - oh);
+                    it->rel_y = y0 + y + (align_line_top ? 0.0f : line_h - oh);
                 }
             }
             y += line_h;
-            n = 0; line_x = 0.0f; line_h = 0.0f;
-            sp = 0.0f;
+            n = 0; line_x = 0.0f; line_h = 0.0f; align_line_top = 0;
+            if (!end && !is_block) goto next_line;
         }
         if (end) break;
         if (is_br) {
@@ -12891,14 +13082,14 @@ static float inline_flow(int idx, float inner_w, int place) {
                 if (place) for (int k = 0; k < n; k++) {
                     LunaElement* it = &elements[line[k]];
                     float oh = it->margin_top + it->h + it->margin_bottom;
-                    float shift = cont->text_align == 1 ? (inner_w - line_x) * 0.5f
-                                : cont->text_align == 2 ? inner_w - line_x : 0.0f;
+                    float shift = cont->text_align == 1 ? (line_width - line_x) * 0.5f
+                                : cont->text_align == 2 ? line_width - line_x : 0.0f;
                     if (shift < 0.0f) shift = 0.0f;
                     it->rel_x += shift;
-                    it->rel_y = y0 + y + (line_h - oh);
+                    it->rel_y = y0 + y + (align_line_top ? 0.0f : line_h - oh);
                 }
                 y += line_h;
-                n = 0; line_x = 0.0f; line_h = 0.0f;
+                n = 0; line_x = 0.0f; line_h = 0.0f; align_line_top = 0;
             }
             if (place) { ch->rel_x = x0; ch->rel_y = y0 + y; ch->w = 0.0f; ch->h = 0.0f; }
             continue;
@@ -12919,21 +13110,35 @@ static float inline_flow(int idx, float inner_w, int place) {
             }
             float clear = flow_clearance(floats, float_count, ch->css_clear);
             if (y < clear) y = clear;
-            /* A block among inline content: its own line, full width. */
-            if (ch->pct_w) ch->w = inner_w * ch->raw_w;
-            else if (!ch->has_css_width) ch->w = inner_w - ch->margin_left - ch->margin_right;
+            /* A paragraph beside a float can share a parent with inline
+             * placeholders. That parent takes the inline layout path even
+             * though the paragraph itself has a block box. */
+            float left = 0.0f, band = inner_w;
+            float margins = ch->margin_left + ch->margin_right;
+            int auto_width = !ch->has_css_width && !ch->pct_w;
+            if (ch->pct_w) ch->w = css_percentage_width(ch, inner_w);
+            if (g_luna_web_compat && auto_width && block_wraps_floats(c)) {
+                inline_float_bounds(ch, floats, float_count, inner_w, y + ch->margin_top);
+            } else if (g_luna_web_compat && float_count) {
+                float minimum = auto_width ? min_content_width(ch) : ch->w;
+                float border_y = y + ch->margin_top;
+                band = flow_block_band(floats, float_count, inner_w,
+                                       minimum + margins, &border_y, &left);
+                y = border_y - ch->margin_top;
+            }
+            if (auto_width) ch->w = fmaxf(0.0f, band - margins);
             if (ch->w < 0.0f) ch->w = 0.0f;
             if (!ch->has_css_height && !ch->pct_h)
                 ch->h = aspect_height(ch) >= 0.0f ? aspect_height(ch) : flow_content_height(ch);
-            float free_w = inner_w - ch->w - ch->margin_left - ch->margin_right;
-            if (free_w < 0.0f) free_w = 0.0f;
+            float free_w = fmaxf(0.0f, band - ch->w - margins);
             float auto_left = ch->margin_left_auto ? (ch->margin_right_auto ? free_w * 0.5f : free_w) : 0.0f;
-            if (place) { ch->rel_x = x0 + auto_left; ch->rel_y = y0 + y; }
+            if (place) { ch->rel_x = x0 + left + auto_left; ch->rel_y = y0 + y; }
             y += ch->margin_top + ch->h + ch->margin_bottom;
             continue;
         }
         ch->h = h;
-        if (place) ch->rel_x = x0 + line_x + sp;
+        if (wrap_in_remaining && h > css_used_line_height(ch) + 0.5f) align_line_top = 1;
+        if (place) ch->rel_x = x0 + line_left + line_x + sp - shared_indent;
         line_x += sp + outer_w;
         float oh = ch->margin_top + h + ch->margin_bottom;
         if (oh > line_h) line_h = oh;
@@ -12979,7 +13184,7 @@ static float flow_content_height(LunaElement* e) {
             chh = flow_content_height(ch);
         } else if (ch->has_aspect_ratio && ch->aspect_ratio > 0.0f && ch->pct_w) {
             float iw = e->w - e->pad_l - e->pad_r - e->border_width * 2.0f;
-            chh = (iw > 0.0f ? iw * ch->raw_w + ch->raw_w_off : 0.0f) / ch->aspect_ratio;
+            chh = (iw > 0.0f ? css_percentage_width(ch, iw) : 0.0f) / ch->aspect_ratio;
         } else {
             chh = flow_content_height(ch);   /* recurse for auto-height children */
         }
@@ -13054,7 +13259,7 @@ static float flow_content_height(LunaElement* e) {
                 float pw = par->w - par->pad_l - par->pad_r - par->border_width * 2.0f
                          - e->margin_left - e->margin_right;
                 if (pw < 0.0f) pw = 0.0f;
-                avail = pw * e->raw_w + e->raw_w_off
+                avail = css_percentage_width(e, pw)
                       - e->pad_l - e->pad_r - e->border_width * 2.0f;
             } else {
                 avail = e->w - e->pad_l - e->pad_r - e->border_width * 2.0f;
@@ -13124,6 +13329,28 @@ static float flow_content_height(LunaElement* e) {
                     ? collapse_vertical_margins(previous_bottom, ch->margin_top) : ch->margin_top;
                 float clear = flow_clearance(floats, float_count, ch->css_clear);
                 if (inner < clear) inner = clear;
+                if (g_luna_web_compat && float_count) {
+                    float left, margins = ch->margin_left + ch->margin_right;
+                    int auto_width = !ch->has_css_width && !ch->pct_w;
+                    float minimum = auto_width ? min_content_width(ch) :
+                        ch->pct_w ? css_outer_width(ch, css_percentage_width(ch, available)) :
+                                    css_outer_width(ch, ch->css_width);
+                    int wrap = auto_width && block_wraps_floats(kids[k]);
+                    float band = available;
+                    if (wrap) inline_float_bounds(ch, floats, float_count, available, inner);
+                    else band = flow_block_band(floats, float_count, available,
+                                                minimum + margins, &inner, &left);
+                    if (auto_width && (wrap || band < available) && !ch->has_css_height && !ch->pct_h) {
+                        float saved_width = ch->w;
+                        ch->w = fmaxf(0.0f, band - margins);
+                        border_h = flow_content_height(ch);
+                        ch->w = saved_width;
+                        if (ch->has_min_height)
+                            border_h = fmaxf(border_h, css_outer_height(ch, ch->css_min_height));
+                        if (ch->has_max_height && !ch->max_height_pct)
+                            border_h = fminf(border_h, css_outer_height(ch, ch->css_max_height));
+                    }
+                }
                 inner += border_h;
                 previous_bottom = ch->margin_bottom;
                 have_previous = 1;
@@ -13144,9 +13371,12 @@ static float flow_content_height(LunaElement* e) {
     return flow_leaf_text_height(e);
 }
 
-static float intrinsic_content_width(LunaElement* e) {
+static float intrinsic_content_width_at(LunaElement* e, float percent_basis) {
     int idx = (int)(e - elements);
-    if (idx >= 0 && idx < elem_count && g_intrinsic_width_valid[idx])
+    if (percent_basis >= 0.0f && e->pct_w && e->inline_level != 1)
+        return fmaxf(0.0f, css_percentage_width(e, percent_basis));
+    if (e->inline_level != 1 || luna_first_kid(idx) < 0) percent_basis = -1.0f;
+    if (percent_basis < 0.0f && idx >= 0 && idx < elem_count && g_intrinsic_width_valid[idx])
         return g_intrinsic_width_cache[idx];
 
     float result;
@@ -13169,7 +13399,7 @@ static float intrinsic_content_width(LunaElement* e) {
         /* A cyclic percentage is auto during intrinsic measurement. Its
            descendants still contribute max-content width: zeroing it makes
            centered column flex items collapse around width:100% children. */
-        float cw = intrinsic_content_width(ch);
+        float cw = intrinsic_content_width_at(ch, percent_basis);
         if (ch->has_min_width && cw < ch->css_min_width) cw = ch->css_min_width;
         /* A percentage max-width is indefinite during intrinsic sizing.  It
            is resolved later by the containing flex/block formatting context. */
@@ -13242,11 +13472,15 @@ static float intrinsic_content_width(LunaElement* e) {
         result = 40.0f;
 
 done:
-    if (idx >= 0 && idx < elem_count) {
+    if (percent_basis < 0.0f && idx >= 0 && idx < elem_count) {
         g_intrinsic_width_cache[idx] = result;
         g_intrinsic_width_valid[idx] = 1;
     }
     return result;
+}
+
+static float intrinsic_content_width(LunaElement* e) {
+    return intrinsic_content_width_at(e, -1.0f);
 }
 
 /* CSS min-content width: the widest unbreakable text run, recursively
@@ -13374,7 +13608,7 @@ static void layout_block_container(int container_idx) {
         if (ch->css_float) {
             ch->w = flow_float_width(ch, inner_w);
         } else if (ch->pct_w) {
-            ch->w = inner_w * ch->raw_w;
+            ch->w = css_percentage_width(ch, inner_w);
         } else if (!ch->has_css_width) {
             /* The browser UA stylesheet makes form controls inline-block.
              * Their auto width is max-content; stretching every auto-width
@@ -13397,6 +13631,24 @@ static void layout_block_container(int container_idx) {
                  * auto. */
                 ch->w = inner_w - ch->margin_left - ch->margin_right;
                 if (ch->w < 0.0f) ch->w = 0.0f;
+            }
+        }
+
+        float border_y = y, left = 0.0f, band = inner_w;
+        if (!ch->css_float) {
+            border_y += have_previous
+                ? collapse_vertical_margins(previous_bottom, ch->margin_top) : ch->margin_top;
+            border_y = fmaxf(border_y, flow_clearance(floats, float_count, ch->css_clear));
+            int auto_width = !ch->has_css_width && !ch->pct_w;
+            if (g_luna_web_compat && auto_width && block_wraps_floats(c)) {
+                inline_float_bounds(ch, floats, float_count, inner_w, border_y);
+            } else if (g_luna_web_compat && float_count) {
+                float margins = ch->margin_left + ch->margin_right;
+                float minimum = auto_width ? min_content_width(ch) : ch->w;
+                band = flow_block_band(floats, float_count, inner_w,
+                                       minimum + margins, &border_y, &left);
+                if (auto_width && band < inner_w)
+                    ch->w = fminf(ch->w, fmaxf(0.0f, band - margins));
             }
         }
 
@@ -13430,7 +13682,7 @@ static void layout_block_container(int container_idx) {
          * coordinate pass adds margin_left/margin_top exactly once.  The old
          * code included them here as well, doubling every block margin and
          * pushing buttons outside cards. */
-        float auto_space = inner_w - ch->w - ch->margin_left - ch->margin_right;
+        float auto_space = band - ch->w - ch->margin_left - ch->margin_right;
         if (auto_space < 0.0f) auto_space = 0.0f;
         float auto_left = 0.0f;
         if (ch->margin_left_auto && ch->margin_right_auto)
@@ -13440,13 +13692,7 @@ static void layout_block_container(int container_idx) {
         else if (ch->display_mode == DISPLAY_TABLE && cont->text_align == 1)
             auto_left = auto_space * 0.5f;      /* <center><table> */
 
-        ch->rel_x = cont->border_width + cont->pad_l + auto_left;
-        float collapsed_before = have_previous
-            ? collapse_vertical_margins(previous_bottom, ch->margin_top)
-            : ch->margin_top;
-        float border_y = y + collapsed_before;
-        float clear = flow_clearance(floats, float_count, ch->css_clear);
-        if (border_y < clear) border_y = clear;
+        ch->rel_x = cont->border_width + cont->pad_l + left + auto_left;
         /* Global position resolution adds margin_top once.  Store the
            pre-margin coordinate so the final border edge lands at border_y. */
         ch->rel_y = border_y - ch->margin_top;
@@ -13550,7 +13796,7 @@ void update_layout() {
                 e->w = e->box_sizing == BOX_CONTENT
                     ? e->css_width + e->pad_l + e->pad_r + e->border_width * 2.0f : e->css_width;
             else if (e->pct_w)
-                e->w = window_width * e->raw_w + e->raw_w_off;
+                e->w = css_percentage_width(e, window_width);
             else
                 e->w = window_width - ml - mr;
             if (e->has_max_width && !e->max_width_pct && e->w > e->css_max_width) e->w = e->css_max_width;
@@ -13563,7 +13809,7 @@ void update_layout() {
                 else if (e->margin_left_auto) ml = free_w;
             }
             e->x = ml; e->y = mt;
-            e->rel_x = e->rel_y = 0.0f;
+            e->rel_x = ml; e->rel_y = mt;
             if (e->pct_h) {
                 e->h = window_height * e->raw_h + e->raw_h_off;
             } else if (e->has_css_height) {
@@ -13596,7 +13842,7 @@ void update_layout() {
             if (parent_h < 0.0f) parent_h = 0.0f;
         }
 
-        if (e->pct_w) e->w = parent_w * e->raw_w + e->raw_w_off;
+        if (e->pct_w) e->w = css_percentage_width(e, parent_w);
         if (e->pct_h) {
             if (par >= 0 && !use_cb && !containing_height_definite(par)) e->h = flow_content_height(e);
             else e->h = parent_h * e->raw_h + e->raw_h_off;
@@ -13768,7 +14014,7 @@ static float flex_main_size(LunaElement* ch, int row_mode, float available_main)
          * content box. Falling back to intrinsic width here made width:100%
          * items ignore their parent and could push sibling controls aside. */
         if (ch->pct_w)
-            size = available_main * ch->raw_w + ch->raw_w_off;
+            size = css_percentage_width(ch, available_main);
         else if (ch->has_css_width)
             size = css_outer_width(ch, ch->css_width);
         else
@@ -13857,7 +14103,7 @@ static float resolve_flex_cross_len(LunaElement* ch, int row_mode, int align,
 
     float ww = ch->w;
     if (ch->pct_w && !(ch->css_positioned & 1)) {
-        ww = pct_cross * ch->raw_w + ch->raw_w_off;
+        ww = css_percentage_width(ch, pct_cross);
     } else if (align != 3 && !ch->has_css_width && !ch->pct_w &&
                !(ch->css_positioned & 1)) {
         ww = flex_content_width(ch);
@@ -13891,7 +14137,7 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
             if (ch->css_positioned & 1) continue;
             int align = child_cross_align(ch, cont, 0);
             if (ch->pct_w) {
-                ch->w = pct_cross * ch->raw_w + ch->raw_w_off;
+                ch->w = css_percentage_width(ch, pct_cross);
             } else if (align == 3 && !ch->has_css_width) {
                 ch->w = inner_cross;
             }
@@ -14186,7 +14432,7 @@ static void layout_flex_container(int container_idx) {
                  * height so wrap lines don't inherit a previous stretch. */
                 float ch_cross;
                 if (!row_mode) {         /* a column's cross size is its width */
-                    if (ch->pct_w) ch_cross = inner_cross * ch->raw_w + ch->raw_w_off;
+                    if (ch->pct_w) ch_cross = css_percentage_width(ch, inner_cross);
                     else if (ch->has_css_width) ch_cross = css_outer_width(ch, ch->css_width);
                     else ch_cross = intrinsic_content_width(ch);
                     ch_cross += ch->margin_left + ch->margin_right;
@@ -14893,7 +15139,10 @@ static void resolve_global_layout_positions(void) {
         int par = e->parent_idx;
 
         if (par == -1) {
-            if (strcmp(e->type, "body") != 0 && strcmp(e->type, "html") != 0) {
+            if (strcmp(e->type, "body") == 0 || strcmp(e->type, "html") == 0) {
+                e->x = e->rel_x;
+                e->y = e->rel_y;
+            } else {
                 e->x = e->rel_x + e->margin_left;
                 e->y = e->rel_y + e->margin_top;
             }
@@ -15031,6 +15280,10 @@ void update_layout_pass(void) {
     const int scroll_only = g_layout_scroll_only;
     g_layout_scroll_only = 0;
     if (!scroll_only) {
+    for (int i = 0; i < elem_count; ++i) {
+        inline_float_bounds(&elements[i], NULL, 0, 0.0f, 0.0f);
+        elements[i].flow_first_indent = 0.0f;
+    }
     LUNA_AUX_ZERO(g_intrinsic_width_valid);
     LUNA_AUX_ZERO(g_min_content_width_valid);
     update_layout();
@@ -15049,7 +15302,7 @@ void update_layout_pass(void) {
     resolve_global_layout_positions();
     apply_relative_offsets();
     apply_scroll_metrics();
-    apply_document_metrics();
+    if (!scroll_only) apply_document_metrics();
     apply_scroll_offsets();
     apply_sticky_positions();
     /* border-radius: 50% is relative to the box.  It used to be read as 50px,
@@ -15070,11 +15323,11 @@ void update_layout_pass(void) {
     for (int i = 0; i < elem_count; i++) {
         LunaElement* e = &elements[i];
         if (e->transform_tx_pct) {
-            e->transform_tx = e->raw_transform_tx * e->w;
+            e->transform_tx = e->raw_transform_tx * e->w + e->transform_tx_offset;
             if (e->anim_speed <= 0.0f || (e->anim_mask && !(e->anim_mask & LUNA_TRV_TRANSFORM))) e->cur_tx = e->transform_tx;
         }
         if (e->transform_ty_pct) {
-            e->transform_ty = e->raw_transform_ty * e->h;
+            e->transform_ty = e->raw_transform_ty * e->h + e->transform_ty_offset;
             if (e->anim_speed <= 0.0f || (e->anim_mask && !(e->anim_mask & LUNA_TRV_TRANSFORM))) e->cur_ty = e->transform_ty;
         }
     }
@@ -15522,12 +15775,13 @@ static int hit_scrollbar_axis(int idx, double mx, double my) {
     return -1;
 }
 
+static float scroll_limit_y(const LunaElement* sc) {
+    return fmaxf(0.0f, sc->scroll_content_h - (sc->h - sc->padding * 2.0f));
+}
+
 static void clamp_scroll_y(int idx) {
     LunaElement* sc = &elements[idx];
-    float pad = sc->padding;
-    float inner_h = sc->h - pad * 2.0f;
-    float max_scroll = sc->scroll_content_h - inner_h;
-    if (max_scroll < 0.0f) max_scroll = 0.0f;
+    float max_scroll = scroll_limit_y(sc);
     if (sc->scroll_top < 0.0f) sc->scroll_top = 0.0f;
     if (sc->scroll_top > max_scroll) sc->scroll_top = max_scroll;
     if (sc->scroll_dest_top < 0.0f) sc->scroll_dest_top = 0.0f;
@@ -15688,6 +15942,23 @@ static int g_input_drag_idx = -1;
 static int g_ctx_open = 0;
 static int g_luna_ctx_menu_enabled = 1;
 
+static void scroll_web_wheel_y(int hit, float delta) {
+    for (int idx = find_scroll_target_y(hit); idx != -1;
+         idx = find_scroll_target_y(elements[idx].parent_idx)) {
+        LunaElement* sc = &elements[idx];
+        float before = sc->scroll_dest_top;
+        float after = fminf(scroll_limit_y(sc), fmaxf(0.0f, before + delta));
+        if (after == before) continue;
+        add_scroll_top(idx, after - before, 0);
+        delta -= after - before;
+        if (fabsf(delta) < 0.001f) return;
+    }
+    for (int i = 0; i < elem_count; ++i)
+        if (elements[i].parent_idx < 0 && !strcmp(elements[i].type, "body") &&
+            elements[i].overflow_y == OVERFLOW_HIDDEN) return;
+    luna_document_scroll(g_document_scroll_x, g_document_scroll_y + delta);
+}
+
 void scroll_callback(void* window, double xoffset, double yoffset) {
     (void)window; /* used via Luna mouse API / GLFW host */
     if (g_ctx_open) { g_ctx_open = 0; luna_platform_request_redraw(); }
@@ -15699,15 +15970,12 @@ void scroll_callback(void* window, double xoffset, double yoffset) {
         if (scroll_idx != -1)
             add_scroll_left(scroll_idx, -(float)yoffset * 18.0f, 0);
     } else if (fabs(yoffset) > 0.001) {
-        int scroll_idx = find_scroll_target_y(hit);
-        if (scroll_idx != -1) {
-            add_scroll_top(scroll_idx, -(float)yoffset * 18.0f, 0);
-        } else if (g_luna_web_compat) {
-            int allowed = 1;
-            for (int i = 0; i < elem_count; ++i)
-                if (elements[i].parent_idx < 0 && !strcmp(elements[i].type, "body") &&
-                    (elements[i].overflow_y == OVERFLOW_HIDDEN)) allowed = 0;
-            if (allowed) luna_document_scroll(g_document_scroll_x, g_document_scroll_y - (float)yoffset * 18.0f);
+        float delta = -(float)yoffset * 18.0f;
+        if (g_luna_web_compat) {
+            scroll_web_wheel_y(hit, delta);
+        } else {
+            int scroll_idx = find_scroll_target_y(hit);
+            if (scroll_idx != -1) add_scroll_top(scroll_idx, delta, 0);
         }
     }
     if (fabs(xoffset) > 0.001) {
@@ -16178,7 +16446,7 @@ static uint64_t damage_hash_element(int idx) {
     MIX_F32(e->t_r); MIX_F32(e->t_g); MIX_F32(e->t_b); MIX_F32(e->t_a);
     MIX_F32(e->bd_r); MIX_F32(e->bd_g); MIX_F32(e->bd_b); MIX_F32(e->bd_a);
     MIX_F32(e->opacity); MIX_F32(e->border_radius); MIX_F32(e->border_width);
-    MIX_F32(e->font_size); MIX_F32(e->scroll_top); MIX_F32(e->scroll_left);
+    MIX_F32(e->font_size); MIX_F32(e->flow_first_indent); MIX_F32(e->scroll_top); MIX_F32(e->scroll_left);
     MIX_U64(e->display_none); MIX_U64(e->font_bold); MIX_U64(e->font_face);
     MIX_U64(e->text_align); MIX_U64(e->has_shadow); MIX_U64(e->shadow_count);
     MIX_U64(e->has_gradient); MIX_U64(e->grad_type); MIX_U64(e->grad_stop_count);
@@ -16512,7 +16780,7 @@ static float kf_stop_width_px(const LunaElement* e, const KeyframeStop* stop) {
             if (e->anim_base_w_pct) {
                 int par = e->parent_idx;
                 float pw = (par != -1) ? elements[par].w : window_width;
-                return pw * e->raw_w;
+                return css_percentage_width(e, pw);
             }
             return e->anim_base_w;
         }
@@ -18451,7 +18719,7 @@ static int cjk_break_at(const char* p, int take) {
 }
 
 static int count_text_lines_uncached(FontAtlas* atlas, const char* text, float box_w,
-                                     float line_h, int max_lines,
+                                     float first_indent, float line_h, int max_lines,
                                      int white_space, int text_overflow, int overflow_wrap) {
     (void)line_h;
     const char* p = text;
@@ -18469,17 +18737,18 @@ static int count_text_lines_uncached(FontAtlas* atlas, const char* text, float b
         int para_len = para_scan;
         if (para_len <= 0) { p += 1; continue; }
 
+        const float line_width = line_no ? box_w : box_w - first_indent;
         int take = para_len;
         if (white_space == 1) {
-            take = fit_text_chars(atlas, p, para_len, box_w);
-            if (take < para_len && text_overflow == 1 && box_w > 0.0f) {
+            take = fit_text_chars(atlas, p, para_len, line_width);
+            if (take < para_len && text_overflow == 1 && line_width > 0.0f) {
                 float ell_w = measure_text_width(atlas, "…");
-                int base = fit_text_chars(atlas, p, para_len, box_w - ell_w);
+                int base = fit_text_chars(atlas, p, para_len, line_width - ell_w);
                 if (base < 0) base = 0;
                 take = base;
             }
         } else {
-            take = fit_text_chars(atlas, p, para_len, box_w);
+            take = fit_text_chars(atlas, p, para_len, line_width);
             if (take <= 0 && para_len > 0) take = 1;
             if (take < para_len && !overflow_wrap && cjk_break_at(p, take)) {
                 /* between two CJK characters: the line ends here */
@@ -18500,7 +18769,7 @@ static int count_text_lines_uncached(FontAtlas* atlas, const char* text, float b
                 int last_space = -1;
                 for (int i = 0; i < take; i++)
                     if (p[i] == ' ' || p[i] == '\t') last_space = i;
-                if (last_space > 0 && measure_text_range(atlas, p, take) > box_w * 0.65f)
+                if (last_space > 0 && measure_text_range(atlas, p, take) > line_width * 0.65f)
                     take = last_space;
             }
         }
@@ -18532,13 +18801,14 @@ static unsigned long long lc_mix(unsigned long long h, unsigned long long v) {
 }
 static unsigned lc_fbits(float f) { unsigned u; memcpy(&u, &f, sizeof u); return u; }
 static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
-                            float line_h, int max_lines,
+                            float first_indent, float line_h, int max_lines,
                             int white_space, int text_overflow, int overflow_wrap) {
     unsigned long long h = 1469598103934665603ull;
     for (const unsigned char* q = (const unsigned char*)text; *q; q++)
         h = (h ^ *q) * 1099511628211ull;
     h = lc_mix(h, (unsigned long long)(size_t)atlas);
     h = lc_mix(h, lc_fbits(box_w));
+    h = lc_mix(h, lc_fbits(first_indent));
     h = lc_mix(h, lc_fbits(g_text_css_px));
     h = lc_mix(h, lc_fbits(g_text_letter_spacing));
     h = lc_mix(h, lc_fbits(text_device_scale()));
@@ -18560,7 +18830,7 @@ static int count_text_lines(FontAtlas* atlas, const char* text, float box_w,
     if (!h) h = 1;
     LineCountMemo* m = &g_line_memo[h & 511u];
     if (m->key == h) return m->lines;
-    int n = count_text_lines_uncached(atlas, text, box_w, line_h, max_lines,
+    int n = count_text_lines_uncached(atlas, text, box_w, first_indent, line_h, max_lines,
                                       white_space, text_overflow, overflow_wrap);
     m->key = h; m->lines = n;
     return n;
@@ -18667,7 +18937,9 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
         return;
     }
 
-    int line_count = count_text_lines(atlas, text, box_w, line_h, max_lines,
+    float first_indent = fx && fx->flow_first_indent > 0.0f && fx->w > 0.0f
+        ? box_w * fx->flow_first_indent / fx->w : 0.0f;
+    int line_count = count_text_lines(atlas, text, box_w, first_indent, line_h, max_lines,
                                       white_space,
                                       (text_overflow || (fx && fx->line_clamp > 0)),
                                       overflow_wrap);
@@ -18696,17 +18968,19 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
         int para_len = para_scan;
         if (para_len <= 0) { p += 1; continue; }
 
+        float indent = line_no ? 0.0f : first_indent;
+        float line_width = box_w - indent;
         int take = para_len;
         if (white_space == 1) {
-            take = fit_text_chars(atlas, p, para_len, box_w);
-            if (take < para_len && text_overflow == 1 && box_w > 0.0f) {
+            take = fit_text_chars(atlas, p, para_len, line_width);
+            if (take < para_len && text_overflow == 1 && line_width > 0.0f) {
                 float ell_w = measure_text_width(atlas, "...");
-                int base = fit_text_chars(atlas, p, para_len, box_w - ell_w);
+                int base = fit_text_chars(atlas, p, para_len, line_width - ell_w);
                 if (base < 0) base = 0;
                 take = base;
             }
         } else {
-            take = fit_text_chars(atlas, p, para_len, box_w);
+            take = fit_text_chars(atlas, p, para_len, line_width);
             if (take <= 0 && para_len > 0) take = 1;
             if (take < para_len && !overflow_wrap && cjk_break_at(p, take)) {
                 /* between two CJK characters: the line ends here */
@@ -18724,7 +18998,7 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
                 int last_space = -1;
                 for (int i = 0; i < take; i++)
                     if (p[i] == ' ' || p[i] == '\t') last_space = i;
-                if (last_space > 0 && measure_text_range(atlas, p, take) > box_w * 0.65f)
+                if (last_space > 0 && measure_text_range(atlas, p, take) > line_width * 0.65f)
                     take = last_space;
             }
         }
@@ -18741,16 +19015,16 @@ void render_text_fx(const char* text, float x, float y, float box_w, float box_h
         if ((white_space == 1 || is_last_visible_line) &&
             (text_overflow == 1 || (fx && fx->line_clamp > 0)) && has_more) {
             float ell_w = measure_text_width(atlas, "…");
-            while (n > 0 && measure_text_range(atlas, line, n) + ell_w > box_w)
+            while (n > 0 && measure_text_range(atlas, line, n) + ell_w > line_width)
                 line[--n] = '\0';
             if (n + 3 < (int)sizeof(line)) strcat(line, "…");
         }
 
         float line_w = measure_text_width(atlas, line);
-        float start_x = x;
-        if      (align == 1) start_x = x + (box_w - line_w) / 2.0f;
-        else if (align == 2) start_x = x + (box_w - line_w);
-        if (start_x < x) start_x = x;
+        float start_x = x + indent;
+        if      (align == 1) start_x += (line_width - line_w) / 2.0f;
+        else if (align == 2) start_x += (line_width - line_w);
+        if (start_x < x + indent) start_x = x + indent;
 
         int single_line = (white_space == 1 || line_count == 1);
         float baseline;
@@ -19026,6 +19300,11 @@ static int hit_test_at(double xpos, double ypos) {
         float bx, by, bw, bh;
         get_element_hit_bounds(e, &bx, &by, &bw, &bh);
         if (xpos < bx || xpos > bx + bw || ypos < by || ypos > by + bh) continue;
+        if (e->flow_first_indent > 0.0f) {
+            float scale = bw / e->w;
+            if (xpos < bx + e->flow_first_indent * scale &&
+                ypos < by + css_used_line_height(e) * scale) continue;
+        }
         if (!is_rendered(i) || element_is_inert(i)) continue;
         return i;
     }
@@ -19041,6 +19320,21 @@ static void set_window_cursor(void* window, int cursor_type) {
     if (cursor_type == g_current_cursor) return;
     g_current_cursor = cursor_type;
     if (g_luna_platform.set_cursor) g_luna_platform.set_cursor(cursor_type);
+}
+
+static int hover_affects_descendants(LunaElement* e) {
+    if (!g_luna_web_compat) return 1;
+    if (!g_rule_index_ready) rebuild_rule_index();
+    for (int i = 0; i < rule_count; ++i) {
+        StyleRule* rule = &css_rules[i];
+        /* A matching target can change inherited values such as color. */
+        if (rule->is_hover && simple_selector_matches(&rule->target, e)) return 1;
+        for (int a = 0; a < rule->ancestor_count; ++a) {
+            SimpleSelector* ancestor = &rule->ancestors[a];
+            if (ancestor->is_hover && simple_selector_matches(ancestor, e)) return 1;
+        }
+    }
+    return 0;
 }
 
 void recompute_hover(void* window, double xpos, double ypos) {
@@ -19083,9 +19377,10 @@ void recompute_hover(void* window, double xpos, double ypos) {
     for (int pos = 0; pos < g_hover_chain_count; pos++) {
         int i = g_hover_chain[pos];
         if (g_hover_mark[i] == g_hover_epoch || !elements[i].is_hovered) continue;
+        int restyle_children = hover_affects_descendants(&elements[i]);
         elements[i].is_hovered = 0;
         (void)restyle_element_checked(&elements[i]);
-        restyle_descendants_of(i);
+        if (restyle_children) restyle_descendants_of(i);
         g_pointer_visual_revision++;
     }
     for (int pos = 0; pos < next_count; pos++) {
@@ -19094,7 +19389,7 @@ void recompute_hover(void* window, double xpos, double ypos) {
         if (!e->is_hovered) {
             e->is_hovered = 1;
             (void)restyle_element_checked(e);
-            restyle_descendants_of(i);
+            if (hover_affects_descendants(e)) restyle_descendants_of(i);
             g_pointer_visual_revision++;
         }
         if (e->cursor_type > best_cursor) best_cursor = e->cursor_type;
@@ -21935,7 +22230,9 @@ int luna_dom_compact(const unsigned char* drop_in) {
 
 int luna_dom_set_inner_html(int idx, const char* html) {
     if (!dom_valid(idx)) return -1;
-    {
+    /* Nodes follow their parent in document order. A freshly created element
+     * at the end has no children to detach and needs no child-index rebuild. */
+    if (idx + 1 < elem_count) {
         /* the child list, not a scan of every element per 256 children */
         int nk = 0, cap = 64;
         int* kids = (int*)malloc(sizeof(int) * (size_t)cap);
