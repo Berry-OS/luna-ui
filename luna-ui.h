@@ -1444,7 +1444,9 @@ static char *lht_decoded(const char *s,size_t n)
   if(c<128)p[used++]=(char)c;else if(c<0x800){p[used++]=(char)(0xc0|(c>>6));p[used++]=(char)(0x80|(c&63));}
   else if(c<0x10000){p[used++]=(char)(0xe0|(c>>12));p[used++]=(char)(0x80|((c>>6)&63));p[used++]=(char)(0x80|(c&63));}
   else {p[used++]=(char)(0xf0|(c>>18));p[used++]=(char)(0x80|((c>>12)&63));p[used++]=(char)(0x80|((c>>6)&63));p[used++]=(char)(0x80|(c&63));}
- }if(p)p[used]=0;luna_html_document_free(&d);return p;
+ }
+ if(p)p[used]=0;
+ luna_html_document_free(&d);return p;
 }
 struct lht_attr {char *name,*value;};
 struct lht_frame {char *tag;int32_t start;unsigned margin;struct lh_span *styles;size_t count,capacity;};
@@ -17163,7 +17165,7 @@ static int bake_font_atlas(const unsigned char* ttf_buffer, FontAtlas* atlas, fl
 // ---- font scanning helpers ----------------------------------------
 
 // Returns 1 if the filename extension is a supported font format.
-static int is_font_file(const char* name) {
+static __attribute__((unused)) int is_font_file(const char* name) {
     size_t n = strlen(name);
     if (n < 4) return 0;
     const char* ext = name + n - 4;
@@ -17174,7 +17176,7 @@ static int is_font_file(const char* name) {
 }
 
 // Returns 1 if the filename looks like a bold variant.
-static int is_bold_name(const char* name) {
+static __attribute__((unused)) int is_bold_name(const char* name) {
     // Case-insensitive search for "bold" in the basename.
     char lower[512];
     size_t n = strlen(name);
@@ -17191,7 +17193,7 @@ typedef struct {
     int    cap;
 } FontPathList;
 
-static void fpl_add(FontPathList* fpl, const char* path) {
+static __attribute__((unused)) void fpl_add(FontPathList* fpl, const char* path) {
     char* copy;
     if (fpl->count >= fpl->cap) {
         int new_cap = fpl->cap ? fpl->cap * 2 : 64;
@@ -17371,7 +17373,7 @@ static int luna_font_blob_is_mono(const unsigned char* buf) {
  * Japanese gothic fonts (IPA Gothic, VL Gothic, ...) are fixed pitch — so fall
  * back to probing the metrics instead of drawing a terminal in a proportional
  * UI font. */
-static unsigned char* luna_pick_mono_font(FontPathList* fpl, long* out_sz) {
+static __attribute__((unused)) unsigned char* luna_pick_mono_font(FontPathList* fpl, long* out_sz) {
     int n = fpl->count;
     if (n <= 0) return NULL;
     int* score = (int*)malloc(sizeof(int) * (size_t)n);
